@@ -68,6 +68,16 @@ def test_parked_server_self_probes_and_revives(monkeypatch, tmp_path):
         "revived_registration": 0,
     }
 
+    def _register(name, server, config):
+        # Production discovery registers an owned revival before readiness.
+        assert name == "srv"
+        assert mcp_tool._servers.get(name) is server
+        assert not server._ready.is_set()
+        state["revived_registration"] += 1
+        return ["srv__tool"]
+
+    monkeypatch.setattr(mcp_tool, "_register_server_tools", _register)
+
     async def _scenario():
         class _Task(MCPServerTask):
             def _is_http(self):
@@ -76,11 +86,6 @@ def test_parked_server_self_probes_and_revives(monkeypatch, tmp_path):
             def _deregister_tools(self):
                 state["deregistered"] += 1
                 self._registered_tool_names = []
-
-            def _register_discovered_tools_if_needed(self):
-                if self._ready.is_set() and not self._registered_tool_names:
-                    state["revived_registration"] += 1
-                    self._registered_tool_names = ["srv__tool"]
 
             async def _run_stdio(self, config):
                 state["transport_calls"] += 1
@@ -95,12 +100,21 @@ def test_parked_server_self_probes_and_revives(monkeypatch, tmp_path):
                     raise RuntimeError("backend still down")
                 # Backend recovered: establish a session and park in the
                 # lifecycle wait like the real transport does.
-                self.session = object()
-                self._register_discovered_tools_if_needed()
+                assert not self._ready.is_set()
+                self.session = SimpleNamespace(
+                    list_tools=AsyncMock(
+                        return_value=SimpleNamespace(tools=[SimpleNamespace(name="tool")]),
+                    )
+                )
+                # Match _run_stdio: discover/publish first, signal ready after.
+                await self._discover_tools()
+                assert not self._ready.is_set()
+                self._ready.set()
                 await self._wait_for_lifecycle_event()
 
         task = _Task("srv")
         task._registered_tool_names = ["srv__tool"]
+        monkeypatch.setitem(mcp_tool._servers, task.name, task)
 
         run_task = asyncio.ensure_future(task.run({"command": "x"}))
 
@@ -117,7 +131,7 @@ def test_parked_server_self_probes_and_revives(monkeypatch, tmp_path):
         state["backend_up"] = True
         for _ in range(200):
             await _real_sleep(0.01)
-            if task.session is not None:
+            if task.session is not None and task._ready.is_set():
                 break
 
         assert task.session is not None, (
@@ -127,6 +141,9 @@ def test_parked_server_self_probes_and_revives(monkeypatch, tmp_path):
         assert state["revived_registration"] >= 1, (
             "revived server did not re-register its tools"
         )
+        assert task._ready.is_set(), "revived server never completed discovery"
+        assert task._registered_tool_names == ["srv__tool"]
+        assert [tool.name for tool in task._tools] == ["tool"]
 
         task._shutdown_event.set()
         task._reconnect_event.set()

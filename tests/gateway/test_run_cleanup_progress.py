@@ -108,6 +108,7 @@ class ProgressAgent:
     """Emits two tool-progress events and returns a normal final response."""
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
@@ -123,6 +124,7 @@ class ProgressAgent:
 
 class FailingAgent:
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 

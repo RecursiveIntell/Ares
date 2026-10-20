@@ -37,7 +37,7 @@ def test_startup_timeout_never_sends_later(tmp_path, monkeypatch):
 
 def test_interrupt_ack_matches_exact_session_request_and_target(tmp_path, monkeypatch):
     host = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
-    monkeypatch.setattr(host, "is_running", lambda: True)
+    monkeypatch.setattr(host, "is_ready", lambda: True)
     def send(frame, **kwargs):
         host._handle_host_frame({"type": "interrupt.ack", "sid": frame["sid"],
             "request_id": frame["request_id"], "target_request_id": frame["target_request_id"], "applied": True})
@@ -49,7 +49,7 @@ def test_interrupt_ack_matches_exact_session_request_and_target(tmp_path, monkey
 
 def test_missing_ack_is_uncertain_not_not_sent(tmp_path, monkeypatch):
     host = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
-    monkeypatch.setattr(host, "is_running", lambda: True)
+    monkeypatch.setattr(host, "is_ready", lambda: True)
     sent = []
     monkeypatch.setattr(host, "_send_frame", lambda frame, **kw: sent.append(frame))
     with pytest.raises(HostSendUncertain, match="acknowledgement"):
@@ -61,7 +61,7 @@ def test_missing_ack_is_uncertain_not_not_sent(tmp_path, monkeypatch):
 @pytest.mark.parametrize("bad_field,bad_value", [("sid", "other"), ("target_request_id", "B")])
 def test_mismatched_ack_is_not_success(tmp_path, monkeypatch, bad_field, bad_value):
     host = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
-    monkeypatch.setattr(host, "is_running", lambda: True)
+    monkeypatch.setattr(host, "is_ready", lambda: True)
     def send(frame, **kwargs):
         ack = {"type": "interrupt.ack", "sid": "s", "request_id": "stop",
                "target_request_id": "A", "applied": True, bad_field: bad_value}
@@ -75,7 +75,7 @@ def test_mismatched_ack_is_not_success(tmp_path, monkeypatch, bad_field, bad_val
 @pytest.mark.parametrize("operation", ["lookup", "control"])
 def test_other_controls_cleanup_waiter_on_send_refusal(tmp_path, monkeypatch, operation):
     host = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
-    monkeypatch.setattr(host, "is_running", lambda: True)
+    monkeypatch.setattr(host, "is_ready", lambda: True)
     def send(frame, **kwargs):
         raise HostSendNotSent("nothing offered")
     monkeypatch.setattr(host, "_send_frame", send)
@@ -90,7 +90,7 @@ def test_other_controls_cleanup_waiter_on_send_refusal(tmp_path, monkeypatch, op
 @pytest.mark.parametrize("operation", ["lookup", "control"])
 def test_other_controls_ack_timeout_is_uncertain(tmp_path, monkeypatch, operation):
     host = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
-    monkeypatch.setattr(host, "is_running", lambda: True)
+    monkeypatch.setattr(host, "is_ready", lambda: True)
     sent = []
     monkeypatch.setattr(host, "_send_frame", lambda frame, **kw: sent.append(frame))
     with pytest.raises(HostSendUncertain, match="acknowledgement"):

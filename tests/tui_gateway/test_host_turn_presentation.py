@@ -8,7 +8,7 @@ from tui_gateway.compute_host import ComputeHost
 
 
 def test_host_owned_bubble_marks_pending_without_mutating_payload(monkeypatch):
-    session = {"_host_turn_request_id": "A"}
+    session = {"history_lock": threading.Lock(), "_host_turn_request_id": "A"}
     monkeypatch.setattr(server, "_sessions", {"s": session})
     monkeypatch.setattr(server, "_inside_compute_host_child", lambda: True)
     sent = []
@@ -27,7 +27,8 @@ def test_session_info_stays_busy_during_host_handoff(tmp_path, monkeypatch):
     monkeypatch.setattr(banner, "get_update_result", lambda **kw: None)
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    session = {"running": False, "_host_turn_request_id": "A", "cwd": str(tmp_path)}
+    session = {"running": False, "_host_turn_request_id": "A", "cwd": str(tmp_path),
+               "history_lock": threading.Lock()}
     agent = types.SimpleNamespace(model="test-model", provider="test-provider")
     assert server._session_info(agent, session)["running"] is True
     session.pop("_host_turn_request_id")
@@ -39,10 +40,11 @@ def test_only_matching_host_terminal_releases_presentation_owner(monkeypatch):
     monkeypatch.setattr(server, "_sessions", {"s": session})
     host = ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
     host._active_request_ids["s"] = "A"
+    host._admitted_request_sessions["s"] = ("A", session)
     try:
-        host._emit_real_turn_terminal({"type": "turn.end", "sid": "s", "request_id": "old"})
+        host._emit_real_turn_terminal({"type": "turn.end", "sid": "s", "request_id": "old"}, admitted_session=session)
         assert session["_host_turn_request_id"] == "A"
-        host._emit_real_turn_terminal({"type": "turn.end", "sid": "s", "request_id": "A"})
+        host._emit_real_turn_terminal({"type": "turn.end", "sid": "s", "request_id": "A"}, admitted_session=session)
         assert "_host_turn_request_id" not in session
     finally:
         host.close()

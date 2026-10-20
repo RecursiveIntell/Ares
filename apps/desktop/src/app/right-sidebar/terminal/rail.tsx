@@ -131,9 +131,9 @@ function TerminalRailItem({ active, canCloseOthers, index, term, toggleHint }: T
                   ? 'bg-(--chrome-action-hover) text-foreground'
                   : 'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
               )}
-              {...middleClickHandlers(() => closeTerminal(term.id))}
+              {...middleClickHandlers(() => closeTerminal(term.id, true))}
               // ⌘-click closes (the pane-tab gesture); a plain click selects.
-              onClick={event => (isMetaClose(event) ? closeTerminal(term.id) : selectTerminal(term.id))}
+              onClick={event => (isMetaClose(event) ? closeTerminal(term.id, true) : selectTerminal(term.id))}
               role="tab"
               type="button"
             >
@@ -147,7 +147,7 @@ function TerminalRailItem({ active, canCloseOthers, index, term, toggleHint }: T
         </li>
       </ContextMenuTrigger>
       <ContextMenuContent>
-        <ContextMenuItem onSelect={() => closeTerminal(term.id)}>{t.common.close}</ContextMenuItem>
+        <ContextMenuItem onSelect={() => closeTerminal(term.id, true)}>{t.common.close}</ContextMenuItem>
         <ContextMenuItem disabled={!canCloseOthers} onSelect={() => closeOtherTerminals(term.id)}>
           {t.rightSidebar.terminalCloseOthers}
         </ContextMenuItem>

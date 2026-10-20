@@ -2,12 +2,19 @@ import { QueryClient } from '@tanstack/react-query'
 import { act, cleanup } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { setApiRequestConnection } from '@/api/client'
 import { isTargetSessionBusy } from '@/app/session/hooks/use-prompt-actions/utils'
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
-import { setCurrentModel, setCurrentProvider } from '@/store/session'
+import {
+  _resetSessionOwnerHintsForTests,
+  setCurrentModel,
+  setCurrentProvider,
+  setSessionOwnerHint
+} from '@/store/session'
 
+import publications from './fixtures/selector-publications.json'
 import { type MessageStreamHarness, renderMessageStream } from './test-harness'
 import { PRE_TURN_LIVE_SETTLE_GRACE_MS } from './utils'
 
@@ -55,9 +62,23 @@ afterEach(() => {
   setCurrentProvider('')
   vi.useRealTimers()
   vi.restoreAllMocks()
+  setApiRequestConnection(null)
+  _resetSessionOwnerHintsForTests()
 })
 
 describe('session.info config refetch gating', () => {
+  it('does not overwrite pending explicit options with older runtime observations', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      reasoningEffort: 'high',
+      fast: false,
+      pendingRuntimeOptions: { effort: 'high', fast: false }
+    } as ClientSessionState)
+    sessionInfo(ACTIVE_SID, { reasoning_effort: 'low', fast: true })
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({ reasoningEffort: 'high', fast: false })
+  })
+
   it('coalesces active-session bursts into one trailing config fetch', async () => {
     // Mount under real timers (waitFor), then freeze time for the debounce.
     mountStream()
@@ -91,7 +112,159 @@ describe('session.info config refetch gating', () => {
   })
 })
 
+describe('diagnostic negative witnesses: observation ordering', () => {
+  it('must retain the selection when replaying the actual backend publication witness', async () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      model: 'B',
+      provider: 'synthetic',
+      reasoningEffort: 'high',
+      pendingModelSelection: { model: 'B', provider: 'synthetic', previousModel: 'A', previousProvider: 'synthetic' },
+      pendingRuntimeOptions: { effort: 'high' }
+    } as ClientSessionState)
+
+    for (const observation of publications) {
+      // Retain the original captured values/order; add the new owner-issued
+      // protocol stamp (capture order, not arrival order) for the repaired lane.
+      sessionInfo(ACTIVE_SID, {
+        model: observation.model,
+        provider: 'synthetic',
+        reasoning_effort: observation.effort,
+        pending_runtime_options: null,
+        selector_version: { epoch: 'fixture-owner', revision: observation.model === 'B' ? 2 : 1 }
+      })
+    }
+
+    const observed = {
+      model: sessionStates!.get(ACTIVE_SID)?.model,
+      effort: sessionStates!.get(ACTIVE_SID)?.reasoningEffort
+    }
+    console.log('WITNESS backend → real renderer event replay:', observed)
+    expect(observed).toEqual({ model: 'B', effort: 'high' })
+  })
+  it('older A observation must not overwrite C while C supersedes pending B', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      model: 'C',
+      provider: 'p',
+      pendingModelSelection: {
+        model: 'C',
+        provider: 'p',
+        previousModel: 'B',
+        previousProvider: 'p',
+        rollbackModel: 'A',
+        rollbackProvider: 'p'
+      }
+    } as ClientSessionState)
+    sessionInfo(ACTIVE_SID, { model: 'A', provider: 'p' })
+    console.log('WITNESS model A→B→C delayed A', sessionStates!.get(ACTIVE_SID)?.model)
+    expect(sessionStates!.get(ACTIVE_SID)?.model).toBe('C')
+  })
+  it('matching B observation must not permit a subsequently delivered older A to undo B', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      model: 'B',
+      provider: 'p',
+      pendingModelSelection: { model: 'B', provider: 'p', previousModel: 'A', previousProvider: 'p' }
+    } as ClientSessionState)
+    sessionInfo(ACTIVE_SID, { model: 'B', provider: 'p', selector_version: { epoch: 'fixture-owner', revision: 2 } })
+    sessionInfo(ACTIVE_SID, { model: 'A', provider: 'p', selector_version: { epoch: 'fixture-owner', revision: 1 } })
+    console.log('WITNESS model B confirmed then delayed A', sessionStates!.get(ACTIVE_SID)?.model)
+    expect(sessionStates!.get(ACTIVE_SID)?.model).toBe('B')
+  })
+  it('confirmed high effort must survive a subsequently delivered older low observation', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      reasoningEffort: 'high',
+      pendingRuntimeOptions: { effort: 'high' }
+    } as ClientSessionState)
+    sessionInfo(ACTIVE_SID, {
+      reasoning_effort: 'high',
+      pending_runtime_options: null,
+      selector_version: { epoch: 'fixture-owner', revision: 2 }
+    })
+    sessionInfo(ACTIVE_SID, {
+      reasoning_effort: 'low',
+      pending_runtime_options: null,
+      selector_version: { epoch: 'fixture-owner', revision: 1 }
+    })
+    console.log('WITNESS effort high confirmed then delayed low', sessionStates!.get(ACTIVE_SID)?.reasoningEffort)
+    expect(sessionStates!.get(ACTIVE_SID)?.reasoningEffort).toBe('high')
+  })
+})
+
 describe('session.info model-options invalidation gating', () => {
+  it('does not mix a stale owner hint with an incompatible connection-only event stamp', () => {
+    setApiRequestConnection('connection-a')
+    setSessionOwnerHint('session-background', {
+      connectionId: 'connection-a',
+      profile: 'a-profile',
+      targetProfile: 'a-target'
+    })
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    act(() =>
+      stream.handleEvent({
+        connectionId: 'connection-b',
+        session_id: 'session-background',
+        type: 'session.info',
+        payload: { model: 'b-new', provider: 'b-provider' }
+      })
+    )
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['model-options'] })
+    expect(invalidate).not.toHaveBeenCalledWith({
+      queryKey: modelOptionsQueryKey('a-target', 'session-background', 'connection-b')
+    })
+  })
+
+  it('invalidates the background event owner catalog and backend target while another connection is foregrounded', () => {
+    setApiRequestConnection('connection-a')
+    setSessionOwnerHint('session-background', {
+      connectionId: 'connection-b',
+      profile: 'tile-profile',
+      targetProfile: 'backend-target'
+    })
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    act(() =>
+      stream.handleEvent({
+        connectionId: 'connection-b',
+        profile: 'tile-profile',
+        session_id: 'session-background',
+        type: 'session.info',
+        payload: { model: 'b-new', provider: 'b-provider' }
+      })
+    )
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: modelOptionsQueryKey('backend-target', 'session-background', 'connection-b')
+    })
+    expect(invalidate).not.toHaveBeenCalledWith({
+      queryKey: modelOptionsQueryKey(ACTIVE_PROFILE, 'session-background', 'connection-a')
+    })
+  })
+
+  it('uses a stamped background event connection when no session owner hint is known', () => {
+    setApiRequestConnection('connection-a')
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    act(() =>
+      stream.handleEvent({
+        connectionId: 'connection-b',
+        profile: 'background-profile',
+        session_id: 'session-background',
+        type: 'session.info',
+        payload: { model: 'b-new', provider: 'b-provider' }
+      })
+    )
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: modelOptionsQueryKey('background-profile', 'session-background', 'connection-b')
+    })
+  })
+
   it('skips invalidation when model/provider merely restate the known values', () => {
     mountStream()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
@@ -109,20 +282,17 @@ describe('session.info model-options invalidation gating', () => {
 
   it('preserves a pending model pick when a delayed heartbeat repeats the previous model', () => {
     mountStream()
-    sessionStates!.set(
-      ACTIVE_SID,
-      {
-        ...createClientSessionState('stored-active'),
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      model: 'model-b',
+      provider: 'provider-b',
+      pendingModelSelection: {
         model: 'model-b',
         provider: 'provider-b',
-        pendingModelSelection: {
-          model: 'model-b',
-          provider: 'provider-b',
-          previousModel: 'model-a',
-          previousProvider: 'provider-a'
-        }
-      } as ClientSessionState
-    )
+        previousModel: 'model-a',
+        previousProvider: 'provider-a'
+      }
+    } as ClientSessionState)
 
     // This event was queued before the local config.set selection. It must not
     // repaint the picker back to A merely because it arrives later.

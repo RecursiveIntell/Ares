@@ -3112,6 +3112,7 @@ class ClosureProjector:
             _check_ref(event_ref, "source_event_refs")
             if not source_event_exists(event_ref):
                 raise ContractError("MISSING_SOURCE_EVENT", event_ref)
+        prior = None
         if previous_projection is not None:
             prior = (
                 previous_projection.to_dict()
@@ -3123,10 +3124,6 @@ class ClosureProjector:
                 or prior.get("closure_profile") != closure_profile
             ):
                 raise ContractError("PROJECTION_LINEAGE_MISMATCH")
-            if prior.get("state") == "closed" and not set(normalized_events).difference(
-                prior.get("source_event_refs", [])
-            ):
-                raise ContractError("REOPEN_REQUIRES_NEW_EVIDENCE")
         unknown = set(flags) - self.ALLOWED_FLAGS
         if unknown:
             raise ContractError("UNKNOWN_DIVERGENCE_FLAG", sorted(unknown)[0])
@@ -3140,7 +3137,7 @@ class ClosureProjector:
             if not unsatisfied and not flags
             else ("quarantined" if "AMBIGUOUS_EFFECT" in flags else "evidence_pending")
         )
-        return make_artifact(
+        projection = make_artifact(
             "closure",
             {
                 "mission_ref": mission_ref,
@@ -3154,6 +3151,16 @@ class ClosureProjector:
                 "divergence_flags": sorted(set(flags)),
             },
         )
+        if (
+            prior is not None
+            and prior.get("state") == "closed"
+            and not set(normalized_events).difference(prior.get("source_event_refs", []))
+            and projection.to_dict() != prior
+        ):
+            # Replaying identical owner evidence is a rebuild, not a reopen.
+            # Changed gates, flags or provenance still require a new event.
+            raise ContractError("REOPEN_REQUIRES_NEW_EVIDENCE")
+        return projection
 
 
 BASELINE_DEFINITIONS: Mapping[str, Mapping[str, str]] = {

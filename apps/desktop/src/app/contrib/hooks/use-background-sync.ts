@@ -368,8 +368,7 @@ export function rehydrateLiveSessionStatuses(
     // `starting` may be an incidental lazy build, not a user turn. Preserve it
     // as busy only when this renderer already knows a prompt/turn is active;
     // otherwise merely opening a session would show a false running spinner.
-    const startingTurn =
-      session.status === 'starting' && Boolean(existing?.busy || existing?.awaitingResponse)
+    const startingTurn = session.status === 'starting' && Boolean(existing?.busy || existing?.awaitingResponse)
 
     // A turn we just submitted is not yet running as far as the backend is
     // concerned, so the snapshot honestly reports it idle — but the local

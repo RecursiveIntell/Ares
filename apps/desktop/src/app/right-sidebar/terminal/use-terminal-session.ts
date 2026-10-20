@@ -18,6 +18,7 @@ import { $terminalInjection } from '../store'
 import { observeActiveTerminalResize } from './active-resize'
 import { makeTerminalReader, registerTerminalReader } from './buffer'
 import { mirrorSelection, terminalClipboardIntent } from './clipboard'
+import { flushTerminalFocus, registerTerminalFocus, terminalHostVisible } from './focus'
 import { terminalLinkHandler, terminalWebLinksAddon } from './links'
 import {
   isMacPlatform,
@@ -912,7 +913,16 @@ export function useTerminalSession({
 
       term.open(host)
       mountedRef.current = true
-      term.focus()
+      cleanup.push(
+        registerTerminalFocus(id, () => {
+          if (!terminalHostVisible(host)) {
+            return false
+          }
+          term.focus()
+
+          return true
+        })
+      )
 
       // WebGL renderer matches the dashboard ChatPage path; xterm's default DOM
       // renderer paints SGR via CSS classes that visibly mute against our skins.
@@ -1034,10 +1044,10 @@ export function useTerminalSession({
 
         webglRef.current?.clearTextureAtlas()
         term?.refresh(0, term.rows - 1)
-        term?.focus()
+        flushTerminalFocus(id)
       }
     })
-  }, [active, status])
+  }, [active, id, status])
 
   // Flush a queued command (e.g. a provider-disconnect) into the live session.
   // Only the active tab runs it (so a broadcast doesn't fan out to every shell);
@@ -1060,9 +1070,9 @@ export function useTerminalSession({
       hasSessionActivityRef.current = true
       void window.hermesDesktop?.terminal?.write(sessionId, `${command}\r`)
       $terminalInjection.set(null)
-      termRef.current?.focus()
+      flushTerminalFocus(id)
     })
-  }, [active, status])
+  }, [active, id, status])
 
   return {
     addSelectionToChat,

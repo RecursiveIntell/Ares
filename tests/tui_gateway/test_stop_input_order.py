@@ -23,13 +23,14 @@ def test_new_input_waits_outside_session_lock_until_native_cut_verified(tmp_path
     session["queued_prompt"] = {"text": "B", "context_input_event_id": "B", "transport": None}
     monkeypatch.setattr(server, "_sessions", {"s": session})
     monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_db", db)
     monkeypatch.setattr(server, "_session_db", lambda s: contextlib.nullcontext(db))
     monkeypatch.setattr(server, "_load_cfg", lambda: {
         "dashboard": {"turn_isolation": True}, "compression": {"context_rebase_enabled": True}})
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a: None)
     monkeypatch.setattr(server, "_clear_pending", lambda *a: None)
     monkeypatch.setattr(server, "_emit", lambda *a: None)
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     waiting = threading.Event()
     release = threading.Event()
     input_started = threading.Event()
@@ -49,9 +50,10 @@ def test_new_input_waits_outside_session_lock_until_native_cut_verified(tmp_path
         ack = {"type": "interrupt.ack", "sid": sid, "request_id": kwargs["request_id"],
                "target_request_id": "A", "applied": True}
         if with_receipt:
-            control = db.record_context_stop("stored")
+            operation = db.record_context_stop_operation("stored", operation_id=kwargs['operation_id'])['receipt']
+            control = operation['control']
             results["cut"] = control
-            ack["stop_receipt"] = {"session_key": "stored", "control": control}
+            ack["stop_receipt"] = {"session_key": "stored", "control": control, "operation": operation}
         return ack
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: types.SimpleNamespace(interrupt=interrupt))
 

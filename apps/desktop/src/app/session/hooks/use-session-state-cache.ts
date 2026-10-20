@@ -36,12 +36,16 @@ interface SessionStateCacheOptions {
   setMessages: (messages: ChatMessage[]) => void
 }
 
-function syncRuntimeMetadataToView(state: ClientSessionState) {
+function syncRuntimeMetadataToView(cached: ClientSessionState, sessionId: string) {
+  // A staged RAF/warm cache is not newer than the admitted runtime projection.
+  const live = $sessionStates.get()[sessionId]
+  const state =
+    live && (live.selectorObservation || live.pendingModelSelection || live.pendingRuntimeOptions) ? live : cached
   setCurrentModel(state.model ?? '')
   setCurrentProvider(state.provider ?? '')
-  setCurrentReasoningEffort(state.reasoningEffort ?? '')
+  setCurrentReasoningEffort(state.reasoningEffort ?? '', false)
   setCurrentServiceTier(state.serviceTier ?? '')
-  setCurrentFastMode(state.fast ?? false)
+  setCurrentFastMode(state.fast ?? false, false)
   setYoloActive(state.yolo ?? false)
   setCurrentPersonality(state.personality ?? '')
 }
@@ -240,7 +244,7 @@ export function useSessionStateCache({
 
     viewSessionIdRef.current = pending.sessionId
 
-    syncRuntimeMetadataToView(pending.state)
+    syncRuntimeMetadataToView(pending.state, pending.sessionId)
     setBusy(pending.state.busy || pending.state.reconnecting)
     setMutableRef(busyRef, pending.state.busy || pending.state.reconnecting)
     setAwaitingResponse(pending.state.awaitingResponse)
@@ -265,7 +269,7 @@ export function useSessionStateCache({
         return
       }
 
-      syncRuntimeMetadataToView(state)
+      syncRuntimeMetadataToView(state, sessionId)
       pendingViewStateRef.current = { sessionId, state }
 
       // Terminal / attention transitions (turn finished, error, or the agent is

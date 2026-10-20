@@ -18,6 +18,9 @@ def adoption(monkeypatch, tmp_path):
     monkeypatch.setattr(server, '_profile_home', lambda p: tmp_path/'profile' if p else None)
     monkeypatch.setattr(server, '_turn_isolation_enabled', lambda *a: True)
     class Host:
+        def wait_ready(self):
+            pass
+
         def lookup_session_key(self, key):
             return {'session_id':'host-owner','running':True,'request_id':'live-turn',
                     'session_info':{'model':'fixture','provider':'fixture'}}

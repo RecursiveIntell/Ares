@@ -24,6 +24,29 @@ import { pendingClarifyToolPayload, restorePendingClarifyFromSnapshot } from './
 const resumeStartedAt = 1_700_000_000
 
 describe('restorePendingClarifyFromSnapshot', () => {
+  it('does not expire or clear a local question when the child snapshot is unavailable', () => {
+    const request = {
+      requestId: 'child-request',
+      sessionId: 'child-session',
+      question: 'Confirm?',
+      choices: null,
+      multiSelect: false,
+      receivedAt: resumeStartedAt - 1
+    }
+
+    $clarifyRequests.set({ 'child-session': request })
+
+    const state = restorePendingClarifyFromSnapshot(
+      { pending_clarify_unavailable: true },
+      'child-session',
+      resumeStartedAt,
+      request.requestId
+    )
+
+    expect(state).toEqual({ authoritativeAbsent: false, cleared: null, request: null })
+    expect($clarifyRequests.get()['child-session']).toBe(request)
+    expect(clearClarifyRequestMock).not.toHaveBeenCalled()
+  })
   beforeEach(() => {
     clearClarifyRequestMock.mockClear()
     setClarifyRequestMock.mockClear()
@@ -180,5 +203,64 @@ describe('pendingClarifyToolPayload', () => {
       },
       tool_id: 'rid'
     })
+  })
+})
+
+describe('resume delivery receipts', () => {
+  beforeEach(() => {
+    clearClarifyRequestMock.mockClear()
+    $clarifyRequests.set({})
+  })
+  it.each(['submitting', 'deliveryUncertain', 'accepted'] as const)(
+    'retains %s delivery evidence without asserting a pending blocker',
+    async field => {
+      const { emptyClarifyInteraction, hasClarifyRequest, $clarifyRequest } = await import('@/store/clarify')
+      const { $activeSessionAwaitingInput, sessionAwaitingInput } = await import('@/store/prompts')
+      const { $activeSessionId } = await import('@/store/session')
+      const interaction = { ...emptyClarifyInteraction, draft: 'my answer', sendError: 'lost receipt', [field]: true }
+      $activeSessionId.set('receipt-session')
+      $clarifyRequests.set({
+        'receipt-session': {
+          choices: null,
+          multiSelect: false,
+          question: 'Name?',
+          receivedAt: resumeStartedAt - 1,
+          requestId: 'receipt',
+          sessionId: 'receipt-session',
+          generation: 42,
+          interaction
+        }
+      })
+      const state = restorePendingClarifyFromSnapshot({}, 'receipt-session', resumeStartedAt, 'receipt')
+      expect(state.authoritativeAbsent).toBe(true)
+      expect(state.cleared).toBeNull()
+      expect(state.request).toBeNull()
+      expect(clearClarifyRequestMock).not.toHaveBeenCalled()
+      expect($clarifyRequests.get()['receipt-session'].interaction).toBe(interaction)
+      expect($clarifyRequests.get()['receipt-session'].generation).toBe(42)
+      expect($clarifyRequests.get()['receipt-session'].deliveryOnly).toBe(true)
+      expect(hasClarifyRequest('receipt-session')).toBe(false)
+      expect($clarifyRequest.get()).toBeNull()
+      expect($activeSessionAwaitingInput.get()).toBe(false)
+      expect(sessionAwaitingInput('receipt-session').get()).toBe(false)
+      $activeSessionId.set(null)
+    }
+  )
+  it('keeps an unsubmitted chosen answer as a closed expired display after absence', async () => {
+    const { emptyClarifyInteraction } = await import('@/store/clarify')
+    $clarifyRequests.set({
+      s: {
+        choices: ['a'],
+        multiSelect: false,
+        question: 'Q',
+        requestId: 'r',
+        sessionId: 's',
+        interaction: { ...emptyClarifyInteraction, selectedChoices: ['a'] }
+      }
+    })
+    restorePendingClarifyFromSnapshot({}, 's', resumeStartedAt)
+    expect($clarifyRequests.get().s.interaction?.selectedChoices).toEqual(['a'])
+    expect($clarifyRequests.get().s.responseState).toBe('expired')
+    expect($clarifyRequests.get().s.deliveryOnly).toBe(true)
   })
 })

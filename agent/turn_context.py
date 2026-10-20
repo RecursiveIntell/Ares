@@ -550,6 +550,20 @@ def build_turn_context(
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
 
     # Restore the primary runtime if the previous turn activated fallback.
+    from ares_runtime.continuity.runtime import ContextDispatchError, context_dispatch_required
+
+    _aux_context_required = context_dispatch_required(agent)
+    _primary_runtime = getattr(agent, "_primary_runtime", None)
+    _native_primary = (
+        isinstance(_primary_runtime, dict)
+        and _primary_runtime.get("api_mode") == "codex_app_server"
+    )
+    if _aux_context_required and (
+        getattr(agent, "api_mode", None) == "codex_app_server" or _native_primary
+    ):
+        # Stop before restore, title generation, auxiliary resolution or the
+        # native child can dispatch from an unqualified trial context.
+        raise ContextDispatchError("PROVIDER_CONTEXT_RESET_UNQUALIFIED")
     agent._restore_primary_runtime()
 
     # Tell auxiliary_client what the live main provider/model are for this turn
@@ -577,8 +591,13 @@ def build_turn_context(
             auth_mode=getattr(agent, "auth_mode", "") or "",
             session_id=getattr(agent, "session_id", "") or "",
             cache_scope=_cache_scope,
+            context_dispatch_required=_aux_context_required,
         )
+    except ContextDispatchError:
+        raise
     except Exception:
+        if _aux_context_required:
+            raise ContextDispatchError("CONTEXT_DISPATCH_OWNER_UNAVAILABLE") from None
         pass
 
     # Between-turns MCP refresh: an MCP server that finished connecting since
@@ -1169,9 +1188,8 @@ def build_turn_context(
             # Context is already over the compression threshold, but compression
             # is blocked (summary LLM cooldown or anti-thrashing). Without a
             # signal the session keeps growing until the model silently stops
-            # answering — the conversation hits the hard provider token limit
-            # with no explanation. Surface a deduped warning so the user can
-            # take action (/new or /compress) instead of hitting a silent hang.
+            # answering. Surface a deduped warning that states the admission
+            # risk without recommending an immediate compression retry.
             agent._warn_context_overflow_blocked(
                 _compress_block_reason,
                 _preflight_tokens,

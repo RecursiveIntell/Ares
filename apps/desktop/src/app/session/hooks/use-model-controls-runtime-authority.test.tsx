@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { _resetComposerModelSelectionsForTests } from '@/store/session'
 import {
   $activeSessionId,
   $currentModel,
@@ -64,6 +65,7 @@ function installSessionStateDelegate() {
 
 describe('useModelControls runtime authority', () => {
   beforeEach(() => {
+    _resetComposerModelSelectionsForTests()
     $sessionStates.set({})
     $activeSessionId.set(PRIMARY_RUNTIME_ID)
     $selectedStoredSessionId.set(PRIMARY_STORED_ID)
@@ -228,4 +230,75 @@ describe('useModelControls runtime authority', () => {
     expect($currentModel.get()).toBe('model-c')
     expect($currentProvider.get()).toBe('provider-c')
   })
+
+  it('settles only its own confirmed model intent when an ACK snapshot has a foreign epoch', async () => {
+    const current = $sessionStates.get()[PRIMARY_RUNTIME_ID]
+    publishSessionState(PRIMARY_RUNTIME_ID, {
+      ...current,
+      selectorObservation: {
+        version: { epoch: 'owner-a', revision: 7 },
+        values: { model: 'model-a', provider: 'provider-a' }
+      }
+    })
+
+    const requestGateway = vi.fn(
+      async () =>
+        ({
+          key: 'model',
+          scope: 'session',
+          value: 'model-b',
+          selector_info: {
+            model: 'model-b',
+            provider: 'provider-b',
+            selector_version: { epoch: 'replacement-owner', revision: 1 }
+          }
+        }) as never
+    )
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    await expect(result.current.selectModel({ model: 'model-b', provider: 'provider-b' })).resolves.toBe(true)
+
+    expect($sessionStates.get()[PRIMARY_RUNTIME_ID]).toMatchObject({
+      model: 'model-b',
+      provider: 'provider-b',
+      pendingModelSelection: null,
+      selectorObservation: { version: { epoch: 'owner-a', revision: 7 } }
+    })
+  })
+
+  it.each(['openrouter', 'anthropic', 'openai-codex', 'moa', 'ollama-cloud', 'ollama-launch', 'custom:target', 'auto'])(
+    'preserves A→B→A intent when older selector replies arrive last (%s)',
+    async provider => {
+      const replies: Array<(value: unknown) => void> = []
+
+      const requestGateway = vi.fn(
+        (_method: string, _params?: Record<string, unknown>) =>
+          new Promise<never>(resolve => {
+            replies.push(value => resolve(value as never))
+          })
+      )
+
+      const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+      const choices = [
+        result.current.selectModel({ provider, model: 'model-a' }),
+        result.current.selectModel({ provider: 'openrouter', model: 'model-b' }),
+        result.current.selectModel({ provider, model: 'model-a' })
+      ]
+
+      for (const index of [2, 1, 0]) {
+        replies[index]({ key: 'model', scope: 'session', value: index === 1 ? 'model-b' : 'model-a' })
+        await expect(choices[index]).resolves.toBe(true)
+        expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-a')
+        expect(PRIMARY_SESSION_VIEW.$provider.get()).toBe(provider)
+      }
+
+      expect(requestGateway.mock.calls.map(([, params]) => params)).toEqual([
+        expect.objectContaining({ value: `model-a --provider ${provider} --session`, session_id: PRIMARY_RUNTIME_ID }),
+        expect.objectContaining({ value: 'model-b --provider openrouter --session', session_id: PRIMARY_RUNTIME_ID }),
+        expect.objectContaining({ value: `model-a --provider ${provider} --session`, session_id: PRIMARY_RUNTIME_ID })
+      ])
+    }
+  )
 })

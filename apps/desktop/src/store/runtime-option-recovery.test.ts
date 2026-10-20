@@ -42,12 +42,15 @@ function context(response: unknown, dimension: 'effort' | 'fast' = 'effort') {
   }
 }
 
-it.each([undefined, null, '', '   ', 0, false])('does not accept readback with unproven host boot %#', async host_boot_id => {
-  const ctx = context({ owner: 'compute_host', session_id: 'r', host_boot_id, value: 'high' })
-  await reconcileRuntimeOptionFailure(Object.assign(new Error('unknown'), { code: 5019 }), ctx)
-  expect(ctx.applyObserved).not.toHaveBeenCalled()
-  expect($sessionStates.get().r.unconfirmedRuntimeOptions).toEqual(['effort'])
-})
+it.each([undefined, null, '', '   ', 0, false])(
+  'does not accept readback with unproven host boot %#',
+  async host_boot_id => {
+    const ctx = context({ owner: 'compute_host', session_id: 'r', host_boot_id, value: 'high' })
+    await reconcileRuntimeOptionFailure(Object.assign(new Error('unknown'), { code: 5019 }), ctx)
+    expect(ctx.applyObserved).not.toHaveBeenCalled()
+    expect($sessionStates.get().r.unconfirmedRuntimeOptions).toEqual(['effort'])
+  }
+)
 
 it.each([
   ['effort', 'none', 'none'],
@@ -57,12 +60,22 @@ it.each([
   ['fast', 'fast', true]
 ] as const)('reads %s=%s without retrying a write', async (dimension, value, expected) => {
   const ctx = context({ owner: 'compute_host', session_id: 'r', host_boot_id: 'owner-boot', value }, dimension)
-  expect(await reconcileRuntimeOptionFailure(Object.assign(new Error('unknown'), { code: 5019 }), ctx)).toBe(true)
+  expect(await reconcileRuntimeOptionFailure(Object.assign(new Error('unknown'), { code: 5019 }), ctx)).toBe('observed')
   expect(ctx.request).toHaveBeenCalledExactlyOnceWith('config.get', {
     key: dimension === 'effort' ? 'reasoning' : 'fast',
     session_id: 'r'
   })
   expect(ctx.applyObserved).toHaveBeenCalledExactlyOnceWith(expected)
+  expect($sessionStates.get().r.unconfirmedRuntimeOptions).toBeUndefined()
+})
+
+it('reconciles a session-bound in-process readback after an unknown write acknowledgement', async () => {
+  const ctx = context({ owner: 'gateway', session_id: 'r', value: 'medium' })
+
+  await expect(reconcileRuntimeOptionFailure(Object.assign(new Error('unknown'), { code: 5019 }), ctx)).resolves.toBe(
+    'observed'
+  )
+  expect(ctx.applyObserved).toHaveBeenCalledExactlyOnceWith('medium')
   expect($sessionStates.get().r.unconfirmedRuntimeOptions).toBeUndefined()
 })
 
@@ -115,8 +128,15 @@ it('leaves confirmed rejection on the existing rollback path without reading', a
   const ctx = context({})
   expect(
     await reconcileRuntimeOptionFailure(Object.assign(new Error('request not applied'), { code: 4009 }), ctx)
-  ).toBe(false)
+  ).toBe('not_uncertain')
   expect(ctx.request).not.toHaveBeenCalled()
+})
+
+it.each(['not_sent', 'not_applied'])('does not reconcile a typed %s refusal as unknown', async delivery => {
+  const ctx = context({})
+  expect(await reconcileRuntimeOptionFailure({ code: 5019, data: { delivery } }, ctx)).toBe('not_uncertain')
+  expect(ctx.request).not.toHaveBeenCalled()
+  expect($sessionStates.get().r.unconfirmedRuntimeOptions).toBeUndefined()
 })
 
 it('clears only the acknowledged dimension', () => {
@@ -128,7 +148,7 @@ it('clears only the acknowledged dimension', () => {
 it('does not recreate a removed runtime even if an intent guard remains true', async () => {
   const ctx = context({ owner: 'compute_host', session_id: 'r', value: 'high' })
   $sessionStates.set({})
-  await expect(reconcileRuntimeOptionFailure(new Error('request timed out'), ctx)).resolves.toBe(true)
+  await expect(reconcileRuntimeOptionFailure(new Error('request timed out'), ctx)).resolves.toBe('obsolete')
   expect(ctx.request).not.toHaveBeenCalled()
   expect($sessionStates.get()).toEqual({})
   expect(notify).not.toHaveBeenCalled()

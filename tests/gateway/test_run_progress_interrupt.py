@@ -61,6 +61,7 @@ class PreInterruptAgent:
     """
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
         self._interrupt_requested = False
@@ -84,6 +85,7 @@ class InterruptedAgent:
     """
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
         # Start already interrupted — simulates stop having already landed
@@ -110,6 +112,7 @@ class PartialTruncationAgent:
     """Returns an incomplete turn with no visible assistant text."""
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
         self._interrupt_requested = False

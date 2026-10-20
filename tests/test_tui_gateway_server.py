@@ -680,7 +680,7 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
     monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
-    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: dict(fixed_info))
+    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None, *, lock_held=False: dict(fixed_info))
     monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
     monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
     fake_title = types.ModuleType("agent.title_generator")
@@ -3200,7 +3200,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
     monkeypatch.setattr(
         server,
         "_session_info",
-        lambda agent, *a: {"model": "test", "tools": {}, "skills": {}},
+        lambda agent, *a, lock_held=False: {"model": "test", "tools": {}, "skills": {}},
     )
     monkeypatch.setattr(
         server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None
@@ -3659,9 +3659,9 @@ def test_slow_resume_hydration_degrades_instead_of_killing_agent_init(monkeypatc
         with caplog.at_level("WARNING", logger="tui_gateway.server"):
             outcome = server._await_resume_history(session, sid, "hydration-degrade-key")
         assert outcome == "degraded"
-        assert session["resume_hydrating"] is False
+        assert session["resume_hydrating"] is True
         assert session["history"] == []
-        assert event.is_set()
+        assert not event.is_set()
         statuses = [payload["status"] for name, payload in events
                     if name == "session.resume_progress"]
         assert statuses == ["slow", "degraded_timeout"]
@@ -3869,7 +3869,7 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     monkeypatch.setattr(server, "_make_agent", fake_make_agent)
     monkeypatch.setattr(
-        server, "_session_info", lambda agent, *a: {"model": "test", "tools": {}, "skills": {}}
+        server, "_session_info", lambda agent, *a, lock_held=False: {"model": "test", "tools": {}, "skills": {}}
     )
     monkeypatch.setattr(
         server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None
@@ -3929,7 +3929,7 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     monkeypatch.setattr(server, "_set_session_context", lambda target: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     monkeypatch.setattr(server, "_make_agent", fake_make_agent)
-    monkeypatch.setattr(server, "_session_info", lambda agent, *a: {"model": agent.model, "provider": agent.provider})
+    monkeypatch.setattr(server, "_session_info", lambda agent, *a, lock_held=False: {"model": agent.model, "provider": agent.provider})
 
     def fake_init_session(sid, key, agent, history, cols=80, **_kwargs):
         server._sessions[sid] = {"agent": agent, "session_key": key}
@@ -4027,7 +4027,7 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
     monkeypatch.setattr(
         server,
         "_session_info",
-        lambda _agent, session=None: {"cwd": session.get("cwd") if session else ""},
+        lambda _agent, session=None, *, lock_held=False: {"cwd": session.get("cwd") if session else ""},
     )
 
     import tools.approval as approval
@@ -7343,7 +7343,7 @@ def _configure_immediate_prompt_run(
     monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
     monkeypatch.setattr(server, "_set_session_context", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
-    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_session_info", lambda *_args, lock_held=False: {})
     monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
     monkeypatch.setattr(
         server, "_sync_session_key_after_compress", lambda *_args, **_kwargs: None
@@ -8492,7 +8492,8 @@ def test_config_set_approval_mode_persists_three_way_value_and_emits_live_status
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     emitted = []
     monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
-    server._sessions["sid"] = {"agent": object(), "session_key": "profile-session"}
+    server._sessions["sid"] = {"agent": object(), "session_key": "profile-session",
+                               "history_lock": threading.Lock()}
 
     try:
         resp = server.handle_request(
@@ -8646,7 +8647,7 @@ def test_config_set_fast_updates_live_agent_session_scoped(monkeypatch):
     monkeypatch.setattr(
         server, "_write_config_key", lambda path, value: writes.append((path, value))
     )
-    monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
+    monkeypatch.setattr(server, "_session_info", lambda _agent, *a, lock_held=False: {"model": "x"})
     monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
     monkeypatch.setattr(
         "hermes_cli.models.resolve_fast_mode_overrides",
@@ -10187,7 +10188,7 @@ def test_config_set_personality_preserves_history_and_returns_info(monkeypatch):
         lambda cfg=None: {"helpful": "You are helpful."},
     )
     monkeypatch.setattr(
-        server, "_session_info", lambda agent, *a: {"model": getattr(agent, "model", "?")}
+        server, "_session_info", lambda agent, *a, lock_held=False: {"model": getattr(agent, "model", "?")}
     )
     monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
     # Persistence now flows through the single owner (hermes_cli.personality),
@@ -10302,7 +10303,7 @@ def test_session_compress_uses_compress_helper(monkeypatch):
         "_compress_session_history",
         lambda session, focus_topic=None, **_kw: (2, {"total": 42}),
     )
-    monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
+    monkeypatch.setattr(server, "_session_info", lambda _agent, *a, lock_held=False: {"model": "x"})
 
     with patch("tui_gateway.server._emit") as emit:
         resp = server.handle_request(
@@ -10334,7 +10335,7 @@ def test_session_compress_normalizes_messages_for_desktop_transcript(monkeypatch
     agent = types.SimpleNamespace()
     server._sessions["sid"] = _session(agent=agent, history=history)
     monkeypatch.setattr(server, "_compress_session_history", lambda *_args, **_kwargs: (0, {}))
-    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_session_info", lambda *_args, lock_held=False: {})
 
     try:
         response = server.handle_request(
@@ -10404,17 +10405,20 @@ def test_session_compress_forwards_120_second_budget_to_compute_host(monkeypatch
         server._sessions.pop("sid", None)
 
     assert resp["result"]["status"] == "compressed"
-    assert calls == [
-        (
-            ("sid",),
-            {
-                "route_name": "session.compress",
-                "command": "/compress",
-                "wait": True,
-                "timeout": 120.0,
-            },
-        )
-    ]
+    # The 120s budget must reach the host unchanged. Since the manual-compress
+    # change the call also carries the serving gateway's session snapshot so
+    # the host can rebuild a resumed session before compressing it; assert the
+    # contract, not a brittle full-dict snapshot.
+    assert len(calls) == 1
+    (call_args, call_kwargs) = calls[0]
+    assert call_args == ("sid",)
+    assert call_kwargs["route_name"] == "session.compress"
+    assert call_kwargs["command"] == "/compress"
+    assert call_kwargs["wait"] is True
+    assert call_kwargs["timeout"] == 120.0
+    _snapshot = call_kwargs["payload"]["session_snapshot"]
+    assert _snapshot["type"] == "turn.start"
+    assert _snapshot["sid"] == "sid"
 
 
 def test_session_compress_preserves_compute_host_aborted_summary(monkeypatch):
@@ -10479,7 +10483,7 @@ def test_session_compress_reports_aborted_summary_without_success(monkeypatch):
         "_compress_session_history",
         lambda session, focus_topic=None, **_kw: (0, {"total": 42}),
     )
-    monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
+    monkeypatch.setattr(server, "_session_info", lambda _agent, *a, lock_held=False: {"model": "x"})
 
     try:
         with patch("tui_gateway.server._emit"):
@@ -10530,7 +10534,7 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
         return 2, {"total": 42}
 
     monkeypatch.setattr(server, "_compress_session_history", _compress)
-    monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
+    monkeypatch.setattr(server, "_session_info", lambda _agent, *a, lock_held=False: {"model": "x"})
     restart_calls = []
     monkeypatch.setattr(
         server,
@@ -10583,7 +10587,7 @@ def test_session_compress_sync_failure_discards_lcm_notification(monkeypatch):
     monkeypatch.setattr(
         server,
         "_session_info",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("finalization failed")),
+        lambda *_args, lock_held=False: (_ for _ in ()).throw(RuntimeError("finalization failed")),
     )
 
     try:
@@ -11940,7 +11944,7 @@ def test_session_info_includes_session_title(monkeypatch):
 
     info = server._session_info(
         types.SimpleNamespace(tools=[], model="test/model", provider="openai-codex"),
-        {"session_key": "session-key", "history": []},
+        {"session_key": "session-key", "history": [], "history_lock": threading.Lock()},
     )
 
     assert info["title"] == "Dashboard title"
@@ -11954,6 +11958,7 @@ def test_session_info_reports_pending_model_switch(monkeypatch):
     session = {
         "session_key": "",
         "history": [],
+        "history_lock": threading.Lock(),
         "pending_model_switch": {
             "raw": "new/model --provider anthropic",
             "display_model": "new/model",
@@ -11974,6 +11979,7 @@ def test_session_info_includes_turn_started_at():
     agent = types.SimpleNamespace(tools=[], model="", provider="")
     session = {
         "history": [],
+        "history_lock": threading.Lock(),
         "inflight_turn": {"started_at": 1_700_000_123.5},
         "running": True,
     }
@@ -13718,6 +13724,7 @@ def test_respond_unpacks_sid_tuple_correctly():
     """After the (sid, Event) tuple change, _respond must still work."""
     ev = threading.Event()
     server._pending["rid-x"] = ("sid_x", ev)
+    server._pending_prompt_payloads["rid-x"] = ("clarify.request", {})
     try:
         resp = server.handle_request(
             {
@@ -13731,6 +13738,7 @@ def test_respond_unpacks_sid_tuple_correctly():
         assert server._answers.get("rid-x") == "the answer"
     finally:
         server._pending.pop("rid-x", None)
+        server._pending_prompt_payloads.pop("rid-x", None)
         server._answers.pop("rid-x", None)
 
 
@@ -13882,7 +13890,8 @@ def test_mirror_slash_side_effects_allowed_when_idle(monkeypatch):
 
     applied = {"model": False}
 
-    def _fake_apply_model(sid, session, arg):
+    def _fake_apply_model(sid, session, arg, *, explicit_model_intent=False):
+        assert explicit_model_intent is True
         applied["model"] = True
         return {"value": arg, "warning": ""}
 
@@ -13919,7 +13928,7 @@ def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
 
     monkeypatch.setattr(server, "_compress_session_history", _fake_compress)
     monkeypatch.setattr(server, "_sync_session_key_after_compress", _fake_sync)
-    monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
+    monkeypatch.setattr(server, "_session_info", lambda _agent, *a, lock_held=False: {"model": "x"})
     monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
 
     session = _session(running=False)
@@ -14187,7 +14196,7 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
         "_get_db",
         lambda: types.SimpleNamespace(create_session=lambda *a, **kw: None),
     )
-    monkeypatch.setattr(server, "_session_info", lambda _a, *a2: {"model": "x"})
+    monkeypatch.setattr(server, "_session_info", lambda _a, *a2, lock_held=False: {"model": "x"})
     monkeypatch.setattr(server, "_probe_credentials", lambda _a: None)
     monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
@@ -14295,7 +14304,7 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
         "_get_db",
         lambda: types.SimpleNamespace(create_session=lambda *a, **kw: None),
     )
-    monkeypatch.setattr(server, "_session_info", lambda _a, *a2: {"model": "x"})
+    monkeypatch.setattr(server, "_session_info", lambda _a, *a2, lock_held=False: {"model": "x"})
     monkeypatch.setattr(server, "_probe_credentials", lambda _a: None)
     monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
@@ -14399,7 +14408,7 @@ def test_session_create_continues_when_state_db_is_unavailable(monkeypatch):
     monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_db=None, **_kwargs: _FakeAgent())
     monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda _a, *a2: {"model": "x"})
+    monkeypatch.setattr(server, "_session_info", lambda _a, *a2, lock_held=False: {"model": "x"})
     monkeypatch.setattr(server, "_probe_credentials", lambda _a: None)
     monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: emits.append(a))
@@ -15566,8 +15575,16 @@ def test_model_options_hides_unconfigured_providers_by_default(monkeypatch):
     assert calls[-1]["include_unconfigured"] is True
 
 
-def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypatch):
+@pytest.mark.parametrize("has_anthropic_oauth", [False, True])
+def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypatch, has_anthropic_oauth):
     from hermes_cli.inventory import ConfigContext
+
+    # Explicit OAuth is a separate discovery input from configured API keys.
+    # Control both states; never let a developer's Claude login affect this fixture.
+    monkeypatch.setattr(
+        "hermes_cli.inventory._anthropic_oauth_credentials_present",
+        lambda: has_anthropic_oauth,
+    )
 
     class _Agent:
         provider = "custom"
@@ -15626,9 +15643,8 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
 
     assert "result" in resp, resp
     assert resp["result"]["provider"] == "custom:local-ollama"
-    assert [row["slug"] for row in resp["result"]["providers"]] == [
-        "custom:local-ollama"
-    ]
+    expected_slugs = (["anthropic"] if has_anthropic_oauth else []) + ["custom:local-ollama"]
+    assert [row["slug"] for row in resp["result"]["providers"]] == expected_slugs
     canonical.assert_called_once_with(
         base_url="http://127.0.0.1:11434/v1",
         config_provider="custom:local-ollama",
@@ -15995,6 +16011,8 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     started = threading.Event()
     release = threading.Event()
     done = threading.Event()
+    allow_settle = threading.Event()
+    turn_thread = None
 
     class _Agent:
         model = "model-live"
@@ -16018,11 +16036,12 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent, _session=None: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, _session=None, *, lock_held=False: {"model": agent.model})
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
             done.set()
+            assert allow_settle.wait(2), "test did not release terminal publication"
 
     monkeypatch.setattr(server, "_emit", _emit)
 
@@ -16036,6 +16055,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         )
         assert submit["result"]["status"] == "streaming"
         assert started.wait(2), "fake model did not stream before activation"
+        turn_thread = server._sessions["sid-live"]["_run_thread"]
 
         resp = server.handle_request(
             {
@@ -16058,6 +16078,21 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
 
         release.set()
         assert done.wait(2), "fake model turn did not complete"
+        # Bubble completion retains this admission until guarded lifecycle and
+        # once-model cleanup finish; it does not admit a successor by itself.
+        terminal = server.handle_request({
+            "id": "activate-terminal", "method": "session.activate",
+            "params": {"session_id": "sid-live"},
+        })
+        assert terminal["result"]["inflight"] == {
+            "assistant": "partial answer", "streaming": False,
+            "user": "write a long answer",
+        }
+        assert terminal["result"]["turn_started_at"] == turn_started_at
+        assert server._sessions["sid-live"]["running"] is True
+        allow_settle.set()
+        turn_thread.join(timeout=2)
+        assert not turn_thread.is_alive(), "fake model turn did not settle"
         completed = server.handle_request(
             {
                 "id": "activate-done",
@@ -16073,7 +16108,9 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         ]
     finally:
         release.set()
-        done.wait(2)
+        allow_settle.set()
+        if turn_thread is not None:
+            turn_thread.join(timeout=2)
         server._sessions.pop("sid-live", None)
 
 
@@ -16085,7 +16122,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     that copy without leaking the transport object.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_session_info", lambda agent, _session=None: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, _session=None, *, lock_held=False: {"model": agent.model})
     agent = types.SimpleNamespace(model="model-live")
     session = _session(
         agent=agent,
@@ -16118,7 +16155,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
 
 
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent, _session=None: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, _session=None, *, lock_held=False: {"model": agent.model})
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "old"}],
@@ -16155,7 +16192,7 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
 
 
 def test_session_activate_can_omit_duplicate_desktop_transcript(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent, _session=None: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, _session=None, *, lock_held=False: {"model": agent.model})
     server._sessions["sid-large"] = _session(
         agent=types.SimpleNamespace(model="model-large"),
         history=[
@@ -18662,10 +18699,11 @@ def test_reset_session_agent_clears_session_overrides(monkeypatch):
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
     monkeypatch.setattr(server, "_load_show_reasoning", lambda: True)
     monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "all")
-    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_session_info", lambda *_args, lock_held=False: {})
     monkeypatch.setattr(server, "_emit", lambda *_args: None)
     monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
 
+    monkeypatch.setitem(server._sessions, "sid", session)
     server._reset_session_agent("sid", session)
 
     # No session overrides forwarded — fresh agent builds from config.
@@ -20000,7 +20038,8 @@ def test_fallback_session_info_reports_session_cwd_not_launch_dir(monkeypatch):
     monkeypatch.setattr(server, "_project_info_for_cwd", lambda cwd: None)
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
-    info = server._fallback_session_info({"cwd": "/projects/session-own-repo"})
+    info = server._fallback_session_info({"cwd": "/projects/session-own-repo",
+                                          "history_lock": threading.Lock()})
 
     assert info["cwd"] == "/projects/session-own-repo"
     assert info["branch"] == "bb/feature"
@@ -20017,7 +20056,7 @@ def test_fallback_session_info_always_emits_branch(monkeypatch):
     monkeypatch.setattr(server, "_project_info_for_cwd", lambda cwd: None)
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
-    info = server._fallback_session_info({"cwd": "/plain/folder"})
+    info = server._fallback_session_info({"cwd": "/plain/folder", "history_lock": threading.Lock()})
 
     assert "branch" in info
     assert info["branch"] == ""
@@ -21509,7 +21548,7 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
         lambda cwd: str(new_cwd),
     )
 
-    live = {"session_key": target, "running": True, "cwd": str(tmp_path / "old-project")}
+    live = _session(session_key=target, running=True, cwd=str(tmp_path / "old-project"))
     server._sessions["live-sid"] = live
     monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
 

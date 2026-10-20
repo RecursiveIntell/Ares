@@ -12,8 +12,51 @@ export interface ClarifyQuestion {
   multiSelect: boolean
 }
 
+export interface ClarifyInteraction {
+  draft: string
+  selectedChoices: string[]
+  staged: Record<string, { choices: string[]; draft: string }>
+  submitting: boolean
+  sendError: string | null
+  deliveryUncertain: boolean
+  accepted: boolean
+  acceptedAnswer: string | null
+  cancelled: boolean
+  attempt: number
+}
+
+export const emptyClarifyInteraction: ClarifyInteraction = {
+  draft: '',
+  selectedChoices: [],
+  staged: {},
+  submitting: false,
+  sendError: null,
+  deliveryUncertain: false,
+  accepted: false,
+  acceptedAnswer: null,
+  cancelled: false,
+  attempt: 0
+}
+
+export interface ClarifyScope {
+  requestId: string
+  sessionId: string | null
+  generation?: number
+}
+
+export interface ClarifyResponseToken extends ClarifyScope {
+  attempt: number
+}
+
 export interface ClarifyRequest {
   requestId: string
+  /** Renderer lifecycle identity, retained on replay and renewed after cleanup. */
+  generation?: number
+  interaction?: ClarifyInteraction
+  /** Local delivery receipt after authoritative absence of a backend blocker. */
+  deliveryOnly?: boolean
+  /** Terminal response state reported by the owning Gateway. */
+  responseState?: 'conflict' | 'expired'
   question: string
   choices: string[] | null
   multiSelect: boolean
@@ -118,21 +161,160 @@ const keyFor = (sessionId: string | null | undefined): string => sessionId ?? ''
 
 export const $clarifyRequests = atom<Record<string, ClarifyRequest>>({})
 
-// The clarify request for the currently-viewed session. The inline ClarifyTool
-// only ever mounts inside the active session's transcript, so it reads this
-// focus-scoped view rather than reaching into the whole map.
-export const $clarifyRequest = computed(
-  [$clarifyRequests, $activeSessionId],
-  (requests, activeId) => requests[keyFor(activeId)] ?? null
-)
+// The active session's live blocker, excluding display-only delivery receipts.
+export const $clarifyRequest = computed([$clarifyRequests, $activeSessionId], (requests, activeId) => {
+  const request = requests[keyFor(activeId)]
 
-/** The clarify request for one specific session — the tile counterpart of the
- *  active-session `$clarifyRequest` view (same map, fixed key). */
+  return request && !request.deliveryOnly ? request : null
+})
+
+/** Inline card state for one session, including retained delivery receipts. */
 export const sessionClarifyRequest = (sessionId: string | null) =>
   computed($clarifyRequests, requests => requests[keyFor(sessionId)] ?? null)
 
+let clarifyGeneration = 0
+
 export function setClarifyRequest(request: ClarifyRequest): void {
-  $clarifyRequests.set({ ...$clarifyRequests.get(), [keyFor(request.sessionId)]: request })
+  const requests = $clarifyRequests.get()
+  const key = keyFor(request.sessionId)
+  const current = requests[key]
+
+  const sameRequest = current?.requestId === request.requestId
+
+  const nextRequest = {
+    ...request,
+    generation: sameRequest ? current.generation : ++clarifyGeneration,
+    interaction: sameRequest ? current.interaction : { ...emptyClarifyInteraction },
+    deliveryOnly: false,
+    responseState: sameRequest ? current.responseState : undefined
+  }
+
+  $clarifyRequests.set({ ...requests, [key]: nextRequest })
+}
+
+/** An absent blocker says nothing about an answer whose receipt was lost. */
+export function retainClarifyDelivery(scope: ClarifyScope): boolean {
+  const requests = $clarifyRequests.get()
+  const key = keyFor(scope.sessionId)
+  const current = requests[key]
+
+  if (!current || current.requestId !== scope.requestId || current.generation !== scope.generation) {
+    return false
+  }
+
+  const interaction = current.interaction
+
+  if (!interaction) {
+    return false
+  }
+
+  const submitted = interaction.submitting || interaction.deliveryUncertain || interaction.accepted
+
+  const drafted =
+    interaction.draft.trim() ||
+    interaction.selectedChoices.length ||
+    Object.values(interaction.staged).some(stage => stage.draft.trim() || stage.choices.length)
+
+  if (!submitted && !drafted) {
+    return false
+  }
+
+  $clarifyRequests.set({
+    ...requests,
+    [key]: {
+      ...current,
+      deliveryOnly: true,
+      responseState: current.responseState ?? (submitted ? undefined : 'expired')
+    }
+  })
+
+  return true
+}
+
+/** Update only this lifecycle; a late promise cannot mutate a replacement. */
+export function updateClarifyInteraction(
+  scope: ClarifyScope,
+  patch: Partial<ClarifyInteraction> | ((current: ClarifyInteraction) => Partial<ClarifyInteraction>)
+): boolean {
+  const requests = $clarifyRequests.get()
+  const key = keyFor(scope.sessionId)
+  const current = requests[key]
+
+  if (!current || current.requestId !== scope.requestId || current.generation !== scope.generation) {
+    return false
+  }
+
+  const interaction = current.interaction ?? emptyClarifyInteraction
+  const delta = typeof patch === 'function' ? patch(interaction) : patch
+  $clarifyRequests.set({ ...requests, [key]: { ...current, interaction: { ...interaction, ...delta } } })
+
+  return true
+}
+
+/** Synchronous admission survives remounts and blocks duplicate clicks/windows. */
+export function beginClarifyResponse(scope: ClarifyScope): ClarifyResponseToken | null {
+  const current = $clarifyRequests.get()[keyFor(scope.sessionId)]
+
+  if (
+    !current ||
+    current.requestId !== scope.requestId ||
+    current.generation !== scope.generation ||
+    current.responseState ||
+    current.interaction?.accepted ||
+    current.interaction?.submitting
+  ) {
+    return null
+  }
+
+  const attempt = (current.interaction?.attempt ?? 0) + 1
+  updateClarifyInteraction(scope, {
+    attempt,
+    submitting: true,
+    sendError: current.interaction?.deliveryUncertain ? current.interaction.sendError : null
+  })
+
+  return { requestId: scope.requestId, sessionId: scope.sessionId, generation: scope.generation, attempt }
+}
+
+export function isClarifyResponseCurrent(token: ClarifyResponseToken): boolean {
+  const current = $clarifyRequests.get()[keyFor(token.sessionId)]
+
+  return (
+    current?.requestId === token.requestId &&
+    current.generation === token.generation &&
+    current.interaction?.attempt === token.attempt
+  )
+}
+
+export function finishClarifyResponse(token: ClarifyResponseToken): void {
+  const current = $clarifyRequests.get()[keyFor(token.sessionId)]
+
+  if (current?.interaction?.attempt === token.attempt) {
+    updateClarifyInteraction(token, { submitting: false })
+  }
+}
+
+/** Mark only the exact request which received a terminal Gateway response. */
+export function markClarifyResponseState(
+  requestId: string,
+  sessionId: string | null | undefined,
+  responseState: ClarifyRequest['responseState'],
+  generation?: number
+): void {
+  const requests = $clarifyRequests.get()
+  const key = keyFor(sessionId)
+  const current = requests[key]
+
+  if (
+    !current ||
+    current.requestId !== requestId ||
+    !responseState ||
+    (generation !== undefined && current.generation !== generation)
+  ) {
+    return
+  }
+
+  $clarifyRequests.set({ ...requests, [key]: { ...current, responseState } })
 }
 
 export function clearClarifyRequest(requestId?: string, sessionId?: string | null): void {
@@ -176,7 +358,7 @@ export function clearClarifyRequest(requestId?: string, sessionId?: string | nul
 /** Whether `sessionId` has a clarify parked on it right now (imperative read —
  *  the composer checks this on Enter, not on every render). */
 export const hasClarifyRequest = (sessionId: string | null | undefined): boolean =>
-  Boolean($clarifyRequests.get()[keyFor(sessionId)])
+  Boolean($clarifyRequests.get()[keyFor(sessionId)] && !$clarifyRequests.get()[keyFor(sessionId)].deliveryOnly)
 
 /**
  * Answer `sessionId`'s pending clarify with an empty answer (a skip) and drop it
@@ -194,7 +376,7 @@ export const hasClarifyRequest = (sessionId: string | null | undefined): boolean
 export async function skipClarifyRequest(sessionId: string | null | undefined): Promise<boolean> {
   const request = $clarifyRequests.get()[keyFor(sessionId)]
 
-  if (!request) {
+  if (!request || request.deliveryOnly) {
     return false
   }
 
@@ -212,7 +394,7 @@ export async function skipClarifyRequest(sessionId: string | null | undefined): 
         request.sessionId,
         gateway.request.bind(gateway) as typeof gateway.request,
         'clarify.respond',
-        { request_id: request.requestId, answer: '' }
+        { request_id: request.requestId, session_id: request.sessionId, answer: '' }
       )
     }
   } catch {

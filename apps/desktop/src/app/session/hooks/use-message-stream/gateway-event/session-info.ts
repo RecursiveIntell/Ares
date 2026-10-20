@@ -1,5 +1,8 @@
+import { getApiRequestConnection } from '@/api/client'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
+import { reconcileSelectorInfo } from '@/lib/selector-observation'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { followActiveSessionCwd } from '@/store/projects'
@@ -24,6 +27,7 @@ import {
   setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
+import { knownOwnerForSession } from '@/store/session-states'
 import { reportInstallMethodWarning } from '@/store/updates'
 
 import { finalizeInterruptedMessages } from '../../use-prompt-actions/rewind'
@@ -136,7 +140,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // session, OR when it's a global broadcast and we have no session.
     const apply = (explicitSid ? isActiveEvent : !activeSessionIdRef.current) || rebound
     const statePatch = sessionInfoStatePatch(payload)
-    const hasStatePatch = hasSessionInfoStatePatch(statePatch)
+    const hasStatePatch = hasSessionInfoStatePatch(statePatch) || Boolean(payload?.pending_runtime_options)
     const modelChanged = typeof payload?.model === 'string'
     const providerChanged = typeof payload?.provider === 'string'
     const runningChanged = typeof payload?.running === 'boolean'
@@ -152,7 +156,24 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // A reconnect retires the old runtime id. It may still have buffered
     // session.info frames, but those frames cannot prove the durable turn has
     // settled: only a fresh runtime binding or durable hydrate may do that.
+    const selectorPatch = reconcileSelectorInfo(knownState ?? createClientSessionState(), payload ?? {})
     const retiredRuntime = Boolean(knownState?.reconnecting)
+    // A fresh renderer has no optimistic state to preserve. Hydrate the
+    // session-owned deferred intent only from an admitted, non-retired owner.
+    const reportedOptions = retiredRuntime ? null : payload?.pending_runtime_options
+
+    const rawIncomingOptions =
+      reportedOptions && typeof reportedOptions === 'object'
+        ? {
+            ...(typeof reportedOptions.effort === 'string' ? { effort: reportedOptions.effort } : {}),
+            ...(typeof reportedOptions.fast === 'boolean' ? { fast: reportedOptions.fast } : {})
+          }
+        : null
+
+    const incomingOptions =
+      knownState?.selectorObservation && !selectorPatch.selectorObservation ? null : rawIncomingOptions
+
+    const pendingOptions = knownState?.pendingRuntimeOptions ?? incomingOptions
     const modelValueChanged = modelChanged && payload!.model !== (knownState?.model ?? $currentModel.get())
 
     const providerValueChanged =
@@ -212,20 +233,39 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         setCurrentPersonality(normalizePersonalityValue(payload.personality))
       }
 
-      if (typeof payload?.reasoning_effort === 'string') {
-        setCurrentReasoningEffort(payload.reasoning_effort)
+      if (
+        selectorPatch.reasoningEffort !== undefined &&
+        (pendingOptions?.effort === undefined || selectorPatch.reasoningEffort === pendingOptions.effort)
+      ) {
+        setCurrentReasoningEffort(selectorPatch.reasoningEffort, false)
       }
 
-      if (typeof payload?.service_tier === 'string') {
-        setCurrentServiceTier(payload.service_tier)
+      if (
+        selectorPatch.serviceTier !== undefined &&
+        (pendingOptions?.fast === undefined || selectorPatch.fast === pendingOptions.fast)
+      ) {
+        setCurrentServiceTier(selectorPatch.serviceTier)
       }
 
-      if (typeof payload?.fast === 'boolean') {
-        setCurrentFastMode(payload.fast)
+      if (
+        selectorPatch.fast !== undefined &&
+        (pendingOptions?.fast === undefined || selectorPatch.fast === pendingOptions.fast)
+      ) {
+        setCurrentFastMode(selectorPatch.fast, false)
       }
 
       if (typeof payload?.yolo === 'boolean') {
         setYoloActive(payload.yolo)
+      }
+
+      if (sessionId && !knownState?.pendingRuntimeOptions && incomingOptions) {
+        if (incomingOptions.effort !== undefined) {
+          setCurrentReasoningEffort(incomingOptions.effort, false)
+        }
+
+        if (incomingOptions.fast !== undefined) {
+          setCurrentFastMode(incomingOptions.fast, false)
+        }
       }
     }
 
@@ -233,36 +273,33 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
       updateSessionState(
         sessionId,
         state => {
-          const pending = state.pendingModelSelection
-          const hasIncomingModelMetadata = statePatch.model !== undefined || statePatch.provider !== undefined
+          const {
+            model: _model,
+            provider: _provider,
+            reasoningEffort: _effort,
+            fast: _fast,
+            serviceTier: _tier,
+            ...other
+          } = statePatch
+          const pending = state.pendingRuntimeOptions ?? incomingOptions
 
-          // A model click updates the owning runtime slice immediately. A
-          // session.info heartbeat that was queued before that click can arrive
-          // later with the exact previous pair; it is stale relative to the
-          // local intent, not evidence that the click failed. A matching pick
-          // or genuinely different backend-normalized pair remains authoritative
-          // and settles the pending selection.
-          const repeatsPreviousModel =
-            Boolean(pending) &&
-            hasIncomingModelMetadata &&
-            (statePatch.model === undefined || statePatch.model === pending?.previousModel) &&
-            (statePatch.provider === undefined || statePatch.provider === pending?.previousProvider)
+          const base =
+            !state.pendingRuntimeOptions && incomingOptions
+              ? { ...state, pendingRuntimeOptions: incomingOptions }
+              : state
 
-          const { model: _incomingModel, provider: _incomingProvider, ...nonModelStatePatch } = statePatch
-          const effectiveStatePatch = repeatsPreviousModel ? nonModelStatePatch : statePatch
-
-          const pendingModelSelection = repeatsPreviousModel
-            ? pending
-            : hasIncomingModelMetadata
-              ? null
-              : pending
+          const selectors = reconcileSelectorInfo(base, payload ?? {})
 
           return {
             ...state,
-            ...effectiveStatePatch,
-            branch: effectiveStatePatch.branch ?? state.branch,
-            cwd: effectiveStatePatch.cwd ?? state.cwd,
-            pendingModelSelection
+            ...other,
+            ...selectors,
+            ...(pending?.effort !== undefined ? { reasoningEffort: pending.effort } : {}),
+            ...(pending?.fast !== undefined ? { fast: pending.fast } : {}),
+            pendingRuntimeOptions:
+              selectors.pendingRuntimeOptions !== undefined ? selectors.pendingRuntimeOptions : (pending ?? null),
+            branch: other.branch ?? state.branch,
+            cwd: other.cwd ?? state.cwd
           }
         },
         payload?.stored_session_id || undefined
@@ -426,8 +463,28 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     }
 
     if (modelValueChanged || providerValueChanged) {
+      const knownOwner = knownOwnerForSession(sessionId)
+      const owner = typeof knownOwner === 'string' ? { connectionId: 'local', profile: knownOwner } : knownOwner
+      const eventConnection = event.connectionId?.trim() || undefined
+      const eventProfile = event.profile?.trim() || undefined
+
+      const matchesOwner =
+        owner &&
+        (!eventConnection || eventConnection === owner.connectionId) &&
+        (!eventProfile || eventProfile === owner.profile || eventProfile === owner.targetProfile)
+
+      const completeEventOwner = eventConnection && eventProfile
+      const legacyUnstamped = !eventConnection && !eventProfile && !owner
+      const catalogProfile = matchesOwner ? owner.targetProfile || owner.profile : eventProfile || activeGatewayProfile
+      const catalogConnection = matchesOwner ? owner.connectionId : eventConnection || getApiRequestConnection()
+      // An incomplete stamp that conflicts with a known owner cannot name
+      // one exact cache. Invalidate the catalog family without mixing owners.
+      const exactOwner = matchesOwner || completeEventOwner || legacyUnstamped
       void queryClient.invalidateQueries({
-        queryKey: explicitSid && sessionId ? modelOptionsQueryKey(activeGatewayProfile, sessionId) : ['model-options']
+        queryKey:
+          explicitSid && sessionId && exactOwner
+            ? modelOptionsQueryKey(catalogProfile, sessionId, catalogConnection)
+            : ['model-options']
       })
     }
 

@@ -114,8 +114,10 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from tools.registry import tool_error
 from tools.ansi_strip import strip_unicode_tags
@@ -179,63 +181,157 @@ _OSV_MALWARE_CHECK_TIMEOUT_S = 12.0
 # the terminal while prompt_toolkit / Rich is rendering the TUI — which
 # corrupts the display and can hang the session.
 #
-# Instead we redirect every stdio MCP subprocess's stderr into a shared
-# per-profile log file (~/.hermes/logs/mcp-stderr.log), tagged with the
-# server name so individual servers remain debuggable.
+# Each stdio attempt owns a separate file under its config home's logs.
+# The existing mcp-stderr.log remains an index, without interleaving child
+# output from concurrent servers or borrowing another profile's handle.
 #
 # Fallback is os.devnull if opening the log file fails for any reason.
 
-_mcp_stderr_log_fh: Optional[Any] = None
+_mcp_stderr_log_files: Dict[str, Any] = {}
 _mcp_stderr_log_lock = threading.Lock()
+_mcp_stdio_diagnostic: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "mcp_stdio_diagnostic", default=None
+)
 
 
 def _get_mcp_stderr_log() -> Any:
-    """Return a shared append-mode file handle for MCP subprocess stderr.
+    """Return this attempt's stderr file, or this config home's index.
 
-    Opened once per process and reused for every stdio server.  Must have a
-    real OS-level file descriptor (``fileno()``) because asyncio's subprocess
-    machinery wires the child's stderr directly to that fd.  Falls back to
-    ``/dev/null`` if opening the log file fails.
+    The no-argument seam is retained for existing stdio adapters. Attempt
+    handles are closed with the transport; only per-home index handles are
+    cached. Diagnostics must never prevent a connection attempt.
     """
-    global _mcp_stderr_log_fh
+    capture = _mcp_stdio_diagnostic.get()
+    if capture is not None and "stream" in capture:
+        return capture["stream"]
     with _mcp_stderr_log_lock:
-        if _mcp_stderr_log_fh is not None:
-            return _mcp_stderr_log_fh
+        log_path = None
+        fh = None
         try:
-            from hermes_constants import get_hermes_home
-            log_dir = get_hermes_home() / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_path = log_dir / "mcp-stderr.log"
-            # Line-buffered so server output lands on disk promptly; errors=
-            # "replace" tolerates garbled binary output from misbehaving
-            # servers.
-            fh = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
-            # Sanity-check: confirm a real fd is available before we commit.
+            if capture is not None:
+                log_path = Path(capture["stderr_path"])
+            else:
+                from hermes_constants import get_hermes_home
+
+                log_path = get_hermes_home() / "logs" / "mcp-stderr.log"
+                cached = _mcp_stderr_log_files.get(str(log_path))
+                if cached is not None and not cached.closed:
+                    return cached
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(
+                log_path, "x+" if capture is not None else "a", encoding="utf-8",
+                errors="replace", buffering=1, newline="" if capture is not None else None,
+                opener=lambda path, flags: os.open(path, flags, 0o600),
+            )
             fh.fileno()
-            _mcp_stderr_log_fh = fh
+            destination = "file"
         except Exception as exc:  # pragma: no cover — best-effort fallback
-            logger.debug("Failed to open MCP stderr log, using devnull: %s", exc)
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            logger.debug("Failed to open MCP stderr log: %s", type(exc).__name__)
             try:
-                _mcp_stderr_log_fh = open(os.devnull, "w", encoding="utf-8")
+                fh = open(os.devnull, "w", encoding="utf-8")
+                destination = "discarded"
             except Exception:
-                # Last resort: the real stderr.  Not ideal for TUI users but
-                # it matches pre-fix behavior.
-                _mcp_stderr_log_fh = sys.stderr
-        return _mcp_stderr_log_fh
+                fh = sys.stderr
+                destination = "parent_stderr"
+        if capture is not None:
+            capture["stream"] = fh
+            capture["destination"] = destination
+        elif log_path is not None:
+            _mcp_stderr_log_files[str(log_path)] = fh
+        return fh
+
+
+def _stdio_diagnostic_fields(capture: dict) -> dict:
+    """Only ownership and lifecycle metadata; no argv, env or error text."""
+    return {"kind": "mcp.stdio.attempt", **{key: capture.get(key) for key in (
+        "attempt_id", "server", "config_home", "parent_pid", "stderr_path",
+        "destination", "phase", "status", "exception_type",
+    )}}
+
+
+def _begin_stdio_diagnostic(server_name: str) -> dict:
+    capture = {
+        "attempt_id": uuid4().hex, "server": server_name,
+        "config_home": None, "parent_pid": os.getpid(), "stderr_path": None,
+        "phase": "transport", "status": "starting",
+    }
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        capture["config_home"] = str(home)
+        capture["stderr_path"] = str(home / "logs" / "mcp-stderr" / f"{capture['attempt_id']}.log")
+    except Exception:
+        pass  # Unavailable ownership is explicit; capture still fails softly.
+    capture["token"] = _mcp_stdio_diagnostic.set(capture)
+    capture["stream"] = _get_mcp_stderr_log()
+    _write_stderr_log_header(server_name)
+    logger.debug("MCP stdio attempt: %s", json.dumps(_stdio_diagnostic_fields(capture)))
+    return capture
+
+
+def _finish_stdio_diagnostic(capture: dict) -> None:
+    try:
+        record = json.dumps(_stdio_diagnostic_fields(capture))
+        fh = capture.get("stream")
+        try:
+            if fh is not None:
+                boundary = "\n"
+                if capture.get("destination") == "file":
+                    # The transport has unwound. Inspect its last byte through
+                    # the same owned handle; child stderr may omit a newline.
+                    fh.flush()
+                    fh.seek(0, os.SEEK_END)
+                    end = fh.tell()
+                    if end:
+                        fh.seek(end - 1)
+                        boundary = "" if fh.read(1) == "\n" else "\n"
+                    else:
+                        boundary = ""
+                    fh.seek(0, os.SEEK_END)
+                fh.write(boundary + record + "\n")
+                fh.flush()
+        except Exception:
+            pass
+        if capture["status"] != "closed" or capture.get("destination") != "file":
+            logger.warning("MCP stdio attempt ended: %s", record)
+    finally:
+        _mcp_stdio_diagnostic.reset(capture["token"])
+        fh = capture.get("stream")
+        if fh is not None and fh is not sys.stderr:
+            try:
+                fh.close()
+            except Exception:
+                pass
 
 
 def _write_stderr_log_header(server_name: str) -> None:
     """Write a human-readable session marker before launching a server.
 
-    Gives operators a way to find each server's output in the shared
-    ``mcp-stderr.log`` file without needing per-line prefixes (which would
-    require a pipe + reader thread and complicate shutdown).
+    The per-home index points at an attempt-owned file, so concurrent child
+    output can be attributed without changing the MCP protocol streams.
     """
     fh = _get_mcp_stderr_log()
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         fh.write(f"\n===== [{ts}] starting MCP server '{server_name}' =====\n")
         fh.flush()
+        capture = _mcp_stdio_diagnostic.get()
+        if capture is not None:
+            record = json.dumps(_stdio_diagnostic_fields(capture))
+            fh.write(record + "\n")
+            token = _mcp_stdio_diagnostic.set(None)
+            try:
+                index = _get_mcp_stderr_log()
+            finally:
+                _mcp_stdio_diagnostic.reset(token)
+            index.write(record + "\n")
+            index.flush()
     except Exception:
         pass
 
@@ -3280,12 +3376,10 @@ class MCPServerTask:
         # Snapshot child PIDs before spawning so we can track the new one.
         pids_before = _snapshot_child_pids()
         new_pids: set = set()
-        # Redirect subprocess stderr into a shared log file so MCP servers
-        # (FastMCP banners, slack-mcp startup JSON, etc.) don't dump onto
-        # the user's TTY and corrupt the TUI.  Preserves debuggability via
-        # ~/.hermes/logs/mcp-stderr.log.
-        _write_stderr_log_header(self.name)
-        _errlog = _get_mcp_stderr_log()
+        # Each attempt keeps its child stderr and config-home ownership.
+        # The per-home mcp-stderr.log is an index of those files.
+        _diagnostic = _begin_stdio_diagnostic(self.name)
+        _errlog = _diagnostic["stream"]
         try:
             async with stdio_client(server_params, errlog=_errlog) as (
                 read_stream,
@@ -3356,13 +3450,16 @@ class MCPServerTask:
                     connect_timeout = float(
                         config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
                     )
+                    _diagnostic["phase"] = "negotiate"
                     self.initialize_result = await self._negotiate_session(
                         session, connect_timeout
                     )
                     self.session = session
                     self._mark_lifecycle_started()
+                    _diagnostic["phase"] = "discover_tools"
                     await self._discover_tools()
                     self._ready.set()
+                    _diagnostic["phase"] = "active"
                     self._ever_connected = True
                     # Session is live again: clear any breaker state from a
                     # prior outage so the first call after recovery isn't
@@ -3378,7 +3475,17 @@ class MCPServerTask:
                     # _reconnect_event (e.g. future manual /mcp refresh) for
                     # consistency with _run_http.
                     return await self._wait_for_lifecycle_event()
+        except BaseException as exc:
+            _diagnostic["status"] = "failed"
+            _diagnostic["exception_type"] = type(exc).__name__
+            raise
         finally:
+            if _diagnostic["status"] == "starting":
+                _diagnostic["status"] = "closed"
+            try:
+                _finish_stdio_diagnostic(_diagnostic)
+            except Exception:
+                logger.debug("Failed to finalize MCP stdio diagnostics", exc_info=False)
             # Runs on clean exit, exceptions, AND asyncio cancellation.
             # If any of the spawned PIDs are still alive, the SDK's
             # teardown failed (common when the task is cancelled mid-way
@@ -4020,6 +4127,9 @@ class MCPServerTask:
 
         while True:
             try:
+                # Readiness belongs to this transport attempt. Exception
+                # retries and lazy stdio revival also rebuild the session.
+                self._ready.clear()
                 if self._is_http():
                     lifecycle_reason = await self._run_http(config)
                 else:
@@ -8001,7 +8111,11 @@ def get_mcp_status() -> List[dict]:
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
         enabled = _parse_boolish(cfg.get("enabled", True), default=True)
         server = active_servers.get(name)
-        if server and server.session is not None:
+        # A session is assigned after initialize, before tools/list completes.
+        # The task's ready event and error state own readiness, including on
+        # reconnect; a transport object alone must not advertise success.
+        if (server and server.session is not None and server._ready.is_set()
+                and server._error is None):
             entry = {
                 "name": name,
                 "transport": transport,
@@ -8025,7 +8139,8 @@ def get_mcp_status() -> List[dict]:
                 "disabled": True,
                 "status": "disabled",
             })
-        elif name in connecting:
+        elif name in connecting or (server and not server._ready.is_set()
+                                    and server._error is None):
             result.append({
                 "name": name,
                 "transport": transport,
@@ -8034,7 +8149,7 @@ def get_mcp_status() -> List[dict]:
                 "disabled": False,
                 "status": "connecting",
             })
-        elif name in connect_errors:
+        elif name in connect_errors or (server and server._error is not None):
             result.append({
                 "name": name,
                 "transport": transport,
@@ -8042,7 +8157,7 @@ def get_mcp_status() -> List[dict]:
                 "connected": False,
                 "disabled": False,
                 "status": "failed",
-                "error": connect_errors[name],
+                "error": connect_errors.get(name) or _format_connect_error(server._error),
             })
         else:
             result.append({
@@ -8332,7 +8447,10 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     staged_engine_names: set = set()
     try:
         enabled = getattr(agent, "enabled_toolsets", None)
-        context_engine_allowed = enabled is None or "context_engine" in enabled
+        context_engine_allowed = (
+            (enabled is None or "context_engine" in enabled)
+            and "context_engine" not in (getattr(agent, "disabled_toolsets", None) or [])
+        )
         compressor = getattr(agent, "context_compressor", None)
         get_schemas = getattr(compressor, "get_tool_schemas", None) if compressor else None
         if context_engine_allowed and callable(get_schemas):

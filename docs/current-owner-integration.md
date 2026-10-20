@@ -2,7 +2,7 @@
 
 ## Profile-runtime V2
 
-The current Libraries owner at `9849d12adc8a5ef852d56e36abec4ffbb5122c62`
+The current Libraries owner at `12c55d5cd08e0b986a56d344cbe261d01bf2957f`
 exports `profile-runtime.resolved-policy-basis/v2`. Its outer reference binds
 the task-specific V1 projection digest. The legacy V1 reference names a
 composition receipt and can be shared by different task projections.
@@ -77,7 +77,7 @@ explicitly out-of-path debt, not a claimed fixed Ares bypass.
 ## Origin revocation adoption
 
 The current paired native, Governor and current-owner qualification selections
-all use Libraries `9849d12adc8a5ef852d56e36abec4ffbb5122c62`, including the
+all use Libraries `12c55d5cd08e0b986a56d344cbe261d01bf2957f`, including the
 canonical origin-revocation epoch fix from Libraries PR57. Historical proof
 objects retain their original tuple and do not certify this new selection.
 Native stays at `2ea67c4ffe70b0dce95a7792b241693a9f9f4dcc`; no unmerged native

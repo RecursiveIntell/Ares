@@ -192,6 +192,57 @@ def test_candidate_without_meaningful_reduction_does_not_close_parent(setup):
     assert db.get_session("s0")["ended_at"] is None
 
 
+def test_lineage_integrity_veto_blocks_before_rebase_owner_touches_durable_state(
+    setup, monkeypatch
+):
+    """A Governor integrity refusal cannot be converted into a DB successor."""
+    from ares_runtime.continuity import runtime
+
+    db, agent, messages, history, transitions = setup
+    veto = "CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH"
+    agent.context_compressor = SimpleNamespace(
+        threshold_tokens=50_000,
+        automatic_rebase_block_reason=lambda: veto,
+    )
+    calls = {"flush": 0, "episode": 0, "candidate": 0}
+
+    def forbidden_flush(*_args, **_kwargs):
+        calls["flush"] += 1
+        return True
+
+    agent._flush_messages_to_session_db = forbidden_flush
+    read_episode = db.read_context_rebase_episode
+
+    def record_episode(*args, **kwargs):
+        calls["episode"] += 1
+        return read_episode(*args, **kwargs)
+
+    db.read_context_rebase_episode = record_episode
+    build_candidate = runtime.build_live_candidate
+
+    def record_candidate(*args, **kwargs):
+        calls["candidate"] += 1
+        return build_candidate(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "build_live_candidate", record_candidate)
+    before_changes = db._conn.total_changes
+
+    result = attempt_turn_start_context_rebase(
+        agent,
+        messages,
+        conversation_history=history,
+        active_system_prompt=agent._cached_system_prompt,
+        before_tokens=100_000,
+    )
+
+    assert result.status is AutomaticRebaseStatus.BLOCKED
+    assert result.reason == veto
+    assert calls == {"flush": 0, "episode": 0, "candidate": 0}
+    assert db._conn.total_changes == before_changes
+    assert db.get_session("s0")["ended_at"] is None
+    assert transitions == []
+
+
 def test_ready_rebase_carries_goal_recurring_state_and_title(setup):
     db, agent, messages, history, _ = setup
     goal = GoalState(goal="Fix the queue", created_at=1.0)

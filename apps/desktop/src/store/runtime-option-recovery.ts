@@ -5,6 +5,7 @@ import { dismissNotification, notify } from './notifications'
 import { $sessionStates, sessionTileDelegate } from './session-states'
 
 export type RuntimeOptionDimension = 'effort' | 'fast'
+export type RuntimeOptionFailureResolution = 'not_uncertain' | 'observed' | 'unresolved' | 'obsolete'
 
 type RequestGateway = <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 
@@ -38,6 +39,17 @@ export function clearRuntimeOptionUncertainty(sessionId: string, dimension: Runt
 /** Recognized transport/host uncertainty is not proof of rejection. */
 export function isUncertainRuntimeOptionError(error: unknown): boolean {
   if (error && typeof error === 'object' && 'code' in error && error.code === 5019) {
+    const data = 'data' in error ? error.data : null
+
+    if (
+      data &&
+      typeof data === 'object' &&
+      'delivery' in data &&
+      (data.delivery === 'not_sent' || data.delivery === 'not_applied')
+    ) {
+      return false
+    }
+
     return true
   }
 
@@ -46,9 +58,10 @@ export function isUncertainRuntimeOptionError(error: unknown): boolean {
   return /request timed out|gateway connection closed|\bunconfirmed\b/i.test(message)
 }
 
-/** Reconcile a failed option acknowledgement using one read, never a write retry.
- * Returns false only for errors outside this bounded uncertainty path. A fresh
- * observation says what the host reports now, not which write produced it. */
+/** Reconcile a failed acknowledgement using one read, never a write retry.
+ * A fresh observation says what the current owner reports now, not which write
+ * produced it. Callers can settle the request overlay without claiming an
+ * unresolved write applied or rolling a confirmed readback back again. */
 export async function reconcileRuntimeOptionFailure(
   error: unknown,
   context: {
@@ -58,13 +71,13 @@ export async function reconcileRuntimeOptionFailure(
     owns: () => boolean
     applyObserved: (value: string | boolean) => void
   }
-): Promise<boolean> {
+): Promise<RuntimeOptionFailureResolution> {
   if (!isUncertainRuntimeOptionError(error)) {
-    return false
+    return 'not_uncertain'
   }
 
   if (!context.owns() || !$sessionStates.get()[context.sessionId]) {
-    return true
+    return 'obsolete'
   }
 
   const { dimension, sessionId } = context
@@ -78,14 +91,15 @@ export async function reconcileRuntimeOptionFailure(
     })
 
     if (!context.owns() || !$sessionStates.get()[sessionId]) {
-      return true
+      return 'obsolete'
     }
 
     if (
-      response?.owner === 'compute_host' &&
-      response.session_id === sessionId &&
-      typeof response.host_boot_id === 'string' &&
-      response.host_boot_id.trim().length > 0
+      response?.session_id === sessionId &&
+      (response?.owner === 'gateway' ||
+        (response?.owner === 'compute_host' &&
+          typeof response.host_boot_id === 'string' &&
+          response.host_boot_id.trim().length > 0))
     ) {
       const value = response.value
 
@@ -115,5 +129,5 @@ export async function reconcileRuntimeOptionFailure(
     })
   }
 
-  return true
+  return observed ? 'observed' : 'unresolved'
 }

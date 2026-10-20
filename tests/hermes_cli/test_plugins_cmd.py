@@ -397,29 +397,30 @@ class TestCmdInstall:
 class TestCmdUpdate:
     """Test the update command."""
 
-    @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
-    @patch("hermes_cli.plugins_cmd._plugins_dir")
-    @patch("hermes_cli.plugins_cmd.subprocess.run")
-    def test_update_git_pull_success(self, mock_run, mock_plugins_dir, mock_sanitize):
-        from hermes_cli.plugins_cmd import cmd_update
-
-        mock_plugins_dir_val = MagicMock()
-        mock_plugins_dir.return_value = mock_plugins_dir_val
-        mock_target = MagicMock()
-        mock_target.exists.return_value = True
-        mock_target.__truediv__ = lambda self, x: MagicMock(
-            exists=MagicMock(return_value=True)
-        )
-        mock_sanitize.return_value = mock_target
-
-        mock_run.side_effect = [
-            MagicMock(returncode=0, stdout="", stderr=""),        # status: clean
-            MagicMock(returncode=0, stdout="Updated", stderr=""),  # pull
-        ]
-
+    def test_update_git_pull_success(self, tmp_path, monkeypatch):
+        import subprocess
+        from hermes_cli.plugins_cmd import _install_plugin_core, cmd_update, _read_install_metadata
+        remote = tmp_path / "remote"
+        remote.mkdir()
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=remote, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git("init", "-q", "-b", "main")
+        git("config", "user.email", "fixture@example.invalid")
+        git("config", "user.name", "Fixture")
+        (remote / "plugin.yaml").write_text("name: test-plugin\n")
+        (remote / "marker").write_text("old")
+        git("add", ".")
+        git("commit", "-qm", "old fixture")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        target, _, _ = _install_plugin_core(remote.as_uri(), force=False)
+        (remote / "marker").write_text("new")
+        git("add", ".")
+        git("commit", "-qm", "new fixture")
+        revision = git("rev-parse", "HEAD")
         cmd_update("test-plugin")
-
-        assert mock_run.call_count == 2
+        assert (target / "marker").read_text() == "new"
+        assert _read_install_metadata()["test-plugin"]["revision"] == revision
 
     @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
@@ -430,7 +431,7 @@ class TestCmdUpdate:
         mock_plugins_dir_val.iterdir.return_value = []
         mock_plugins_dir.return_value = mock_plugins_dir_val
         mock_target = MagicMock()
-        mock_target.exists.return_value = False
+        mock_target.is_dir.return_value = False
         mock_sanitize.return_value = mock_target
 
         with pytest.raises(SystemExit) as exc_info:

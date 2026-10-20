@@ -506,7 +506,14 @@ class GatewayAuthorizationMixin:
         }
         if getattr(source, "is_bot", False):
             allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and _platform_gate_env(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+            allow_bots = _platform_gate_env(allow_bots_var, "") if allow_bots_var else ""
+            if not allow_bots and source.platform == Platform.FEISHU:
+                # The existing adapter resolver refuses a default-profile
+                # fallback for secondary sources. Share its resolved target
+                # YAML/env admission policy instead of borrowing process env.
+                adapter = self._authorization_adapter(source.platform, adapter_profile)
+                allow_bots = str(getattr(adapter, "_allow_bots", "none"))
+            if allow_bots.lower().strip() in {"mentions", "all"}:
                 return True
 
         if not user_id:

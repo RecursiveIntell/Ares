@@ -56,6 +56,81 @@ def test_host_interrupt_clears_child_pending_prompt(monkeypatch):
         host.close()
 
 
+def test_cold_compute_host_restore_preserves_only_durable_summary_markers(
+    monkeypatch, tmp_path
+):
+    """Cold host replay must preserve the DB-owned bit, never a text lookalike."""
+    from hermes_state import SessionDB
+
+    session_key = "cold-governor-summary"
+    database = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        database.create_session(session_key, "synthetic system prompt")
+        database.append_message(session_key, "user", "Original active task.")
+        database.append_message(
+            session_key,
+            "assistant",
+            "Authenticated prior summary.",
+            _compressed_summary=True,
+        )
+        database.append_message(
+            session_key,
+            "user",
+            "This literal text says _compressed_summary=true.",
+        )
+
+        # The inspection/default projection remains unmarked. The host's
+        # model-facing replay is the explicitly opted-in projection.
+        ordinary = database.get_messages_as_conversation(session_key)
+        assert not any(m.get("_compressed_summary") for m in ordinary)
+
+        class _Agent:
+            session_id = session_key
+            model = "synthetic"
+            provider = "synthetic"
+
+        monkeypatch.setattr(server, "_sessions", {}, raising=False)
+        monkeypatch.setattr(server, "_get_db", lambda: database)
+        monkeypatch.setattr(server, "_make_agent", lambda *a, **kw: _Agent())
+        monkeypatch.setattr(server, "_transfer_db_to_agent", lambda *a, **kw: False)
+
+        def _register(sid, key, agent, history, **kwargs):
+            server._sessions[sid] = {
+                "agent": agent,
+                "session_key": key,
+                "history": list(history),
+            }
+
+        monkeypatch.setattr(server, "_init_session", _register)
+        host = ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
+        try:
+            session = host._ensure_server_session(
+                server,
+                {
+                    "sid": "cold-host-id",
+                    "session_key": session_key,
+                    "history": [{"role": "user", "content": "stale snapshot"}],
+                    "history_version": 0,
+                    "cols": 80,
+                },
+            )
+        finally:
+            host.close()
+
+        replayed = session["history"]
+        flagged = [m for m in replayed if m.get("_compressed_summary") is True]
+        assert len(flagged) == 1
+        assert flagged[0]["role"] == "assistant"
+        assert flagged[0]["content"] == "Authenticated prior summary."
+        user_lookalikes = [m for m in replayed if m.get("role") == "user"]
+        assert user_lookalikes[-1]["content"] == (
+            "This literal text says _compressed_summary=true."
+        )
+        assert not any(m.get("_compressed_summary") for m in user_lookalikes)
+    finally:
+        database.close()
+
+
 def test_ensure_server_session_fallback_uses_canonical_source_resolver(monkeypatch):
     """A side-machinery failure must not abort a real host turn.
 
@@ -167,10 +242,13 @@ def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
 def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "config.set.model": "run-concurrent",
-        "config.set.fast": "idle-gated",
-        "config.set.reasoning": "idle-gated",
+        "config.set.fast": "run-concurrent",
+        "config.set.reasoning": "run-concurrent",
+        "config.set.runtime_options": "run-concurrent",
         "session.redirect": "run-concurrent",
         "session.steer": "run-concurrent",
+        "clarify.snapshot": "run-concurrent",
+        "clarify.respond": "run-concurrent",
         "prompt.submit": "turn-path",
         "session.interrupt": "turn-path",
         "reload.mcp": "run-concurrent",
@@ -685,6 +763,9 @@ def test_resume_claim_adopts_the_compute_host_owner_when_parent_mirror_is_gone(m
     observed = {}
 
     class _Supervisor:
+        def wait_ready(self):
+            pass
+
         def lookup_session_key(self, key):
             assert key == session_key
             return {
@@ -882,17 +963,26 @@ def test_existing_compute_host_agent_applies_fast_off_and_on_at_owner(monkeypatc
         host.close()
 
 
-def test_busy_compute_host_fast_control_rejects_without_mutation(monkeypatch):
+def test_busy_compute_host_fast_control_defers_without_mutating_live_request(monkeypatch):
     sid = "host-fast-busy"
-    agent = types.SimpleNamespace(service_tier="priority", request_overrides={"service_tier": "priority"})
-    server._sessions[sid] = {"agent": agent, "running": True}
+    agent = types.SimpleNamespace(model="fixture", provider="fixture", service_tier="priority",
+                                  request_overrides={"service_tier": "priority"})
+    session = {"agent": agent, "running": True, "history_lock": threading.Lock()}
+    server._sessions[sid] = session
+    # run_host() exports this for the real host child; a bare ComputeHost does not.
+    monkeypatch.setenv("HERMES_COMPUTE_HOST_CHILD", "1")
     output = io.StringIO()
     host = ComputeHost(stdout=output, heartbeat_secs=0)
     try:
         host._handle_control({"sid": sid, "request_id": "busy", "route_name": "config.set.fast",
                               "params": {"value": "normal"}})
-        assert _json_lines(output)[-1]["type"] == "control.error"
+        frame = _json_lines(output)[-1]
+        assert frame["type"] == "control.ack"
+        assert frame["result"]["deferred"] is True
+        # The in-flight request is immutable; the edit waits for the next admission.
         assert agent.service_tier == "priority"
+        assert agent.request_overrides == {"service_tier": "priority"}
+        assert session["pending_model_switch"]["runtime_options"] == {"fast": False}
     finally:
         server._sessions.pop(sid, None)
         host.close()
@@ -948,10 +1038,14 @@ def test_compute_host_lookup_returns_session_owner_metadata(monkeypatch):
     output = io.StringIO()
     host = ComputeHost(stdout=output, heartbeat_secs=0)
     monkeypatch.setattr(server, "_sessions", {owner_sid: session})
+    def owner_info(_agent, _session, *, lock_held=False):
+        assert lock_held is True
+        assert _session["history_lock"].locked()
+        return {"model": "owner-model", "provider": "owner-provider"}
     monkeypatch.setattr(
         server,
         "_session_info",
-        lambda _agent, _session: {"model": "owner-model", "provider": "owner-provider"},
+        owner_info,
     )
     try:
         host._handle_session_lookup(

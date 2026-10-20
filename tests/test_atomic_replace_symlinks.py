@@ -224,23 +224,20 @@ def test_atomic_replace_broken_symlink_creates_target(tmp_path: Path) -> None:
 
 
 
-def test_atomic_replace_copy_fallback_preserves_symlink(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_atomic_replace_copy_fallback_preserves_symlink(tmp_path, monkeypatch):
     real = tmp_path / "real.yaml"
     link = tmp_path / "link.yaml"
     real.write_text("old\n", encoding="utf-8")
     link.symlink_to(real)
     tmp = _write_tmp(tmp_path, "new\n")
-
-    def fail_replace(src: str, dst: str) -> None:
-        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src, None, dst)
-
-    monkeypatch.setattr("utils.os.replace", fail_replace)
-
+    replace = os.replace
+    def initial_exdev(src, dst):
+        if Path(src) == tmp:
+            raise OSError(errno.EXDEV, "cross-device")
+        return replace(src, dst)
+    monkeypatch.setattr("utils.os.replace", initial_exdev)
     assert Path(atomic_replace(tmp, link)) == real
-    assert link.is_symlink()
-    assert real.read_text(encoding="utf-8") == "new\n"
+    assert link.is_symlink() and real.read_text(encoding="utf-8") == "new\n"
     assert not tmp.exists()
 
 
@@ -313,37 +310,20 @@ def fast_replace_retries(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("winerror", [5, 32, 33])
-def test_contended_rename_retries_then_rewrites_in_place(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    fast_replace_retries: None,
-    winerror: int,
-) -> None:
-    """A target held for the whole call: the rename is retried the full
-    budget, then the in-place rewrite lands the write anyway.
-
-    winerror 5 is the code the reported bug actually produces; 32 and 33 are
-    the sibling contention codes.  All three must recover.
-    """
-    import utils as utils_mod
-
-    target = tmp_path / "gateway_state.json"
+def test_contended_rename_exhaustion_preserves_existing_file(tmp_path, monkeypatch, fast_replace_retries, winerror):
+    import utils
+    target = tmp_path / "state.json"
     target.write_text("old", encoding="utf-8")
     tmp = _write_tmp(tmp_path, "new")
-
-    attempts = []
-
-    def always_contended(src: str, dst: str) -> None:
-        attempts.append(src)
-        raise _sharing_error(winerror)
-
-    monkeypatch.setattr("utils.os.replace", always_contended)
+    denial = _sharing_error(winerror)
+    replace = MagicMock(side_effect=denial)
+    monkeypatch.setattr("utils.os.replace", replace)
     monkeypatch.setattr("utils._IS_WINDOWS", True)
-
-    assert Path(atomic_replace(tmp, target)) == target
-    assert len(attempts) == 1 + utils_mod._REPLACE_RETRY_ATTEMPTS
-    assert target.read_text(encoding="utf-8") == "new"
-    assert not tmp.exists()
+    with pytest.raises(PermissionError) as caught:
+        atomic_replace(tmp, target)
+    assert caught.value is denial
+    assert replace.call_count == 1 + utils._REPLACE_RETRY_ATTEMPTS
+    assert target.read_text(encoding="utf-8") == "old" and tmp.exists()
 
 
 def test_contended_rename_retry_wins_keeps_write_atomic(
@@ -369,7 +349,7 @@ def test_contended_rename_retry_wins_keeps_write_atomic(
 
     monkeypatch.setattr("utils.os.replace", contended_twice)
     monkeypatch.setattr("utils._IS_WINDOWS", True)
-    monkeypatch.setattr("utils._rewrite_in_place", forbid)
+    monkeypatch.setattr("utils._copy_fallback", forbid)
     monkeypatch.setattr("utils.shutil.copyfile", forbid)
 
     assert Path(atomic_replace(tmp, target)) == target
@@ -378,60 +358,39 @@ def test_contended_rename_retry_wins_keeps_write_atomic(
     assert not tmp.exists()
 
 
-def test_genuine_denial_propagates_after_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fast_replace_retries: None
-) -> None:
-    """A real ACL denial reports the same winerror as contention, so it is
-    not classified up front — it exhausts the budget, fails the in-place
-    rewrite too, and surfaces to the caller instead of being swallowed."""
+def test_genuine_denial_propagates_after_budget(tmp_path, monkeypatch, fast_replace_retries):
     target = tmp_path / "denied.json"
     target.write_text("old", encoding="utf-8")
     tmp = _write_tmp(tmp_path, "new")
-
-    monkeypatch.setattr(
-        "utils.os.replace", MagicMock(side_effect=_sharing_error(5))
-    )
+    denial = _sharing_error(5)
+    monkeypatch.setattr("utils.os.replace", MagicMock(side_effect=denial))
     monkeypatch.setattr("utils._IS_WINDOWS", True)
-
-    denial = PermissionError(errno.EACCES, "access is denied")
-
-    def cannot_open(*_args: object, **_kw: object) -> None:
-        raise denial
-
-    monkeypatch.setattr("utils.os.open", cannot_open)
-
+    open_target = MagicMock(side_effect=AssertionError("must not open target for rewriting"))
+    monkeypatch.setattr("utils.os.open", open_target)
     with pytest.raises(PermissionError) as caught:
         atomic_replace(tmp, target)
-
-    assert caught.value is denial
-    assert target.read_text(encoding="utf-8") == "old"
-    assert tmp.exists(), "the pending write must survive for the caller"
+    assert caught.value is denial and not open_target.called
+    assert target.read_text(encoding="utf-8") == "old" and tmp.exists()
 
 
-def test_contended_retry_switching_to_exdev_uses_copy_fallback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fast_replace_retries: None
-) -> None:
-    """A retry that turns into EXDEV must stop consuming the sharing budget
-    and take the copy fallback — EXDEV never clears on retry."""
+def test_contended_retry_switching_to_exdev_uses_copy_fallback(tmp_path, monkeypatch, fast_replace_retries):
     target = tmp_path / "target.json"
     target.write_text("old", encoding="utf-8")
     tmp = _write_tmp(tmp_path, "new")
-
-    replace = MagicMock(
-        side_effect=[_sharing_error(5), OSError(errno.EXDEV, "cross-device")]
-    )
+    real_replace = os.replace
+    calls = []
+    def replace(src, dst):
+        calls.append((src, dst))
+        if len(calls) == 1:
+            raise _sharing_error(5)
+        if len(calls) == 2:
+            raise OSError(errno.EXDEV, "cross-device")
+        return real_replace(src, dst)
     monkeypatch.setattr("utils.os.replace", replace)
     monkeypatch.setattr("utils._IS_WINDOWS", True)
-
-    def forbid_rewrite(*_a: object, **_k: object) -> None:
-        raise AssertionError("EXDEV must use the copy fallback, not a rewrite")
-
-    monkeypatch.setattr("utils._rewrite_in_place", forbid_rewrite)
-
     assert Path(atomic_replace(tmp, target)) == target
-    assert replace.call_count == 2
-    assert target.read_text(encoding="utf-8") == "new"
-    assert not tmp.exists()
+    assert len(calls) == 3
+    assert target.read_text(encoding="utf-8") == "new" and not tmp.exists()
 
 
 def test_non_contended_oserror_propagates_without_retry(
@@ -479,70 +438,42 @@ def test_posix_eacces_propagates_without_retry(
     assert tmp.exists()
 
 
-def test_in_place_rewrite_never_exposes_a_truncated_file(
-    tmp_path: Path,
-) -> None:
-    """The in-place rewrite must not truncate-then-fill: a concurrent reader
-    can observe a 0-byte file during shutil.copyfile, which for auth.json
-    means an empty credential store.  Shrinking writes must also not leave
-    trailing bytes from the previous, longer content.
-    """
-    import utils as utils_mod
-
-    target = tmp_path / "auth.json"
-    observed: list[int] = []
-
-    target.write_text("A" * 5000, encoding="utf-8")
-    tmp = _write_tmp(tmp_path, "B" * 5000)
-    utils_mod._rewrite_in_place(str(tmp), str(target))
-    observed.append(len(target.read_text(encoding="utf-8")))
-    assert target.read_text(encoding="utf-8") == "B" * 5000
-    assert not tmp.exists()
-
-    # Shrinking rewrite: ftruncate must drop the tail.
-    tmp = _write_tmp(tmp_path, "C" * 10)
-    utils_mod._rewrite_in_place(str(tmp), str(target))
-    assert target.read_text(encoding="utf-8") == "C" * 10
-    assert observed == [5000]
+def test_busy_target_does_not_overwrite_existing_file(tmp_path, monkeypatch):
+    target = tmp_path / "existing.txt"
+    target.write_text("old", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new")
+    monkeypatch.setattr("utils.os.replace", MagicMock(side_effect=OSError(errno.EBUSY, "busy")))
+    with pytest.raises(OSError) as caught:
+        atomic_replace(tmp, target)
+    assert caught.value.errno == errno.EBUSY
+    assert target.read_text(encoding="utf-8") == "old" and tmp.exists()
 
 
-def test_symlinked_target_survives_a_contended_rename(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fast_replace_retries: None
-) -> None:
-    """The #16743 invariant must hold on the contended path too: a symlinked
-    config.yaml stays a symlink when the rewrite fallback runs."""
+def test_symlinked_target_survives_a_contended_rename(tmp_path, monkeypatch, fast_replace_retries):
     real = tmp_path / "real.yaml"
     link = tmp_path / "config.yaml"
     real.write_text("old\n", encoding="utf-8")
     link.symlink_to(real)
     tmp = _write_tmp(tmp_path, "new\n")
-
-    monkeypatch.setattr(
-        "utils.os.replace", MagicMock(side_effect=_sharing_error(5))
-    )
+    monkeypatch.setattr("utils.os.replace", MagicMock(side_effect=_sharing_error(5)))
     monkeypatch.setattr("utils._IS_WINDOWS", True)
-
-    assert Path(atomic_replace(tmp, link)) == real
-    assert link.is_symlink(), "symlink must survive the rewrite fallback"
-    assert real.read_text(encoding="utf-8") == "new\n"
-    assert not tmp.exists()
+    with pytest.raises(PermissionError):
+        atomic_replace(tmp, link)
+    assert link.is_symlink() and real.read_text(encoding="utf-8") == "old\n" and tmp.exists()
 
 
 # ── native Windows: real contended handles ────────────────────────────────
 
 
 @pytest.mark.windows_only
-def test_windows_real_held_read_handle_lands_the_write(tmp_path: Path) -> None:
-    """The reported bug, end to end against a real held handle."""
+def test_windows_real_held_read_handle_preserves_existing_file(tmp_path):
     target = tmp_path / "gateway_state.json"
     target.write_text('{"active_agents": 1}', encoding="utf-8")
     tmp = _write_tmp(tmp_path, '{"active_agents": 2}')
-
-    with open(target, "r", encoding="utf-8"):
-        assert Path(atomic_replace(tmp, target)) == target
-
-    assert json.loads(target.read_text(encoding="utf-8")) == {"active_agents": 2}
-    assert not tmp.exists()
+    with open(target, "r", encoding="utf-8"), pytest.raises(OSError):
+        atomic_replace(tmp, target)
+    assert json.loads(target.read_text(encoding="utf-8")) == {"active_agents": 1}
+    assert tmp.exists()
 
 
 @pytest.mark.windows_only
@@ -566,20 +497,14 @@ def test_windows_real_held_handle_reports_access_denied(tmp_path: Path) -> None:
 
 
 @pytest.mark.windows_only
-def test_windows_atomic_json_write_with_concurrent_reader(
-    tmp_path: Path,
-) -> None:
-    """End-to-end gateway_state.json scenario through atomic_json_write:
-    the write lands and no .tmp file is orphaned."""
+def test_windows_atomic_json_write_with_concurrent_reader(tmp_path):
     target = tmp_path / "gateway_state.json"
     atomic_json_write(target, {"active_agents": 1})
-
-    with open(target, "r", encoding="utf-8"):
+    with open(target, "r", encoding="utf-8"), pytest.raises(OSError):
         atomic_json_write(target, {"active_agents": 2})
-
-    assert json.loads(target.read_text(encoding="utf-8")) == {"active_agents": 2}
+    assert json.loads(target.read_text(encoding="utf-8")) == {"active_agents": 1}
     leftovers = list(tmp_path.glob("*.tmp")) + list(tmp_path.glob(".*.tmp"))
-    assert leftovers == [], f"orphaned temp files: {leftovers}"
+    assert leftovers == []
 
 
 @pytest.mark.windows_only
@@ -597,3 +522,133 @@ def test_windows_readonly_target_still_raises(tmp_path: Path) -> None:
         assert target.read_text(encoding="utf-8") == "old"
     finally:
         subprocess.run(["attrib", "-R", str(target)], capture_output=True)
+
+
+# Ordinary publication failures: tiny payloads and injected errno only.
+def _publication_sentinels(tmp_path):
+    tmp_path = tmp_path / "publication"
+    tmp_path.mkdir()
+    target = tmp_path / "real.txt"
+    link = tmp_path / "linked.txt"
+    old, new = b"OLD-complete\n", b"NEW-complete\n"
+    target.write_bytes(old)
+    link.symlink_to(target)
+    incoming = tmp_path / "incoming.tmp"
+    incoming.write_bytes(new)
+    return target, link, incoming, old, new
+
+
+def _fail_copy_after_prefix(monkeypatch):
+    def copyfile(src, dst, **kwargs):
+        with open(src, "rb") as source, open(dst, "wb") as sink:
+            sink.write(source.read(3))
+        raise OSError(errno.ENOSPC, "injected short copy")
+
+    def copyfileobj(source, sink, *args, **kwargs):
+        sink.write(source.read(3))
+        raise OSError(errno.ENOSPC, "injected short copy")
+
+    monkeypatch.setattr("utils.shutil.copyfile", copyfile)
+    monkeypatch.setattr("utils.shutil.copyfileobj", copyfileobj)
+
+
+def test_exdev_short_copy_enospc_preserves_existing_bytes(tmp_path, monkeypatch):
+    target, link, incoming, old, new = _publication_sentinels(tmp_path)
+    monkeypatch.setattr("utils.os.replace", lambda *args: (_ for _ in ()).throw(OSError(errno.EXDEV, "injected EXDEV")))
+    _fail_copy_after_prefix(monkeypatch)
+    with pytest.raises(OSError) as caught:
+        atomic_replace(incoming, link)
+    assert caught.value.errno == errno.ENOSPC
+    print({"pre": old, "post": target.read_bytes(), "incoming": incoming.read_bytes()})
+    assert target.read_bytes() == old
+    assert link.is_symlink() and incoming.read_bytes() == new
+    assert sorted(p.name for p in target.parent.iterdir()) == ["incoming.tmp", "linked.txt", "real.txt"]
+
+
+def test_ebusy_refuses_before_destination_write(tmp_path, monkeypatch):
+    target, link, incoming, old, new = _publication_sentinels(tmp_path)
+    calls = []
+    import utils
+    real_copy = utils.shutil.copyfile
+    def observed_copy(src, dst, **kwargs):
+        calls.append(str(dst))
+        return real_copy(src, dst, **kwargs)
+    monkeypatch.setattr("utils.shutil.copyfile", observed_copy)
+    monkeypatch.setattr("utils.os.replace", lambda *args: (_ for _ in ()).throw(OSError(errno.EBUSY, "injected busy")))
+    error = None
+    try:
+        atomic_replace(incoming, link)
+    except OSError as exc:
+        error = exc
+    print({"pre": old, "post": target.read_bytes(), "destination_copies": calls})
+    assert error is not None and error.errno == errno.EBUSY
+    assert calls == []
+    assert target.read_bytes() == old and incoming.read_bytes() == new and link.is_symlink()
+
+
+@pytest.mark.parametrize("winerror", [5, 32, 33])
+def test_persistent_windows_contention_preserves_existing_bytes(tmp_path, monkeypatch, winerror):
+    import utils
+    target, link, incoming, old, new = _publication_sentinels(tmp_path)
+    writes = []
+    real_write = os.write
+    def short_write(fd, data):
+        writes.append(bytes(data))
+        if len(writes) == 1:
+            return real_write(fd, data[:3])
+        raise OSError(errno.ENOSPC, "injected short write")
+    rename = MagicMock(side_effect=_sharing_error(winerror))
+    monkeypatch.setattr("utils._IS_WINDOWS", True)
+    monkeypatch.setattr("utils.os.replace", rename)
+    monkeypatch.setattr("utils.os.write", short_write)
+    monkeypatch.setattr("utils.time.sleep", lambda delay: None)
+    with pytest.raises(OSError) as caught:
+        atomic_replace(incoming, link)
+    print({"pre": old, "post": target.read_bytes(), "writes": writes})
+    assert target.read_bytes() == old
+    assert getattr(caught.value, "winerror", None) == winerror
+    assert rename.call_count == 1 + utils._REPLACE_RETRY_ATTEMPTS
+    assert writes == [] and incoming.read_bytes() == new and link.is_symlink()
+
+
+def test_exdev_restaging_publishes_from_resolved_target_parent(tmp_path, monkeypatch):
+    target, link, incoming, old, new = _publication_sentinels(tmp_path)
+    import utils
+    real_replace = os.replace
+    calls = []
+    def replace(src, dst):
+        calls.append((Path(src), Path(dst)))
+        if len(calls) == 1:
+            raise OSError(errno.EXDEV, "injected EXDEV")
+        assert Path(src).parent == target.parent
+        assert Path(src) != incoming and Path(dst) == target
+        return real_replace(src, dst)
+    monkeypatch.setattr("utils.os.replace", replace)
+    assert Path(atomic_replace(incoming, link)) == target
+    assert len(calls) == 2
+    assert target.read_bytes() == new and link.is_symlink() and not incoming.exists()
+    assert sorted(p.name for p in target.parent.iterdir()) == ["linked.txt", "real.txt"]
+
+
+@pytest.mark.parametrize("failure", ["copy", "fsync", "rename"])
+def test_exdev_staging_failure_preserves_existing_bytes(tmp_path, monkeypatch, failure):
+    target, link, incoming, old, new = _publication_sentinels(tmp_path)
+    calls = []
+    def replace(src, dst):
+        calls.append((src, dst))
+        raise OSError(errno.EXDEV if len(calls) == 1 else errno.ENOSPC, "injected rename")
+    monkeypatch.setattr("utils.os.replace", replace)
+    if failure == "copy":
+        _fail_copy_after_prefix(monkeypatch)
+    elif failure == "fsync":
+        monkeypatch.setattr("utils.os.fsync", lambda fd: (_ for _ in ()).throw(OSError(errno.ENOSPC, "injected fsync")))
+    error = None
+    try:
+        atomic_replace(incoming, link)
+    except OSError as exc:
+        error = exc
+    print({"failure": failure, "pre": old, "post": target.read_bytes()})
+    assert error is not None and error.errno == errno.ENOSPC
+    assert target.read_bytes() == old
+    assert incoming.read_bytes() == new and link.is_symlink()
+    assert sorted(p.name for p in target.parent.iterdir()) == ["incoming.tmp", "linked.txt", "real.txt"]

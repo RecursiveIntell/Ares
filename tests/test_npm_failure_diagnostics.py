@@ -19,7 +19,7 @@ def test_bounded_tail_and_known_codes_only(tmp_path):
 
 
 def test_collector_revalidates_instead_of_copying_strings(tmp_path):
-    safe = api["record"]("tui", 1, 0, ["E401"], False)
+    safe = api["record"]("tui", 1, 0, ["E401"], False, output_kind="recognized-code")
     evil = {**safe, "safe_causes": ["Authorization: Bearer secret-token"]}
     extra = {**safe, "raw_output": "private-token"}
     log = tmp_path / "transcript"
@@ -28,7 +28,7 @@ def test_collector_revalidates_instead_of_copying_strings(tmp_path):
 
 
 def test_collector_record_count_bound(tmp_path):
-    safe = api["record"]("root", 1, 0, [], False)
+    safe = api["record"]("root", 1, 0, [], False, output_kind="empty")
     log = tmp_path / "transcript"
     log.write_text((api["PREFIX"] + json.dumps(safe) + "\n") * 50)
     assert len(api["collect"](log)) == 4
@@ -37,7 +37,7 @@ def test_collector_record_count_bound(tmp_path):
 @pytest.mark.parametrize("bad", [None, [], {}, "secret", True, -1, 256])
 def test_invalid_status_rejected(bad):
     with pytest.raises(ValueError):
-        api["record"]("root", bad, 0, [], False)
+        api["record"]("root", bad, 0, [], False, output_kind="empty")
 
 
 @pytest.mark.linux_only
@@ -80,7 +80,7 @@ def test_two_invocations_under_reused_parent_have_distinct_current_artifacts(tmp
         run = Path(made.stdout.strip())
         directories.append(run)
         assert run.parent == parent
-        value = api["record"]("root", code, 2, ["ERESOLVE"], False)
+        value = api["record"]("root", code, 2, ["ERESOLVE"], False, output_kind="recognized-code")
         transcript = run / "reinstall.log"
         transcript.write_text(api["PREFIX"] + json.dumps(value) + "\n")
         subprocess.run([sys.executable, api["__file__"], "collect", "--input", str(transcript),
@@ -89,3 +89,70 @@ def test_two_invocations_under_reused_parent_have_distinct_current_artifacts(tmp
     assert directories[0] != directories[1]
     assert json.loads((directories[0] / "npm-diagnostics-reinstall.json").read_text())[0]["exit_code"] == 37
     assert json.loads((directories[1] / "npm-diagnostics-reinstall.json").read_text())[0]["exit_code"] == 124
+
+
+@pytest.mark.parametrize("text,kind,codes", [
+    ("", "empty", []),
+    (" \n\t", "empty", []),
+    ("npm error code EUNRECOGNIZED\nAuthorization: sentinel-private-token", "unrecognized-code", []),
+    ("npm ERR! code EUNRECOGNIZED\n", "unrecognized-code", []),
+    ("SSL EOF occurred\nAuthorization: sentinel-private-token", "non-code", []),
+    ("npm error code ENOTEMPTY\n", "recognized-code", ["ENOTEMPTY"]),
+    ("npm ERR! code UNABLE_TO_GET_ISSUER_CERT\n", "recognized-code", ["UNABLE_TO_GET_ISSUER_CERT"]),
+    ("npm error code ERESOLVE\nnpm error code EUNRECOGNIZED\n", "recognized-code", ["ERESOLVE"]),
+])
+def test_bounded_output_classification_does_not_expose_unknown_text(tmp_path, text, kind, codes):
+    log = tmp_path / "raw"
+    log.write_text(text)
+    value = api["summarize"](log, "root", 217, 2)
+    assert value["schema"] == "npm-install-diagnostic/v2"
+    assert value["output_kind"] == kind
+    assert value["npm_codes"] == codes
+    assert value["exit_code"] == 217
+    assert value["timeout_status"] is False
+    assert "sentinel" not in json.dumps(value)
+    assert "EUNRECOGNIZED" not in json.dumps(value)
+    assert len(json.dumps(value)) < 1024
+
+
+@pytest.mark.parametrize("status", [1, 217, 124])
+def test_exit_status_alone_never_classifies_a_filesystem_or_tls_cause(tmp_path, status):
+    log = tmp_path / "raw"
+    log.write_text("")
+    value = api["summarize"](log, "root", status, 2)
+    assert value["output_kind"] == "empty"
+    assert value["npm_codes"] == []
+    assert value["safe_causes"] == []
+    assert value["exit_code"] == status
+    assert value["timeout_status"] == (status == 124)
+
+
+def test_collector_rebuilds_and_validates_classification(tmp_path):
+    safe = api["record"]("root", 217, 2, [], False, output_kind="unrecognized-code")
+    invalid = [{**safe, "output_kind": "private-token"},
+               {**safe, "output_kind": "recognized-code"},
+               {**safe, "detail": "Authorization: secret-token"},
+               {**safe, "schema": "npm-install-diagnostic/v1"}]
+    missing = {key: value for key, value in safe.items() if key != "output_kind"}
+    log = tmp_path / "transcript"
+    log.write_text("\n".join(api["PREFIX"] + json.dumps(value) for value in [*invalid, missing, safe]))
+    assert api["collect"](log) == [safe]
+
+
+@pytest.mark.parametrize("kind,codes", [("empty", ["ERESOLVE"]),
+                                       ("recognized-code", []),
+                                       ("unrecognized-code", ["ERESOLVE"]),
+                                       ("non-code", ["ERESOLVE"]),
+                                       ("secret-token", []), (None, []), (True, [])])
+def test_invalid_output_classification_rejected(kind, codes):
+    with pytest.raises(ValueError):
+        api["record"]("root", 1, 0, codes, False, output_kind=kind)
+
+
+def test_classification_refers_to_the_bounded_tail_only(tmp_path):
+    log = tmp_path / "raw"
+    log.write_text("npm error code ENOTEMPTY\n" + " " * (api["LIMIT"] + 10))
+    value = api["summarize"](log, "root", 217, 2)
+    assert value["output_truncated"] is True
+    assert value["output_kind"] == "empty"
+    assert value["npm_codes"] == []

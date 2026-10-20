@@ -67,6 +67,15 @@ import {
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
+// Explicit renderer ports keep the shipped module importable with offline dependencies.
+function createGroupTurnPorts(ports = globalThis) {
+  return { Date: ports.Date ?? globalThis.Date, setTimeout: ports.setTimeout ?? globalThis.setTimeout,
+    clearTimeout: ports.clearTimeout ?? globalThis.clearTimeout,
+    setInterval: ports.setInterval ?? globalThis.setInterval, clearInterval: ports.clearInterval ?? globalThis.clearInterval,
+    document: ports.document ?? globalThis.document }
+}
+let { Date, setTimeout, clearTimeout, setInterval, clearInterval, document } = createGroupTurnPorts()
+
 const { McpTab, ToolsetConfigPanel } = sdk
 // Keep optional exports feature-detected; test harnesses may strip the SDK namespace.
 const SkillsView = typeof sdk === 'undefined' ? undefined : sdk.SkillsView
@@ -499,44 +508,59 @@ function groupActivityLabel(event) {
   }
 
   const who = event?.member === 'You' ? 'You' : groupSpeakerLabel(event?.member || 'A bot')
+  const reason = ['failed', 'interrupted', 'unavailable', 'waiting', 'observing'].includes(kind) && typeof event?.reason === 'string' ? event.reason.trim() : ''
 
-  return `${who} ${base}`
+  return `${who} ${base}${reason ? `: ${reason}` : ''}`
 }
 
 const GROUP_ACTIVITY_LABELS = {
   queued: 'sent a message',
   working: 'is working…',
+  observing: 'is checking earlier turn status',
+  waiting: 'is waiting',
   replied: 'replied',
   passed: 'passed',
   'timed-out': 'took too long',
   failed: 'hit an error',
+  interrupted: 'turn was interrupted',
+  unavailable: 'outcome is unavailable',
+  blocked: 'has not started this message — earlier work remains unresolved',
   cancelled: 'turn interrupted by a newer message',
   settled: 'turn settled',
   capped: 'turn stopped at the round/message cap',
   delivered: 'delivered a late reply',
   held: 'is held (stopped by you) — @mention it or say resume to release',
+  stopping: 'held the room — interruption was applied; waiting for turn retirement',
+  'stop-unconfirmed': 'held the room — interruption is unconfirmed; Stop can retry',
   stopped: 'stopped the room — remaining turns are held until resumed'
 }
 
 const GROUP_ACTIVITY_GLYPHS = {
   queued: 'comment',
   working: 'sync',
+  observing: 'sync',
+  waiting: 'debug-pause',
   replied: 'check',
   passed: 'circle-outline',
   'timed-out': 'clock',
   failed: 'error',
+  interrupted: 'close',
+  unavailable: 'error',
+  blocked: 'debug-pause',
   cancelled: 'close',
   settled: 'check-all',
   capped: 'debug-step-over',
   delivered: 'mail-read',
   held: 'debug-pause',
+  stopping: 'debug-stop',
+  'stop-unconfirmed': 'error',
   stopped: 'debug-stop'
 }
 
 /** Text tone for an activity row: quiet for pass/cancel/settle, accent for
  *  work and real replies, destructive for failures and timeouts. */
 function groupActivityTone(kind) {
-  if (kind === 'failed' || kind === 'timed-out') {
+  if (kind === 'failed' || kind === 'timed-out' || kind === 'interrupted' || kind === 'unavailable') {
     return 'text-destructive'
   }
 
@@ -667,7 +691,9 @@ function groupChatSyncSnapshot(all = $groupChats.get(), deleted = {}) {
       },
       text: String(entry?.text || '').slice(0, GROUP_CHAT_SYNC_TEXT_CHARS),
       at: Number(entry?.at || 0),
-      ...(entry?.thread ? { thread: String(entry.thread).slice(0, 128) } : {})
+      ...(entry?.thread ? { thread: String(entry.thread).slice(0, 128) } : {}),
+      ...(groupTurnDeliveryKey(entry?.delivery) ? { delivery: entry.delivery } : {}),
+      ...(groupTurnDeliveryKey(entry?.answer_to) ? { answer_to: entry.answer_to } : {})
     }))
     const compact = {
       name: String(name).slice(0, 64),
@@ -704,6 +730,8 @@ function groupChatSyncSnapshot(all = $groupChats.get(), deleted = {}) {
 }
 
 function groupChatSyncEntryKey(entry) {
+  const deliveryKey = groupTurnDeliveryKey(entry?.delivery)
+  if (deliveryKey) return `turn:${deliveryKey}`
   if (entry?.id) {
     return `id:${String(entry.id)}`
   }
@@ -945,6 +973,7 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
     const existing = (localName ? rooms[localName] : rooms[displayName]) || {}
     const remoteRevision = Math.max(0, Number(projected.revision || 0))
     const localRevision = Math.max(0, Number(existing.syncRevision || 0))
+    const threadInputVersions = { ...(existing.threadInputVersions || {}) }
     const entries = new Map(
       (Array.isArray(existing.log) ? existing.log : []).map(entry => [groupChatSyncEntryKey(entry), entry])
     )
@@ -960,6 +989,10 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
       // watermark deltas for members that already saw it (phantom rounds).
       if (!entries.has(entryKey)) {
         entries.set(entryKey, entry)
+        if (groupIsUserInstruction(entry)) {
+          const thread = groupThreadOf(entry)
+          threadInputVersions[thread] = (threadInputVersions[thread] || 0) + 1
+        }
       }
     }
     const isPreserved = preserved.has(displayName) || (localName && preserved.has(localName))
@@ -978,6 +1011,7 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
         return byTime || groupChatSyncEntryKey(left).localeCompare(groupChatSyncEntryKey(right))
       })
     )
+    const consumedInputs = groupConsumedInputs(existing)
     const bounded = trimGroupChatLog(log, existing.watermarks || {})
 
     // A remote rename with a higher revision moves the local record to the
@@ -992,6 +1026,8 @@ function mergeRemoteGroupChatSnapshotIntoRooms(
       ...existing,
       log: bounded.log,
       watermarks: bounded.watermarks,
+      consumedInputs,
+      threadInputVersions,
       sessions: existing.sessions && typeof existing.sessions === 'object' ? existing.sessions : {},
       stranded: existing.stranded && typeof existing.stranded === 'object' ? existing.stranded : {},
       members: [...members.values()],
@@ -1050,8 +1086,15 @@ function durableGroupChatRooms(all = $groupChats.get()) {
     durable[name] = {
       log: room.log,
       watermarks: room.watermarks || {},
+      consumedInputs: groupConsumedInputs(room),
+      threadInputVersions: room.threadInputVersions || {},
+      sessionOwners: room.sessionOwners || {},
+      holds: room.holds || {},
+      recoveryOrigin: room.recoveryOrigin || null,
       sessions: room.sessions || {},
       stranded: room.stranded || {},
+      driveContexts: durableGroupDriveContexts(room),
+      coordinationId: room.coordinationId || null,
       members: Array.isArray(room.members) ? room.members : [],
       // Immutable room identity: without this, a room merged in via the
       // remote-sync path (the only caller of this function) loses its
@@ -1246,6 +1289,7 @@ async function pullGroupChatServerState(connectionId = groupChatSyncConnectionId
     preserveRooms: pending?.changedRooms || [],
     deletedRooms: pending?.deletedRooms || []
   })
+  rehomeGroupRuntimeOwners(merged)
   $groupChats.set(merged)
   await persistGroupChatRooms(merged)
   return true
@@ -1337,6 +1381,7 @@ async function flushGroupChatServerSync(connectionId) {
           preserveRooms: pending?.changedRooms || [],
           deletedRooms: pending?.deletedRooms || []
         })
+        rehomeGroupRuntimeOwners(mergedRooms)
         $groupChats.set(mergedRooms)
         await persistGroupChatRooms(mergedRooms)
       }
@@ -1373,6 +1418,7 @@ async function flushGroupChatServerSync(connectionId) {
         preserveRooms: pending?.changedRooms || [],
         deletedRooms: pending?.deletedRooms || []
       })
+      rehomeGroupRuntimeOwners(mergedRooms)
       $groupChats.set(mergedRooms)
       await persistGroupChatRooms(mergedRooms)
     }
@@ -6781,7 +6827,7 @@ function knownGroups(metaByName) {
 //
 // Behavioral model (clean-room): a group conversation is ONE ordered room log
 // owned by the plugin. A user send triggers at most GROUP_CHAT_MAX_ROUNDS
-// serial round-robin rounds over the member roster — never parallel, no LLM
+// frozen rounds with bounded independent member fan-out, no LLM
 // router. Who speaks each round is a deterministic @mention parse since the
 // last user message (mentioned members only, else everyone); whether a member
 // actually speaks is its own turn's choice — replying with exactly "(pass)"
@@ -7069,7 +7115,7 @@ function trimGroupChatLog(log, watermarks, limit = GROUP_CHAT_HISTORY_LIMIT * 4)
 function updateGroupChat(group, mutate, { sync = true } = {}) {
   const all = { ...$groupChats.get() }
   const current = all[group] || { log: [], watermarks: {}, epoch: 0, running: false }
-  const next = mutate({ ...current, log: [...current.log], watermarks: { ...current.watermarks } })
+  const next = mutate({ ...current, consumedInputs: groupConsumedInputs(current), log: [...current.log], watermarks: { ...current.watermarks } })
   const bounded = trimGroupChatLog(next.log, next.watermarks)
 
   next.log = bounded.log
@@ -7092,12 +7138,17 @@ function updateGroupChat(group, mutate, { sync = true } = {}) {
       durable[name] = {
         log: room.log,
         watermarks: room.watermarks,
+        consumedInputs: groupConsumedInputs(room),
+        threadInputVersions: room.threadInputVersions || {},
         sessions: room.sessions || {},
         sessionOwners: room.sessionOwners || {},
+        recoveryOrigin: room.recoveryOrigin || null,
         // Timed-out turns awaiting a late reply — keyed by member, valued
         // with the pre-turn message baseline. Survives reloads so finished
         // work is still harvested after a window restart.
         stranded: room.stranded || {},
+        driveContexts: durableGroupDriveContexts(room),
+        coordinationId: room.coordinationId || null,
         // #93129: sticky per-member stop holds. Watermarks persist, so holds
         // must too — otherwise a window restart silently releases a bot the
         // user explicitly stopped.
@@ -7191,6 +7242,12 @@ async function disbandGroupChat(group, members) {
         durable[name] = {
           log: room.log,
           watermarks: room.watermarks,
+          consumedInputs: groupConsumedInputs(room),
+          threadInputVersions: room.threadInputVersions || {},
+          stranded: room.stranded || {},
+          driveContexts: durableGroupDriveContexts(room),
+          coordinationId: room.coordinationId || null,
+          holds: room.holds || {},
           sessions: room.sessions || {},
           sessionOwners: room.sessionOwners || {},
           members: Array.isArray(room.members) ? room.members : [],
@@ -7235,9 +7292,9 @@ function setGroupChatImage(group, image) {
   })
 }
 
-/** Rename a group chat. The group's NAME is its identity everywhere — the
- *  room-map key, each local member's ui_meta membership list, and derived
- *  state — so a rename re-keys all of them. Member gateway sessions are kept
+/** Rename a group chat. The group's name keys its presentation — the
+ *  room map, each local member's ui_meta membership list, and derived
+ *  state — so a rename re-keys them while retaining its room lifetime. Member gateway sessions are kept
  *  as-is: stored sids keep resuming, so no history is lost. The room's
  *  immutable roomId (the member-session title) is preserved across the
  *  rename, so even a member whose sid is later lost falls back to the same
@@ -7283,6 +7340,7 @@ async function renameGroupChat(oldName, newName, members) {
     all[next] = room
   }
 
+  rehomeGroupRuntimeOwners(all)
   $groupChats.set(all)
 
   const needs = { ...$groupNeedsYou.get() }
@@ -7293,13 +7351,13 @@ async function renameGroupChat(oldName, newName, members) {
     $groupNeedsYou.set(needs)
   }
 
-  // Mirrored clarify cards key by group name; drop the old room's — the
-  // next poll re-mirrors any still-blocking question under the new name.
-  clearGroupClarify(oldName)
+  // Runtime owners/cards follow the same immutable lifetime above. A display
+  // rename neither replaces the accepted occurrence nor erases its question.
 
   // Local memberships: swap the name inside each member's canonical groups
   // list (syncs cross-machine via ui_meta). Remote members' seating lives in
   // the room record we just moved.
+  const metadataPersistence = []
   for (const member of members || []) {
     if (!member?.name) {
       continue
@@ -7308,11 +7366,20 @@ async function renameGroupChat(oldName, newName, members) {
     const meta = botRosterMeta(member, $botMeta.get()) || {}
     const groups = [...new Set(botGroups(meta).map(g => (g === oldName ? next : g)))]
 
-    await saveBotMeta(member, { groups, group: groups[0] || null })
+    // saveBotMeta applies its local atom before yielding. Start every member's
+    // transition now so a later rename cannot leave old-name writes in this loop.
+    metadataPersistence.push(saveBotMeta(member, { groups, group: groups[0] || null }))
   }
 
   // Persist the re-keyed map (updateGroupChat writes the whole durable map).
-  updateGroupChat(next, r => r, { sync: false })
+  const renamedRoom = updateGroupChat(next, r => {
+    // Idle legacy/metadata-only rooms need the same existing lifetime token
+    // as a runtime coordinator before this operation first yields.
+    if (!r.roomId && !r.coordinationId) r.coordinationId = groupChatEntryId()
+    return r
+  }, { sync: false })
+  const lifetime = { group: next, roomId: renamedRoom.roomId || null,
+    roomToken: renamedRoom.coordinationId || null }
   // A rename is one revisioned state transition: the new identity is updated
   // and the old identity is tombstoned together, so cold hydration cannot
   // merge the pre-rename room back into the roster.
@@ -7331,13 +7398,18 @@ async function renameGroupChat(oldName, newName, members) {
     openGroupChat(next)
   }
 
+  // Room, membership, persistence and navigation intent are all committed
+  // before waiting for metadata acknowledgement. No captured name is written
+  // by this continuation after an overlapping local/remote rename or disband.
+  await Promise.all(metadataPersistence)
+
   // Same convergence as disband: drop the pre-rename roster snapshot so the
   // old name can't linger anywhere the fence doesn't cover.
   if (typeof queryClient !== 'undefined' && queryClient?.invalidateQueries) {
     queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
   }
 
-  return next
+  return groupNameForLifetime(lifetime)
 }
 
 function groupChatEntryId() {
@@ -7359,13 +7431,15 @@ function normalizeGroupChatText(text) {
   return trimmed === GROUP_EMPTY_SENTINEL ? GROUP_EMPTY_FRIENDLY : trimmed
 }
 
-function appendGroupChatEntry(group, from, text, thread, images) {
+function appendGroupChatEntry(group, from, text, thread, images, delivery, answerTo) {
   const entry = {
     id: groupChatEntryId(),
     at: Date.now(),
     from,
     text: normalizeGroupChatText(text),
-    thread: thread || 'legacy'
+    thread: thread || 'legacy',
+    ...(groupTurnDeliveryKey(delivery) ? { delivery } : {}),
+    ...(groupTurnDeliveryKey(answerTo) ? { answer_to: answerTo } : {})
   }
 
   if (Array.isArray(images) && images.length) {
@@ -7381,14 +7455,26 @@ function appendGroupChatEntry(group, from, text, thread, images) {
   const priorLog = ($groupChats.get()[group] || {}).log || []
   const lastEntry = priorLog[priorLog.length - 1]
 
-  if (isDuplicateGroupAppend(lastEntry, from, entry.text, entry.thread)) {
+  const deliveryKey = groupTurnDeliveryKey(entry.delivery)
+  if (deliveryKey) {
+    const prior = priorLog.find(item => groupTurnDeliveryKey(item.delivery) === deliveryKey)
+    if (prior) return prior
+  } else if (isDuplicateGroupAppend(lastEntry, from, entry.text, entry.thread)) {
     return lastEntry
   }
 
   updateGroupChat(group, room => {
     room.log.push(entry)
+    if (groupIsUserInstruction(entry)) {
+      room.threadInputVersions = { ...(room.threadInputVersions || {}),
+        [entry.thread]: (room.threadInputVersions?.[entry.thread] || 0) + 1 }
+    }
     return room
   })
+
+  if (groupIsUserInstruction(entry)) {
+    for (const pump of [...(groupRoomCoordinators.get(group)?.budgetPumps || [])]) pump()
+  }
 
   // Needs-you: a member addressing @user badges the group header.
   if (from.kind === 'member' && /@user\b/i.test(entry.text)) {
@@ -7431,7 +7517,7 @@ function uniqueGroupChatName(base, taken) {
  *  title, which also covers rehydrated rooms whose sid was lost — reopens
  *  it after restarts. Cross-connection members route to their OWN source
  *  via requestForBot; the window's gateway never switches. */
-async function ensureGroupChatSession(group, member) {
+async function ensureGroupChatSession(group, member, requestMember = member, occurrence) {
   const room = $groupChats.get()[group] || {}
   // New rooms title member sessions by their immutable roomId so a
   // same-name recreate never resumes the old room's sessions by title;
@@ -7458,7 +7544,7 @@ async function ensureGroupChatSession(group, member) {
     }
 
     try {
-      const res = await requestForBot(member, 'session.resume', {
+      const res = await requestForBot(requestMember, 'session.resume', {
         session_id: target,
         profile: member.name,
         omit_messages: true
@@ -7468,14 +7554,15 @@ async function ensureGroupChatSession(group, member) {
         const stored = res.session_key || known
 
         if (stored) {
-          updateGroupChat(group, current => {
+          updateGroupChat(occurrence?.group || group, current => {
+            if (occurrence && !groupOccurrenceCurrent(occurrence)) return current
             current.sessions = { ...(current.sessions || {}), [key]: stored }
-            current.sessionOwners = { ...(current.sessionOwners || {}), [key]: groupSessionOwner(member) }
+            current.sessionOwners = { ...(current.sessionOwners || {}), [key]: groupSessionOwner(requestMember) }
             return current
           })
         }
 
-        return { runtime: res.session_id, stored }
+        return { runtime: res.session_id, stored, state: res }
       }
     } catch (error) {
       if (error?.code !== 4007) {
@@ -7486,7 +7573,7 @@ async function ensureGroupChatSession(group, member) {
     }
   }
 
-  const created = await requestForBot(member, 'session.create', {
+  const created = await requestForBot(requestMember, 'session.create', {
     profile: member.name,
     title,
     // Room member sessions are plumbing — always hidden from the sidebar.
@@ -7495,18 +7582,59 @@ async function ensureGroupChatSession(group, member) {
   const stored = created?.stored_session_id || null
 
   if (stored) {
-    updateGroupChat(group, r => {
+    updateGroupChat(occurrence?.group || group, r => {
+      if (occurrence && !groupOccurrenceCurrent(occurrence)) return r
       r.sessions = { ...(r.sessions || {}), [key]: stored }
-      r.sessionOwners = { ...(r.sessionOwners || {}), [key]: groupSessionOwner(member) }
+      r.sessionOwners = { ...(r.sessionOwners || {}), [key]: groupSessionOwner(requestMember) }
       return r
     })
   }
 
-  return { runtime: created?.session_id || null, stored }
+  return { runtime: created?.session_id || null, stored, resumeTarget: stored || title }
+}
+
+/** Older runtimes can accept work without identifying its outcome. Detect the
+ * versioned projection before any attachment or prompt write; display history
+ * cannot establish turn ownership after compaction. Do not cache across boots. */
+async function requireGroupTurnProtocol(member, prepared) {
+  const state = prepared.state || await requestForBot(member, 'session.resume', {
+    session_id: prepared.resumeTarget, profile: member.name, omit_messages: true
+  })
+  const projection = state?.turn_outcomes
+  if (typeof state?.session_id !== 'string' || !state.session_id ||
+      (prepared.stored && state.session_key && state.session_key !== prepared.stored)) {
+    throw new Error('The member session changed before admission. Try sending again.')
+  }
+  const unsupported = () => new Error('Update this member’s backend to support group turn outcomes, then send again. No member prompt was sent.')
+  if (projection === undefined) {
+    // Current lazy-session resume omits the projection. Probe the exact RPC
+    // without inventing an admission: its validation error establishes only
+    // method availability. It grants no ownership or completion authority.
+    try {
+      await requestForBot(member, 'session.turn.poll', {
+        session_id: state.session_id, profile: member.name
+      })
+    } catch (error) {
+      if (error?.code === 4006 && error?.message === 'session_id and full accepted_turn identity required') {
+        return state.session_id
+      }
+      if (error?.code === -32601) throw unsupported()
+      throw error
+    }
+    throw unsupported()
+  }
+  if (projection?.version !== 1 || projection.scope !== 'process_local' ||
+      !['available', 'unavailable'].includes(projection.availability) || !Array.isArray(projection.turns)) {
+    throw unsupported()
+  }
+  return state.session_id
 }
 
 const GROUP_TURN_TIMEOUT_MS = 180000
 const GROUP_TURN_POLL_MS = 2000
+const GROUP_TURN_POLL_RETRY_LIMIT = 3
+const GROUP_TURN_RECONCILE_INTERVAL_MS = 5000
+const GROUP_TURN_RECONCILE_MAX_TRIES = 60
 
 // --- group-turn session-lease helpers (#93602) ------------------------------
 // A member turn is a session-scoped RPC SEQUENCE (resume → attach → submit →
@@ -7558,7 +7686,8 @@ async function retainGroupTurnRoute(member) {
     const release = await host.retainProfile(route)
 
     return typeof release === 'function' ? release : noop
-  } catch {
+  } catch (error) {
+    if (error?.code === 'POOL_CAPACITY_EXCEEDED' || error?.code === 4090) throw error
     return noop
   }
 }
@@ -7568,13 +7697,26 @@ async function retainGroupTurnRoute(member) {
  *  STORED id — the durable identity — to mint a fresh runtime id, and submit
  *  exactly once more. Returns the runtime id the submit actually landed on so
  *  the poll loop keeps a live fallback target. */
-async function submitGroupTurnPrompt(member, runtime, stored, text) {
+async function submitGroupTurnPrompt(member, runtime, stored, text, occurrence, canSubmit) {
+  const submit = async target => {
+    if (occurrence) occurrence.admissionRefused = false
+    try {
+      return await requestForBot(member, 'prompt.submit', { session_id: target, text })
+    } catch (error) {
+      // The gateway rejects a missing runtime before prompt admission. A
+      // cancelled remint/probe after that refusal owns no accepted turn.
+      if (occurrence && (error?.code === 4001 || error?.code === 4090 || error?.code === 'POOL_CAPACITY_EXCEEDED')) {
+        occurrence.admissionRefused = true
+      }
+      throw error
+    }
+  }
   try {
-    await requestForBot(member, 'prompt.submit', { session_id: runtime, text })
+    const ack = await submit(runtime)
 
-    return runtime
+    return { runtime, acceptedTurn: groupAcceptedTurn(ack?.accepted_turn, runtime) }
   } catch (error) {
-    if (!isSessionGoneError(error) || !stored) {
+    if (error?.code !== 4001 || !stored || occurrence?.cancelled) {
       throw error
     }
 
@@ -7588,10 +7730,27 @@ async function submitGroupTurnPrompt(member, runtime, stored, text) {
     if (!fresh) {
       throw error
     }
+    if (occurrence) {
+      const sessionLock = groupSourceSessionKey(occurrence.captured, fresh)
+      const prior = groupRuntimeSessionOwners.get(sessionLock)
+      if (prior && prior !== occurrence) throw error
+      if (occurrence.sessionLock && groupRuntimeSessionOwners.get(occurrence.sessionLock) === occurrence) {
+        groupRuntimeSessionOwners.delete(occurrence.sessionLock)
+      }
+      occurrence.runtime = fresh
+      occurrence.sessionLock = sessionLock
+      groupRuntimeSessionOwners.set(sessionLock, occurrence)
+      if (occurrence.cancelled) { await interruptGroupOccurrence(occurrence); throw error }
+    }
 
-    await requestForBot(member, 'prompt.submit', { session_id: fresh, text })
+    await requireGroupTurnProtocol(member, { runtime: fresh, stored, state: res })
+    if ((occurrence && !groupOccurrenceCanSubmit(occurrence)) || (canSubmit && !canSubmit())) {
+      if (occurrence?.cancelled) await interruptGroupOccurrence(occurrence)
+      throw error
+    }
+    const ack = await submit(fresh)
 
-    return fresh
+    return { runtime: fresh, acceptedTurn: groupAcceptedTurn(ack?.accepted_turn, fresh) }
   }
 }
 
@@ -7602,6 +7761,206 @@ async function submitGroupTurnPrompt(member, runtime, stored, text) {
 // reached the room (db's Aug 2026 report).
 const GROUP_TURN_HARD_CAP_MS = 20 * 60000
 
+/** A failed turn is retained for resume replay, not active work. Running,
+ *  streaming, and legacy inflight payloads still keep the member's slot. */
+function groupTurnTerminalError(state) {
+  const inflight = state?.inflight
+
+  if (!inflight || typeof inflight !== 'object' || state?.running || inflight.streaming || inflight.status !== 'error') {
+    return null
+  }
+
+  const message = typeof inflight.error === 'string' ? inflight.error.trim() : ''
+  const code = typeof inflight.error_surface?.code === 'string' ? inflight.error_surface.code.trim() : ''
+  const error = new Error(message || code || 'Member turn failed')
+  error.data = { reason: error.message }
+  return error
+}
+
+/** Process-local outcomes are execution receipts, independent of display-history
+ *  length, physical rows, timestamps, or content. Never infer a missing receipt. */
+function groupAcceptedTurn(value, runtime = value?.session_id) {
+  if (!value || typeof value.request_id !== 'string' || !value.request_id.trim() ||
+      typeof value.session_id !== 'string' || !value.session_id.trim() || value.session_id !== runtime ||
+      !['compute_host', 'inline'].includes(value.route) ||
+      (value.route === 'compute_host'
+        ? typeof value.host_boot_id !== 'string' || !value.host_boot_id.trim()
+        : value.host_boot_id !== null)) {
+    return null
+  }
+
+  return Object.freeze({ request_id: value.request_id, session_id: value.session_id,
+    route: value.route, host_boot_id: value.host_boot_id })
+}
+
+function groupAcceptedTurnKey(value) {
+  const ref = groupAcceptedTurn(value)
+  return ref ? JSON.stringify([ref.request_id, ref.session_id, ref.route, ref.host_boot_id]) : null
+}
+
+function groupTurnOwnerKey(owner) {
+  if (!owner || typeof owner.name !== 'string' || !owner.name) return null
+  if (!owner.connectionId) return JSON.stringify([owner.name, null])
+  const route = owner.route
+  if (typeof owner.connectionId !== 'string' || route?.connectionId !== owner.connectionId ||
+      route.profile !== owner.name || !['local', 'remote'].includes(route.mode) ||
+      typeof route.targetProfile !== 'string' || !route.targetProfile) return null
+  return JSON.stringify([owner.name, owner.connectionId, route.mode, route.profile, route.targetProfile])
+}
+
+function groupTurnDeliveryKey(delivery) {
+  const accepted = groupAcceptedTurnKey(delivery?.accepted_turn)
+  const owner = groupTurnOwnerKey(delivery?.owner)
+  return accepted && owner && typeof delivery.member_key === 'string' && delivery.member_key
+    ? JSON.stringify([delivery.member_key, owner, accepted]) : null
+}
+
+/** Keep local room keys compatible, while pinning RPCs to the connection that
+ *  accepted the turn whenever the host offers its explicit routing seam. */
+function captureGroupTurnMember(member) {
+  const route = botConnectionRoute(member)
+  const localConnection = host.state.connectionId?.get?.() || host.activeConnectionId?.() || ''
+  const pinnedRoute = route || (localConnection && typeof host.requestProfile === 'function'
+    ? { connectionId: localConnection, mode: localConnection === 'local' ? 'local' : 'remote',
+        profile: member.name, targetProfile: member.name }
+    : null)
+  const captured = Object.freeze({ ...member, ...(route ? { route: Object.freeze({ ...route }) } : {}) })
+  const requestMember = pinnedRoute
+    ? Object.freeze({ ...captured, sourceScoped: true, route: Object.freeze({ ...pinnedRoute }) })
+    : captured
+  return { member: captured, requestMember, owner: groupSessionOwner(requestMember) }
+}
+
+function readGroupTurnOutcome(state, delivery) {
+  const identity = groupAcceptedTurnKey(delivery?.accepted_turn)
+  const projection = state?.turn_outcomes
+  const unavailable = reason => ({ state: 'unavailable', reason })
+  if (!identity) return unavailable('Member turn admission identity is unavailable')
+  if (state?.session_id !== delivery.accepted_turn.session_id) {
+    return unavailable('Member runtime was replaced; its turn outcome is unavailable')
+  }
+  if (projection?.version !== 1 || projection.scope !== 'process_local' ||
+      projection.availability !== 'available' || !Array.isArray(projection.turns)) {
+    return unavailable('Member turn outcome is unavailable from this backend')
+  }
+  const matches = projection.turns.filter(turn => groupAcceptedTurnKey(turn?.accepted_turn) === identity)
+  if (matches.length !== 1) return unavailable('Accepted member turn outcome is missing or evicted')
+  const turn = matches[0]
+  if (turn.state === 'running' || turn.state === 'waiting') return { state: turn.state }
+  if (turn.state === 'complete') {
+    const complete = (Array.isArray(turn.finalized) ? turn.finalized : [])
+      .filter(entry => entry?.status === 'complete' && typeof entry.text === 'string' && entry.text.trim())
+      .map(entry => ({ role: 'assistant', content: entry.text }))
+    const reply = pickGroupTurnReply(complete, 0)
+    return reply === null ? unavailable('Completed member turn has no available finalized reply')
+      : { state: 'complete', reply }
+  }
+  if (turn.state === 'error' || turn.state === 'interrupted' || turn.state === 'unavailable') {
+    const final = Array.isArray(turn.finalized) ? turn.finalized.findLast(entry => entry?.status === turn.state) : null
+    const reason = [turn.reason, final?.error, final?.warning,
+      ...(turn.state === 'error' ? [groupTurnTerminalError(state)?.message] : [])]
+      .find(value => typeof value === 'string' && value.trim())
+    return { state: turn.state, reason: reason?.trim() ||
+      (turn.state === 'error' ? 'Member turn failed' : turn.state === 'interrupted'
+        ? 'Member turn was interrupted' : 'Member turn outcome is unavailable') }
+  }
+  return unavailable('Member turn outcome has an unsupported state')
+}
+
+function groupTurnOutcomeError(outcome) {
+  const error = new Error(outcome.reason)
+  error.data = { reason: outcome.reason, outcomeState: outcome.state }
+  return error
+}
+
+// A receipt in the existing durable stranded map is also the pending turn.
+// Only its current collector owns it; after a window reload the weak lease
+// disappears and the same receipt can be harvested without resubmitting.
+const collectingGroupTurnMarkers = new WeakMap()
+const interruptingGroupTurnMarkers = new WeakMap()
+
+async function waitForGroupTurnCollector(group, memberKey, collector, occurrence) {
+  const epoch = $groupChats.get()[group]?.epoch || 0
+  let timer, unbind
+  const cancelled = () => {
+    const room = $groupChats.get()[occurrence?.group || group]
+    return !room || room.tombstone || Boolean(room.holds?.[memberKey]) ||
+      (occurrence?.userIds ? !groupOccurrenceCanSubmit(occurrence) : (room.epoch || 0) !== epoch)
+  }
+  try {
+    const interrupted = new Promise(resolve => {
+      unbind = $groupChats.listen?.(() => { if (cancelled()) resolve('cancelled') })
+      if (cancelled()) resolve('cancelled')
+      timer = setTimeout(() => resolve('unavailable'), GROUP_TURN_HARD_CAP_MS)
+    })
+    const result = await Promise.race([collector.settled.then(() => 'settled'), interrupted])
+    return cancelled() ? 'cancelled' : result
+  } finally {
+    clearTimeout(timer)
+    unbind?.()
+  }
+}
+
+function groupTurnMarkerBlocksDispatch(room, memberKey, coordinator) {
+  const marker = room.stranded?.[memberKey]
+  const stoppingOwner = [...(coordinator?.occurrences || [])].some(o =>
+    o.id === marker?.occurrence_id && o.cancelled && !o.released)
+  return Object.prototype.hasOwnProperty.call(room.stranded || {}, memberKey) &&
+    !collectingGroupTurnMarkers.has(marker) && !stoppingOwner
+}
+
+function consumeGroupTurnMarker(group, memberKey, marker, published = false) {
+  if ($groupChats.get()[group]?.stranded?.[memberKey] !== marker) return false
+  const owned = [...(groupRoomCoordinators.get(group)?.occurrences || [])].find(o => o.id === marker?.occurrence_id)
+  // session.interrupt targets the runtime's current turn when applied. Even
+  // exact predecessor terminal proof cannot let a successor reuse that runtime
+  // while an older hot generation or a cold marker's control is still pending.
+  if (groupOccurrenceHasPendingInterrupt(owned) || interruptingGroupTurnMarkers.has(marker)) return false
+  const coldDrive = owned ? null : restoreGroupDrive(group, marker)
+  let consumed = false
+  updateGroupChat(group, room => {
+    if (room.stranded?.[memberKey] === marker) {
+      const next = { ...room.stranded }
+      delete next[memberKey]
+      room.stranded = next
+      consumed = true
+    }
+    return room
+  }, { sync: false })
+  if (consumed) {
+    if (coldDrive) {
+      coldDrive.budget.reserved = Math.max(0, coldDrive.budget.reserved - 1)
+      if (published) coldDrive.budget.posted++
+      persistGroupDrive(group, coldDrive)
+    }
+    const parked = [...(groupRoomCoordinators.get(group)?.occurrences || [])].find(o =>
+      o.id === marker?.occurrence_id && o.collectorDone)
+    if (parked && !parked.answerPromise) finishGroupOccurrence(parked)
+    const coordinator = groupRoomCoordinators.get(group)
+    if (coordinator) pumpGroupOccurrences(coordinator)
+  }
+  return consumed
+}
+
+function groupTurnMarkerIntentIsCurrent(room, marker) {
+  if (!room || room.tombstone || marker.stop_requested || marker.hold_requested ||
+      room.holds?.[marker.delivery.member_key]) return false
+  const newerUser = groupTurnHasNewerUser(room, marker.thread, marker.user_ids, marker.anchor_id, marker.input_version)
+  return shouldCommitMemberTurn(marker.epoch ?? 0, room.epoch || 0, newerUser,
+    marker.input_version !== undefined || Array.isArray(marker.user_ids))
+}
+
+function reportUnavailableGroupTurn(group, member, marker, reason) {
+  const memberKey = groupMemberKey(member)
+  if (marker?.reported || $groupChats.get()[group]?.stranded?.[memberKey] !== marker) return
+  updateGroupChat(group, room => {
+    room.stranded = { ...room.stranded, [memberKey]: { ...marker, reported: true, reason } }
+    return room
+  }, { sync: false })
+  recordGroupActivity(group, { kind: 'unavailable', member: member.name, thread: marker?.thread || 'legacy', reason })
+  noteBotAttention(memberKey, reason)
+}
+
 /** Mirror a member's pending prompt — clarify question OR command approval —
  *  from its resume snapshot into the room store, keyed
  *  `${group}::${memberKey}` (#90694). Returns true while a prompt is
@@ -7611,7 +7970,7 @@ const GROUP_TURN_HARD_CAP_MS = 20 * 60000
  *  payload always sync to "no prompt". Clarify wins when both are somehow
  *  present (approvals resolve inside tool batches; clarify is the outer
  *  blocker). */
-function syncGroupClarify(group, member, state) {
+function syncGroupClarify(group, member, state, requestMember = member) {
   const key = `${group}::${groupMemberKey(member)}`
   const clarify = state && typeof state.pending_clarify === 'object' ? state.pending_clarify : null
   const approval = state && typeof state.pending_approval === 'object' ? state.pending_approval : null
@@ -7621,6 +7980,7 @@ function syncGroupClarify(group, member, state) {
   const current = all[key]
 
   if (!requestId) {
+    if (state?.pending_clarify_unavailable && current?.kind === 'clarify') return true
     if (current) {
       const next = { ...all }
       delete next[key]
@@ -7632,7 +7992,9 @@ function syncGroupClarify(group, member, state) {
 
   // Same request already mirrored — keep the object identity so the card
   // doesn't lose its draft to a re-render.
-  if (current?.requestId === requestId) {
+  if (current?.requestId === requestId && current.sessionId === (state?.session_id || null) &&
+      groupTurnDeliveryKey(current.receipt?.delivery) ===
+        groupTurnDeliveryKey($groupChats.get()[group]?.stranded?.[groupMemberKey(member)]?.delivery)) {
     return true
   }
 
@@ -7641,6 +8003,11 @@ function syncGroupClarify(group, member, state) {
     group,
     member: member.name,
     memberKey: groupMemberKey(member),
+    requestMember,
+    receipt: $groupChats.get()[group]?.stranded?.[groupMemberKey(member)],
+    roomId: $groupChats.get()[group]?.roomId || null,
+    roomToken: $groupChats.get()[group]?.coordinationId || null,
+    thread: $groupChats.get()[group]?.stranded?.[groupMemberKey(member)]?.thread || 'legacy',
     // approval.respond keys on the session, not just the request — carry the
     // runtime id the snapshot came from.
     sessionId: state?.session_id || null,
@@ -7680,7 +8047,7 @@ function syncGroupClarify(group, member, state) {
   return true
 }
 
-/** Drop every mirrored clarify belonging to `group` (disband/rename). */
+/** Drop every mirrored clarify belonging to `group` (disband/Stop). */
 function clearGroupClarify(group) {
   const all = $groupClarify.get()
   const next = {}
@@ -7708,283 +8075,983 @@ function clearGroupClarify(group) {
  *  - approval: `approval.respond` with the choice (once/session/always/deny),
  *    keyed by session + request_id — the same wire the 1:1 approval card
  *    and native notifications use. */
-async function answerGroupClarify(entry, member, answers) {
-  if (entry.kind === 'approval') {
-    await requestForBot(member, 'approval.respond', {
-      session_id: entry.sessionId || undefined,
-      request_id: entry.requestId,
-      choice: typeof answers === 'string' && answers ? answers : 'deny'
-    })
-  } else if (entry.questions && entry.questions.length) {
-    for (const question of entry.questions) {
-      const qid = question?.qid ?? question?.id
-      await requestForBot(member, 'clarify.respond', {
-        request_id: entry.requestId,
-        question_id: qid,
-        answer: answers?.[qid] ?? ''
-      })
-    }
-  } else {
-    await requestForBot(member, 'clarify.respond', {
-      request_id: entry.requestId,
-      answer: typeof answers === 'string' ? answers : ''
-    })
+function requireCurrentGroupQuestion(entry) {
+  const room = $groupChats.get()[entry.group]
+  const card = $groupClarify.get()[`${entry.group}::${entry.memberKey}`]
+  if (!room || room.tombstone || room.holds?.[entry.memberKey] ||
+      (entry.roomId !== undefined && entry.roomId !== (room.roomId || null)) ||
+      (entry.roomToken !== undefined && entry.roomToken !== (room.coordinationId || null)) ||
+      (entry.receipt && (
+        groupTurnDeliveryKey(room.stranded?.[entry.memberKey]?.delivery) !== groupTurnDeliveryKey(entry.receipt.delivery) ||
+        room.stranded?.[entry.memberKey]?.stop_requested ||
+        !groupTurnMarkerIntentIsCurrent(room, room.stranded?.[entry.memberKey]))) ||
+      card?.requestId !== entry.requestId || card?.sessionId !== entry.sessionId) {
+    throw new Error('Member question was stopped or replaced')
   }
+}
 
+function answerGroupClarify(entry, member, answers) {
+  try { requireCurrentGroupQuestion(entry) } catch (error) { return Promise.reject(error) }
+  member = entry.requestMember || member
+  const occurrence = [...(groupRoomCoordinators.get(entry.group)?.occurrences || [])].find(o =>
+    o.memberKey === entry.memberKey && o.runtime === entry.sessionId)
+  const answerKey = JSON.stringify([entry.sessionId, entry.requestId, entry.kind])
+  if (occurrence?.answers?.has(answerKey)) return occurrence.answers.get(answerKey)
+  const fence = { acknowledged: false, requestId: entry.requestId }
+  if (occurrence) {
+    occurrence.resumeFence = fence
+    occurrence.answeredQuestions ||= new Set()
+    occurrence.answeredQuestions.add(entry.requestId)
+  }
+  const previous = occurrence?.answerPromise
+  // Coalesce only the exact prompt. A new question queues behind the prior
+  // response and retains the same session/worker custody throughout.
+  const respond = () => respondGroupClarify(entry, member, answers, occurrence, fence)
+  const pending = previous ? previous.catch(() => undefined).then(respond) : respond()
+  if (occurrence) {
+    occurrence.answers ||= new Map()
+    occurrence.answers.set(answerKey, pending)
+    occurrence.answerPromise = pending
+    void pending.finally(() => {
+      if (occurrence.answers.get(answerKey) === pending) occurrence.answers.delete(answerKey)
+      if (occurrence.answerPromise === pending) occurrence.answerPromise = null
+      if (fence.acknowledged && occurrence.collectorDone && !occurrence.cancelled &&
+          !occurrence.answerPromise && !occurrence.parkedCollection) {
+        occurrence.parkedCollection = collectAnsweredParkedGroupTurn(occurrence).finally(() => {
+          occurrence.parkedCollection = null
+        })
+      }
+    }).catch(() => undefined)
+  }
+  return pending
+}
+
+async function respondGroupClarify(entry, member, answers, occurrence, fence) {
+  const requireConfirmation = result => {
+    if (result?.status !== 'ok') {
+      throw new Error(result?.status === 'expired' ? 'The question expired.'
+        : result?.status === 'conflict' ? 'This question already has a different answer.'
+          : 'The answer acknowledgement is unconfirmed.')
+    }
+  }
+  let attempted = false
+  try {
+    if (occurrence) await reserveGroupResumeWorker(occurrence)
+    if (occurrence && !groupOccurrenceCurrent(occurrence)) throw new Error('Member occurrence was stopped or replaced')
+    requireCurrentGroupQuestion(entry)
+    attempted = true
+    if (entry.kind === 'approval') {
+      const result = await requestForBot(member, 'approval.respond', {
+        session_id: entry.sessionId || undefined,
+        request_id: entry.requestId,
+        choice: typeof answers === 'string' && answers ? answers : 'deny'
+      })
+      if (!Number.isSafeInteger(result?.resolved) || result.resolved <= 0) {
+        throw new Error(result?.resolved === 0 ? 'The approval is no longer pending.'
+          : 'The approval acknowledgement is unconfirmed.')
+      }
+    } else if (entry.questions && entry.questions.length) {
+      for (const question of entry.questions) {
+        const qid = question?.qid ?? question?.id
+        requireConfirmation(await requestForBot(member, 'clarify.respond', {
+          session_id: entry.sessionId,
+          request_id: entry.requestId,
+          question_id: qid,
+          answer: answers?.[qid] ?? ''
+        }))
+      }
+    } else {
+      requireConfirmation(await requestForBot(member, 'clarify.respond', {
+        session_id: entry.sessionId,
+        request_id: entry.requestId,
+        answer: typeof answers === 'string' ? answers : ''
+      }))
+    }
+    fence.acknowledged = true
+  } finally {
+    // Settlement may be an uncertain response; keep its worker until a fresh
+    // exact projection proves waiting/terminal or Stop interrupts it.
+    fence.acknowledged = true
+    if (occurrence && attempted) occurrence.admissionVersion = (occurrence.admissionVersion || 0) + 1
+  }
   const all = $groupClarify.get()
   const key = `${entry.group}::${entry.memberKey}`
-
-  if (all[key]?.requestId === entry.requestId) {
+  if (all[key]?.requestId === entry.requestId && all[key]?.sessionId === entry.sessionId) {
     const next = { ...all }
     delete next[key]
     $groupClarify.set(next)
   }
 }
 
-/** One member turn, gateway-native: submit the room delta as a prompt into
- *  the member's per-group session, then poll the session until a NEW
- *  assistant message lands (or timeout → pass). While the session visibly
- *  reports work in flight the deadline extends (bounded by the hard cap),
- *  so slow models aren't cut off mid-run. A turn that still times out
- *  records a stranded marker so the finished reply can be harvested into
- *  the room at the member's next turn instead of being lost. */
-async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
-  // #93602: hold the member's route socket for the whole turn. Without the
-  // lease, every RPC below rides its own request-scoped socket lease; the
-  // socket that minted `runtime` can close between RPCs, the gateway reaps
-  // the runtime session, and prompt.submit dies 4001 — the bot goes silent.
-  const releaseTurnLease = await retainGroupTurnRoute(member)
-
+async function collectAnsweredParkedGroupTurn(occurrence) {
   try {
-    return await runGroupChatMemberTurnLeased(group, member, prompt, thread, images)
+    for (let attempt = 0; attempt < 60 && !occurrence.released; attempt++) {
+      if (!groupOccurrenceCurrent(occurrence)) return
+      await harvestStrandedGroupReply(occurrence.group, occurrence.captured.member)
+      if (occurrence.released) return
+      await new Promise(resolve => setTimeout(resolve, 5000))
+    }
+  } catch (error) {
+    noteBotAttention(occurrence.memberKey, error?.message || 'Member turn outcome is unavailable')
   } finally {
-    releaseTurnLease()
+    // Observation expiry does not prove that a running turn vacated its
+    // worker. Keep the last verified state and all acceptance custody.
+    if (!occurrence.released) {
+      paintGroupOccurrences(occurrence.coordinator)
+      pumpGroupOccurrences(occurrence.coordinator)
+    }
   }
 }
 
-async function runGroupChatMemberTurnLeased(group, member, prompt, thread, images) {
-  const { runtime, stored } = await ensureGroupChatSession(group, member)
+/** Submit once, retain the backend's accepted identity, and collect only its
+ *  validated terminal projection. History is presentation, never completion. */
+// One runtime coordinator per room lifetime. No occurrence or accepted receipt
+// is replayed from this registry after reload; the durable stranded map owns it.
+const groupRoomCoordinators = new Map()
+const groupRuntimeSessionOwners = new Map()
+const GROUP_CHAT_PARALLEL_CEILING = 4
 
-  if (!runtime) {
+function groupNameForLifetime(owner, rooms = $groupChats.get()) {
+  const matches = room => room && !room.tombstone &&
+    (room.roomId || null) === owner.roomId && (room.coordinationId || null) === owner.roomToken
+  if (matches(rooms[owner.group])) return owner.group
+  // Legacy owners also need their minted coordination token. Never follow a
+  // display-name reuse or an unidentifiable room into a replacement lifetime.
+  if (!owner.roomId && !owner.roomToken) return null
+  const names = Object.keys(rooms).filter(name => matches(rooms[name]))
+  return names.length === 1 ? names[0] : null
+}
+
+function rehomeGroupRuntimeOwners(rooms) {
+  for (const [oldName, coordinator] of [...groupRoomCoordinators]) {
+    const next = groupNameForLifetime(coordinator, rooms)
+    if (!next || next === oldName) continue
+    if (groupRoomCoordinators.get(oldName) === coordinator) groupRoomCoordinators.delete(oldName)
+    coordinator.group = next
+    groupRoomCoordinators.set(next, coordinator)
+    for (const occurrence of coordinator.occurrences) occurrence.group = next
+    for (const drive of coordinator.capturedDrives.values()) drive.group = next
+  }
+  const cards = {}, needs = { ...$groupNeedsYou.get() }, activity = { ...$groupActivity.get() }
+  let cardsChanged = false, needsChanged = false, activityChanged = false
+  for (const entry of Object.values($groupClarify.get())) {
+    const next = groupNameForLifetime({ group: entry.group, roomId: entry.roomId, roomToken: entry.roomToken }, rooms)
+    if (next && next !== entry.group) {
+      entry.group = next // preserve pending response/card identity
+      cardsChanged = true
+    }
+    cards[`${entry.group}::${entry.memberKey}`] = entry
+  }
+  for (const [oldName, room] of Object.entries($groupChats.get())) {
+    const next = groupNameForLifetime({ group: oldName, roomId: room.roomId || null,
+      roomToken: room.coordinationId || null }, rooms)
+    if (!next || next === oldName) continue
+    if (oldName in needs) { needs[next] = needs[oldName]; delete needs[oldName]; needsChanged = true }
+    if (oldName in activity) { activity[next] = activity[oldName]; delete activity[oldName]; activityChanged = true }
+  }
+  if (cardsChanged) $groupClarify.set(cards)
+  if (needsChanged) $groupNeedsYou.set(needs)
+  if (activityChanged) $groupActivity.set(activity)
+}
+
+function groupRoomCoordinator(group) {
+  let room = $groupChats.get()[group] || {}
+  if (!room.roomId && !room.coordinationId) {
+    room = updateGroupChat(group, current => { current.coordinationId = groupChatEntryId(); return current }, { sync: false })
+  }
+  let coordinator = groupRoomCoordinators.get(group)
+  if (!coordinator || coordinator.roomId !== (room.roomId || null) || coordinator.roomToken !== (room.coordinationId || null)) {
+    coordinator = { group, roomId: room.roomId || null, roomToken: room.coordinationId || null, resumeQueue: [], occurrences: new Set(),
+      queue: [], budgetPumps: new Set(), active: 0, members: new Map(), drives: new Map(), capturedDrives: new Map() }
+    groupRoomCoordinators.set(group, coordinator)
+  }
+  return coordinator
+}
+
+function groupSourceSessionKey(captured, session) {
+  const route = captured.requestMember.route
+  return JSON.stringify([route?.connectionId || null,
+    route?.targetProfile || captured.owner.name, session])
+}
+
+function registerGroupOccurrence(group, member, thread, deliveryResult = {}, preparedCaptured) {
+  const coordinator = groupRoomCoordinator(group)
+  const room = $groupChats.get()[group] || {}
+  const captured = preparedCaptured || captureGroupTurnMember(member)
+  let settle, ready
+  const occurrence = { id: groupChatEntryId(), group, thread: thread || 'legacy',
+    roomId: coordinator.roomId, roomToken: coordinator.roomToken, epoch: room.epoch || 0, captured, coordinator,
+    memberKey: groupMemberKey(captured.member), phase: 'queued', cancelled: false,
+    runtime: null, interrupts: new Map(), deliveryResult,
+    settled: new Promise(resolve => { settle = resolve }),
+    ready: new Promise(resolve => { ready = resolve }) }
+  occurrence.settle = settle
+  occurrence.markReady = ready
+  occurrence.memberLock = groupSourceSessionKey(captured, `room:${room.roomId || room.coordinationId || group}`)
+  occurrence.inputEndId = room.log?.length ? groupChatSyncEntryKey(room.log.at(-1)) : null
+  occurrence.inputVersion = room.threadInputVersions?.[occurrence.thread] || 0
+  occurrence.userIds = (room.log || []).filter(e => groupIsUserInstruction(e) && groupThreadOf(e) === occurrence.thread).map(groupChatSyncEntryKey)
+  const seen = new Set(groupConsumedInputs(room)[`${occurrence.thread}::${occurrence.memberKey}`] || [])
+  occurrence.consumedIds = (room.log || []).filter(e => groupThreadOf(e) === occurrence.thread && !seen.has(groupChatSyncEntryKey(e))).map(groupChatSyncEntryKey)
+  coordinator.occurrences.add(occurrence) // before retain/session preparation
+  return occurrence
+}
+
+function groupOccurrenceRoomIsCurrent(occurrence) {
+  const room = $groupChats.get()[occurrence.group]
+  return room && !room.tombstone &&
+    (room.roomId || null) === occurrence.roomId &&
+    (room.coordinationId || null) === occurrence.roomToken
+}
+
+function groupOccurrenceCurrent(occurrence) {
+  return !occurrence.cancelled && groupOccurrenceRoomIsCurrent(occurrence) &&
+    !$groupChats.get()[occurrence.group].holds?.[occurrence.memberKey]
+}
+
+function groupOccurrenceCanSubmit(occurrence) {
+  if (!groupOccurrenceCurrent(occurrence)) return false
+  const room = $groupChats.get()[occurrence.group]
+  if (occurrence.drive?.onlyHandoffs && !groupDriveMemberIsCurrent(room, occurrence.captured)) return false
+  return !Array.isArray(occurrence.userIds) || !groupTurnHasNewerUser(room,
+    occurrence.thread, occurrence.userIds, occurrence.inputEndId, occurrence.inputVersion)
+}
+
+function paintGroupOccurrences(coordinator) {
+  const current = $groupChats.get()[coordinator.group]
+  if (!current || (current.roomId || null) !== coordinator.roomId ||
+      (current.coordinationId || null) !== coordinator.roomToken) return
+  const turns = [...coordinator.occurrences].filter(o => !o.released).map(o => ({
+    id: o.id, memberKey: o.memberKey, member: o.captured.member.name,
+    phase: o.cancelled ? (groupOccurrenceInterruptApplied(o) ? 'stopping' : 'stop-unconfirmed') : o.phase, thread: o.thread }))
+  updateGroupChat(coordinator.group, room => {
+    room.turns = turns
+    room.turn = turns.find(o => o.phase === 'running' || o.phase === 'starting')?.member || null
+    return room
+  }, { sync: false })
+}
+
+function groupInterruptConfirmed(reply) {
+  // This confirms application of cancellation, not execution retirement.
+  return reply?.status === 'interrupted'
+}
+
+function interruptStoppedGroupMarker(group, memberKey, marker, target) {
+  const prior = interruptingGroupTurnMarkers.get(marker)
+  if (prior) return prior
+  const room = $groupChats.get()[group]
+  const lifetime = { group, roomId: room?.roomId || null, roomToken: room?.coordinationId || null }
+  const pending = Promise.resolve().then(() => requestForBot(target, 'session.interrupt', {
+    session_id: marker.delivery.accepted_turn.session_id })).then(reply => {
+      const confirmed = groupInterruptConfirmed(reply)
+      const currentGroup = groupNameForLifetime(lifetime)
+      if (confirmed && currentGroup) updateGroupChat(currentGroup, room => {
+        if (room.stranded?.[memberKey] === marker) {
+          marker.interrupt_applied = true
+          room.stranded = { ...room.stranded }
+        }
+        return room
+      }, { sync: false })
+      return confirmed
+    }, () => false).finally(() => {
+      if (interruptingGroupTurnMarkers.get(marker) === pending) interruptingGroupTurnMarkers.delete(marker)
+    })
+  interruptingGroupTurnMarkers.set(marker, pending)
+  return pending
+}
+
+function groupOccurrenceStopConfirmed(occurrence) {
+  if (occurrence.preparationPending || occurrence.submissionPending || occurrence.answerPromise || groupOccurrenceHasPendingInterrupt(occurrence)) return false
+  if (occurrence.terminalObserved) return true
+  if (!occurrence.submitAttempted) return Boolean(occurrence.collectorDone)
+  return false // A matching interrupt ACK still needs exact terminal evidence.
+}
+
+function groupOccurrenceHasPendingInterrupt(occurrence) {
+  return [...(occurrence?.interrupts?.values() || [])].some(attempt => attempt.pending)
+}
+
+function groupOccurrenceInterruptApplied(occurrence) {
+  return !occurrence.preparationPending && !occurrence.submissionPending && !occurrence.answerPromise &&
+    occurrence.interrupts.get(`${occurrence.runtime}::${occurrence.admissionVersion || 0}`)?.confirmed === true
+}
+
+function markGroupOccurrenceStop(occurrence) {
+  const current = $groupChats.get()[occurrence.group]
+  if (!current || (current.roomId || null) !== occurrence.roomId ||
+      (current.coordinationId || null) !== occurrence.roomToken) return
+  updateGroupChat(occurrence.group, room => {
+    const marker = room.stranded?.[occurrence.memberKey]
+    if (marker?.occurrence_id === occurrence.id) {
+      // Keep the collector's object identity: its WeakMap/CAS still owns it.
+      marker.stop_requested = true
+      if (occurrence.runtime) marker.runtime = occurrence.runtime
+      room.stranded = { ...room.stranded }
+    }
+    return room
+  }, { sync: false })
+}
+
+async function interruptGroupOccurrence(occurrence, runtime = occurrence.runtime, retryFailed = false) {
+  if (!runtime || occurrence.released) return false
+  const key = `${runtime}::${occurrence.admissionVersion || 0}`
+  const prior = occurrence.interrupts.get(key)
+  if (prior?.pending) return prior.pending
+  if (prior?.confirmed || (prior && !retryFailed)) return prior.confirmed
+  const attempt = { confirmed: false, pending: null }
+  occurrence.interrupts.set(key, attempt)
+  // Only an in-flight attempt coalesces. Internal cleanup never spins after
+  // failure; the next explicit Stop can retry this same captured generation.
+  attempt.pending = Promise.resolve().then(() => requestForBot(occurrence.captured.requestMember,
+    'session.interrupt', { session_id: runtime })).then(groupInterruptConfirmed, () => false)
+  try {
+    attempt.confirmed = await attempt.pending
+    return attempt.confirmed
+  } finally {
+    attempt.pending = null
+  }
+}
+
+function finishGroupOccurrence(occurrence) {
+  const c = occurrence.coordinator
+  if (occurrence.released || groupOccurrenceHasPendingInterrupt(occurrence)) return
+  occurrence.released = true
+  clearTimeout(occurrence.reconcileTimer)
+  occurrence.reconcileTimer = null
+  occurrence.releaseLease?.()
+  if (c.members.get(occurrence.memberLock) === occurrence) c.members.delete(occurrence.memberLock)
+  if (occurrence.sessionLock && groupRuntimeSessionOwners.get(occurrence.sessionLock) === occurrence) {
+    groupRuntimeSessionOwners.delete(occurrence.sessionLock)
+  }
+  releaseGroupOccurrenceWorker(occurrence)
+  c.occurrences.delete(occurrence)
+  occurrence.markReady()
+  occurrence.settle()
+  paintGroupOccurrences(c)
+  pumpGroupOccurrences(c)
+}
+
+function releaseGroupOccurrenceWorker(occurrence) {
+  if (!occurrence.ownsWorker) return
+  occurrence.ownsWorker = false
+  occurrence.coordinator.active--
+}
+
+function reserveGroupResumeWorker(occurrence) {
+  if (!groupOccurrenceCurrent(occurrence)) return Promise.reject(new Error('Member occurrence was stopped or replaced'))
+  if (occurrence.ownsWorker) return Promise.resolve()
+  if (occurrence.resumeReservation) return occurrence.resumeReservation
+  let resolve, reject
+  occurrence.resumeReservation = new Promise((a, b) => { resolve = a; reject = b })
+  const pending = occurrence.resumeReservation
+  occurrence.coordinator.resumeQueue.push({ occurrence, resolve, reject })
+  pumpGroupOccurrences(occurrence.coordinator)
+  return pending
+}
+
+// Reload does not prove that an accepted execution released its worker. A
+// cold marker without a live occurrence conservatively occupies one until its
+// exact terminal is consumed; no runtime job or session lock is replayed.
+function groupOccupiedWorkers(coordinator) {
+  const room = $groupChats.get()[coordinator.group]
+  if (!room || (room.roomId || null) !== coordinator.roomId ||
+      (room.coordinationId || null) !== coordinator.roomToken) return coordinator.active
+  const owned = new Set([...coordinator.occurrences].filter(o => !o.released).map(o => o.id))
+  return coordinator.active + Object.values(room.stranded || {}).filter(m => !owned.has(m?.occurrence_id)).length
+}
+
+function pumpGroupOccurrences(coordinator) {
+  for (const pump of [...coordinator.budgetPumps]) pump()
+  for (const waiter of [...coordinator.resumeQueue]) {
+    if (!groupOccurrenceCurrent(waiter.occurrence)) {
+      coordinator.resumeQueue.splice(coordinator.resumeQueue.indexOf(waiter), 1)
+      waiter.occurrence.resumeReservation = null
+      waiter.reject(new Error('Member occurrence was stopped or replaced'))
+      continue
+    }
+    if (groupOccupiedWorkers(coordinator) >= GROUP_CHAT_PARALLEL_CEILING) break
+    coordinator.resumeQueue.splice(coordinator.resumeQueue.indexOf(waiter), 1)
+    coordinator.active++
+    waiter.occurrence.ownsWorker = true
+    waiter.occurrence.phase = 'running'
+    waiter.occurrence.resumeReservation = null
+    waiter.resolve()
+  }
+  // Start only bounded work. The retainProfile and prompt.submit boundaries
+  // still perform authoritative admission; four is never a slots-free probe.
+  // Waiting collectors keep sockets/acceptance custody, not admission workers.
+  for (const occurrence of [...coordinator.queue]) {
+    if (groupOccupiedWorkers(coordinator) >= GROUP_CHAT_PARALLEL_CEILING) break
+    if (!coordinator.queue.includes(occurrence)) continue
+    if (coordinator.members.has(occurrence.memberLock)) continue
+    coordinator.queue.splice(coordinator.queue.indexOf(occurrence), 1)
+    if (!groupOccurrenceCanSubmit(occurrence)) {
+      occurrence.deliveryResult.discarded = true
+      occurrence.resolve(null)
+      finishGroupOccurrence(occurrence)
+      continue
+    }
+    coordinator.members.set(occurrence.memberLock, occurrence)
+    coordinator.active++
+    occurrence.ownsWorker = true
+    occurrence.phase = 'starting'
+    paintGroupOccurrences(coordinator)
+    void executeGroupOccurrence(occurrence).then(reply => {
+      occurrence.resolve(reply)
+      if (!retainUnresolvedGroupOccurrence(occurrence)) finishGroupOccurrence(occurrence)
+    }, error => {
+      occurrence.reject(error)
+      if (!retainUnresolvedGroupOccurrence(occurrence)) finishGroupOccurrence(occurrence)
+    })
+  }
+}
+
+function retainUnresolvedGroupOccurrence(occurrence) {
+  occurrence.collectorDone = true
+  const marker = $groupChats.get()[occurrence.group]?.stranded?.[occurrence.memberKey]
+  if (occurrence.cancelled) {
+    if (groupOccurrenceStopConfirmed(occurrence)) {
+      if (marker?.occurrence_id === occurrence.id) consumeGroupTurnMarker(occurrence.group, occurrence.memberKey, marker)
+      return false
+    }
+    markGroupOccurrenceStop(occurrence)
+    if (groupOccurrenceRoomIsCurrent(occurrence) && groupTurnDeliveryKey(marker?.delivery)) {
+      // Late admission/collector settlement may supply the first exact receipt
+      // after Stop. Reconcile it without making control completion wait on a read.
+      void harvestStrandedGroupReply(occurrence.group, occurrence.captured.member).catch(() => undefined)
+    }
+  } else if (!groupOccurrenceRoomIsCurrent(occurrence) || marker?.occurrence_id !== occurrence.id) return false
+  // A timeout/unavailable projection is not capacity evidence. Waiting has
+  // already surrendered only its worker; running/unknown keeps that worker.
+  if (!occurrence.cancelled && occurrence.phase !== 'waiting') occurrence.phase = 'reconciling'
+  occurrence.markReady()
+  paintGroupOccurrences(occurrence.coordinator)
+  scheduleGroupOccurrenceReconciliation(occurrence)
+  return true
+}
+
+/** Exact observation does not need a dispatch slot or a settled room drive.
+ * Keep this bounded and owned by the retained occurrence, not by new input.
+ * Terminal evidence releases its existing locks; unavailable never does. */
+function scheduleGroupOccurrenceReconciliation(occurrence) {
+  if (groupObservationStopped || occurrence.released || occurrence.reconcileTimer || occurrence.reconcileReading ||
+      (occurrence.reconcileTries || 0) >= GROUP_TURN_RECONCILE_MAX_TRIES ||
+      !groupOccurrenceRoomIsCurrent(occurrence)) return
+  const marker = $groupChats.get()[occurrence.group]?.stranded?.[occurrence.memberKey]
+  if (marker?.occurrence_id !== occurrence.id || !groupTurnDeliveryKey(marker.delivery)) return
+  occurrence.reconcileTimer = setTimeout(async () => {
+    occurrence.reconcileTimer = null
+    if (occurrence.released || !groupOccurrenceRoomIsCurrent(occurrence)) return
+    occurrence.reconcileTries = (occurrence.reconcileTries || 0) + 1
+    occurrence.reconcileReading = true
+    try {
+      await harvestStrandedGroupReply(occurrence.group, occurrence.captured.member)
+    } catch {
+      // The next bounded exact read can recover; no prompt or control replay.
+    } finally {
+      occurrence.reconcileReading = false
+      scheduleGroupOccurrenceReconciliation(occurrence)
+    }
+  }, GROUP_TURN_RECONCILE_INTERVAL_MS)
+}
+
+/** Plugin disposal stops scheduling further automatic reads. Markers, leases
+ * and worker reservations remain: stopping an observer is not terminal
+ * evidence. A read already in flight may still settle on exact terminal
+ * evidence, which is the same retirement path an explicit check uses. */
+let groupObservationStopped = false
+function stopGroupTurnObservation() {
+  groupObservationStopped = true
+  for (const coordinator of groupRoomCoordinators.values()) {
+    for (const occurrence of coordinator.occurrences) {
+      clearTimeout(occurrence.reconcileTimer)
+      occurrence.reconcileTimer = null
+    }
+  }
+}
+
+async function executeGroupOccurrence(occurrence) {
+  occurrence.preparationPending = true
+  try {
+    const release = await retainGroupTurnRoute(occurrence.captured.requestMember)
+    let released = false
+    occurrence.releaseLease = () => { if (!released) { released = true; release() } }
+    if (!groupOccurrenceCanSubmit(occurrence)) {
+      occurrence.deliveryResult.discarded = true
+      return null
+    }
+    return await runGroupChatMemberTurnLeased(occurrence.group, occurrence.captured,
+      occurrence.prompt, occurrence.thread, occurrence.images, occurrence.deliveryResult, occurrence)
+  } finally {
+    occurrence.preparationPending = false
+    // Stop owns any interrupt through its acknowledgement, including a runtime
+    // that became available during acquisition. Successors cannot start yet.
+    if (occurrence.answerPromise) await occurrence.answerPromise.catch(() => undefined)
+    if (occurrence.cancelled) await interruptGroupOccurrence(occurrence)
+  }
+}
+
+function runGroupChatMemberTurn(group, member, prompt, thread, images, deliveryResult, registered) {
+  if (!registered && !$groupChats.get()[group]) updateGroupChat(group, room => room, { sync: false })
+  const occurrence = registered || registerGroupOccurrence(group, member, thread, deliveryResult)
+  occurrence.prompt = prompt
+  occurrence.images = (Array.isArray(images) ? images : []).map(image => Object.freeze({ ...image }))
+  occurrence.promise = new Promise((resolve, reject) => { occurrence.resolve = resolve; occurrence.reject = reject })
+  const c = occurrence.coordinator
+  c.queue.push(occurrence)
+  // A blocked member does not occupy one of the four execution workers.
+  const prior = c.members.get(occurrence.memberLock)
+  if (prior) {
+    void waitForGroupTurnCollector(group, occurrence.memberKey, prior, occurrence).then(result => {
+      if (!c.queue.includes(occurrence)) return
+      if (result !== 'settled') {
+        c.queue.splice(c.queue.indexOf(occurrence), 1)
+        if (result === 'cancelled') {
+          occurrence.deliveryResult.discarded = true
+          occurrence.resolve(null)
+        } else occurrence.reject(groupTurnOutcomeError({ state: 'unavailable',
+          reason: 'Earlier member turn did not settle within the wait limit' }))
+        finishGroupOccurrence(occurrence)
+      } else pumpGroupOccurrences(c)
+    })
+  }
+  pumpGroupOccurrences(c)
+  return occurrence.promise
+}
+
+async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, images, deliveryResult, occurrence) {
+  const { member, requestMember, owner } = captured
+  const memberKey = groupMemberKey(member)
+  const discarded = () => {
+    if (deliveryResult) deliveryResult.discarded = true
     return null
   }
-
-  // #91868/#94569: remember the epoch this turn was dispatched under so the
-  // poll loop below can tell an explicit stop from ordinary room churn.
-  const dispatchEpoch = ($groupChats.get()[group] || {}).epoch || 0
-  const memberKey = groupMemberKey(member)
-
-  recordGroupActivity(group, { kind: 'working', member: member.name, thread })
-
-  // Baseline: how many messages exist before our submit.
-  let before = 0
-
+  while (true) {
+    group = occurrence?.group || group
+    const current = $groupChats.get()[group] || {}
+    const prior = current.stranded?.[memberKey]
+    const priorCollector = prior && collectingGroupTurnMarkers.get(prior)
+    if (!priorCollector) {
+      if (Object.prototype.hasOwnProperty.call(current.stranded || {}, memberKey)) {
+        throw groupTurnOutcomeError({ state: 'unavailable', reason: 'Previous member turn outcome is unresolved' })
+      }
+      break
+    }
+    if (prior.thread === (thread || 'legacy') && (current.epoch || 0) === prior.epoch) return discarded()
+    const waited = await waitForGroupTurnCollector(group, memberKey, priorCollector)
+    if (waited === 'cancelled') return discarded()
+    if (waited !== 'settled') {
+      throw groupTurnOutcomeError({ state: 'unavailable', reason: 'Earlier member turn did not settle within the wait limit' })
+    }
+    // Another waiter may have reserved the member. Recheck synchronously
+    // before any session preparation, attachments, or prompt admission.
+  }
+  group = occurrence?.group || group
+  const roomAtDispatch = $groupChats.get()[group] || {}
+  const dispatchEpoch = roomAtDispatch.epoch || 0
+  let marker = { delivery: { accepted_turn: null, member_key: memberKey, owner },
+    thread: thread || 'legacy', epoch: occurrence?.epoch ?? dispatchEpoch,
+    room_id: occurrence?.roomId ?? roomAtDispatch.roomId ?? null, room_token: occurrence?.roomToken, occurrence_id: occurrence?.id,
+    drive_key: occurrence?.drive?.key,
+    consumed_ids: occurrence?.consumedIds, user_ids: occurrence?.userIds, input_version: occurrence?.inputVersion,
+    anchor_id: occurrence?.inputEndId || roomAtDispatch.log?.at(-1)?.id || null }
+  if (occurrence?.drive) persistGroupDrive(group, occurrence.drive)
+  let settleCollector
+  const collector = { settled: new Promise(resolve => { settleCollector = resolve }) }
+  collectingGroupTurnMarkers.set(marker, collector)
+  updateGroupChat(group, room => {
+    room.stranded = { ...(room.stranded || {}), [memberKey]: marker }
+    return room
+  }, { sync: false })
+  let submitAttempted = false
   try {
-    const pre = await requestForBot(member, 'session.resume', {
-      session_id: stored || runtime,
-      profile: member.name
-    })
-    before = Array.isArray(pre?.messages) ? pre.messages.length : pre?.message_count || 0
-  } catch {
-    /* lazy session — zero messages */
-  }
-
-  // Stage this delta's attachments into the member's session so the model
-  // receives the actual payload with the prompt — the same attach RPCs the
-  // 1:1 chat uses (they also work cross-connection, where the member's
-  // gateway can't see this machine's files). Images queue as vision tiles,
-  // PDFs render per-page via pdf.attach, and other files materialize in the
-  // session workspace (their @file: refs are appended to the prompt so the
-  // member's file tools can read them). A failed attach degrades that
-  // member to text-only; the transcript line still names the attachment so
-  // the member knows something was shared.
-  const fileRefs = []
-
-  for (const img of Array.isArray(images) ? images : []) {
-    if (!img || typeof img.data !== 'string' || !img.data) {
-      continue
+    const prepared = await ensureGroupChatSession(group, member, requestMember, occurrence)
+    group = occurrence?.group || group
+    let { runtime } = prepared
+    const { stored } = prepared
+    if (occurrence) {
+      occurrence.runtime = runtime
+      occurrence.sessionLock = groupSourceSessionKey(captured, runtime)
+      const prior = groupRuntimeSessionOwners.get(occurrence.sessionLock)
+      if (prior && prior !== occurrence) {
+        consumeGroupTurnMarker(group, memberKey, marker)
+        throw groupTurnOutcomeError({ state: 'unavailable', reason: 'Member runtime is owned by another occurrence' })
+      }
+      groupRuntimeSessionOwners.set(occurrence.sessionLock, occurrence)
+      if (occurrence.cancelled) await interruptGroupOccurrence(occurrence)
     }
-
-    try {
-      if (img.kind === 'pdf') {
-        await requestForBot(member, 'pdf.attach', {
-          session_id: runtime,
-          content_base64: img.data,
-          filename: img.name || 'attachment.pdf'
-        })
-      } else if (img.kind === 'file') {
-        const res = await requestForBot(member, 'file.attach', {
-          session_id: runtime,
-          data_url: img.data,
-          name: img.name || 'attachment'
-        })
-
-        if (res?.ref_text) {
-          fileRefs.push(`${img.name || 'attachment'} → ${res.ref_text}`)
+    const beforeSubmit = () => {
+      group = occurrence?.group || group
+      const room = $groupChats.get()[group] || {}
+      return (!occurrence || groupOccurrenceCanSubmit(occurrence)) && room.stranded?.[memberKey] === marker && !room.tombstone &&
+        !((room.epoch || 0) !== dispatchEpoch && room.holds?.[memberKey])
+    }
+    if (!runtime || !beforeSubmit()) {
+      consumeGroupTurnMarker(group, memberKey, marker)
+      return discarded()
+    }
+    runtime = await requireGroupTurnProtocol(requestMember, prepared)
+    group = occurrence?.group || group
+    if (occurrence && runtime !== occurrence.runtime) {
+      const sessionLock = groupSourceSessionKey(captured, runtime)
+      const prior = groupRuntimeSessionOwners.get(sessionLock)
+      if (prior && prior !== occurrence) {
+        consumeGroupTurnMarker(group, memberKey, marker)
+        throw groupTurnOutcomeError({ state: 'unavailable', reason: 'Member runtime is owned by another occurrence' })
+      }
+      if (occurrence.sessionLock && groupRuntimeSessionOwners.get(occurrence.sessionLock) === occurrence) {
+        groupRuntimeSessionOwners.delete(occurrence.sessionLock)
+      }
+      occurrence.runtime = runtime
+      occurrence.sessionLock = sessionLock
+      groupRuntimeSessionOwners.set(sessionLock, occurrence)
+      if (occurrence.cancelled) await interruptGroupOccurrence(occurrence)
+    }
+    if (!beforeSubmit()) {
+      consumeGroupTurnMarker(group, memberKey, marker)
+      return discarded()
+    }
+    if (occurrence) {
+      occurrence.preparationPending = false
+      occurrence.phase = 'running'; paintGroupOccurrences(occurrence.coordinator)
+    }
+    recordGroupActivity(group, { kind: 'working', member: member.name, thread })
+    const fileRefs = []
+    for (const img of Array.isArray(images) ? images : []) {
+      if (!img || typeof img.data !== 'string' || !img.data) continue
+      try {
+        if (img.kind === 'pdf') {
+          await requestForBot(requestMember, 'pdf.attach', { session_id: runtime,
+            content_base64: img.data, filename: img.name || 'attachment.pdf' })
+        } else if (img.kind === 'file') {
+          const res = await requestForBot(requestMember, 'file.attach', { session_id: runtime,
+            data_url: img.data, name: img.name || 'attachment' })
+          if (res?.ref_text) fileRefs.push(`${img.name || 'attachment'} → ${res.ref_text}`)
+        } else {
+          await requestForBot(requestMember, 'image.attach_bytes', { session_id: runtime,
+            content_base64: img.data, filename: img.name || 'attachment.png' })
         }
-      } else {
-        await requestForBot(member, 'image.attach_bytes', {
-          session_id: runtime,
-          content_base64: img.data,
-          filename: img.name || 'attachment.png'
-        })
+      } catch {
+        // Required evidence failed before admission: do not submit text-only.
+        // Surface only bounded display metadata, never bytes or RPC errors.
+        const kind = img.kind === 'pdf' ? 'pdf' : img.kind === 'file' ? 'file' : 'image'
+        const fallback = kind === 'pdf' ? 'attachment.pdf' : kind === 'file' ? 'attachment' : 'attachment.png'
+        const filename = (typeof img.name === 'string' ? img.name.split(/[\\/]/).at(-1) : '')
+          .replace(/[^a-zA-Z0-9._ -]/g, '_').slice(0, 120).trim() || fallback
+        const error = groupTurnOutcomeError({ state: 'attachment-failed',
+          reason: `Could not attach ${kind} "${filename}" for member ${member.name}; prompt was not submitted` })
+        error.code = 'GROUP_ATTACHMENT_FAILED'
+        error.data = { ...error.data, member: member.name, attachmentKind: kind, filename }
+        throw error
       }
-    } catch {
-      /* text-only fallback for this member */
     }
-  }
-
-  const turnText = fileRefs.length
-    ? `${prompt}\n\nAttached files staged in your session workspace:\n${fileRefs.join('\n')}`
-    : prompt
-
-  // #93602: one-shot recovery when the runtime session was reaped between
-  // minting and submitting. Tracks the runtime id the submit landed on so
-  // the poll fallback below targets a live session.
-  const liveRuntime = await submitGroupTurnPrompt(member, runtime, stored, turnText)
-
-  const started = Date.now()
-  let deadline = started + GROUP_TURN_TIMEOUT_MS
-
-  while (Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, GROUP_TURN_POLL_MS))
-
-    // #91868/#94569: an explicit stop (stopGroupThread) bumped the epoch AND
-    // held this member — the member's session was interrupted, so nothing is
-    // coming; abandon the poll instead of grinding until the deadline. Both
-    // conditions on purpose: an ordinary newer send bumps the epoch WITHOUT
-    // a hold, and that turn must keep polling so finished work can still be
-    // delivered (the #93127 commit check decides its fate, not this loop).
-    const roomDuringPoll = $groupChats.get()[group] || {}
-
-    if ((roomDuringPoll.epoch || 0) !== dispatchEpoch && (roomDuringPoll.holds || {})[memberKey]) {
-      return null
+    const turnText = fileRefs.length
+      ? `${prompt}\n\nAttached files staged in your session workspace:\n${fileRefs.join('\n')}` : prompt
+    if (!beforeSubmit()) {
+      consumeGroupTurnMarker(group, memberKey, marker)
+      return discarded()
     }
-
-    let state = null
-
+    submitAttempted = true
+    if (occurrence) { occurrence.submitAttempted = true; occurrence.submissionPending = true }
+    let submitted
     try {
-      state = await requestForBot(member, 'session.resume', {
-        session_id: stored || liveRuntime,
-        profile: member.name
-      })
-    } catch {
-      continue
-    }
-
-    const messages = Array.isArray(state?.messages) ? state.messages : []
-    const busy = Boolean(state?.inflight || state?.running)
-    // A clarify blocking inside the member's session is a question for the
-    // HUMAN (#90694) — mirror it into the room store so a card renders, and
-    // hold the turn open: the member isn't stalling, it's waiting on us.
-    const awaitingUser = syncGroupClarify(group, member, state)
-    const done = !busy && !awaitingUser
-
-    if (messages.length > before && done) {
-      const replyText = pickGroupTurnReply(messages, before)
-
-      if (replyText !== null) {
-        recordGroupActivity(group, {
-          kind: isGroupPassText(replyText) ? 'passed' : 'replied',
-          member: member.name,
-          thread
-        })
-
-        return replyText
+      submitted = await submitGroupTurnPrompt(requestMember, runtime, stored, turnText, occurrence, beforeSubmit)
+      if (occurrence) occurrence.runtime = submitted.runtime
+    } finally {
+      if (occurrence) {
+        occurrence.submissionPending = false
+        // Even a lost submission ACK can follow an earlier Stop ACK. Fence
+        // cleanup with a post-settlement interrupt, never replay the prompt.
+        occurrence.admissionVersion = (occurrence.admissionVersion || 0) + 1
+        if (occurrence.cancelled) { markGroupOccurrenceStop(occurrence); await interruptGroupOccurrence(occurrence) }
       }
-
-      recordGroupActivity(group, { kind: 'passed', member: member.name, thread })
-
-      return null
     }
-
-    // Still visibly working — or waiting on the user's answer to a clarify:
-    // extend the deadline (never past the hard cap). A pending question must
-    // outlive the base turn timeout or it dies unanswered at 3 minutes.
-    if (busy || awaitingUser) {
-      deadline = Math.min(started + GROUP_TURN_HARD_CAP_MS, Math.max(deadline, Date.now() + GROUP_TURN_TIMEOUT_MS))
+    group = occurrence?.group || group
+    const previous = marker
+    marker = { ...marker, runtime: submitted.runtime,
+      delivery: { ...marker.delivery, accepted_turn: submitted.acceptedTurn } }
+    collectingGroupTurnMarkers.delete(previous)
+    collectingGroupTurnMarkers.set(marker, collector)
+    let owned = false
+    updateGroupChat(group, room => {
+      if (room.stranded?.[memberKey] === previous) {
+        room.stranded = { ...room.stranded, [memberKey]: marker }
+        owned = true
+      }
+      return room
+    }, { sync: false })
+    if (!owned) return discarded()
+    if (!submitted.acceptedTurn) {
+      throw groupTurnOutcomeError({ state: 'unavailable', reason: 'Member turn admission identity is unavailable' })
     }
+    const started = Date.now()
+    let deadline = started + GROUP_TURN_TIMEOUT_MS
+    let progress = 'working'
+    let failedPolls = 0
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, GROUP_TURN_POLL_MS))
+      group = occurrence?.group || group
+      const roomDuringPoll = $groupChats.get()[group] || {}
+      if (roomDuringPoll.stranded?.[memberKey] !== marker) return discarded()
+      if (occurrence && (occurrence.cancelled || !groupOccurrenceRoomIsCurrent(occurrence))) {
+        if (occurrence.cancelled) markGroupOccurrenceStop(occurrence)
+        return discarded()
+      }
+      let state
+      const resumeFenceAtPoll = occurrence?.resumeFence
+      const responseAcknowledgedAtPoll = resumeFenceAtPoll?.acknowledged
+      try {
+        state = await requestForBot(requestMember, 'session.turn.poll', {
+          session_id: submitted.acceptedTurn.session_id, profile: member.name,
+          accepted_turn: submitted.acceptedTurn })
+      } catch (error) {
+        group = occurrence?.group || group
+        const roomAfterError = $groupChats.get()[group] || {}
+        if (roomAfterError.stranded?.[memberKey] !== marker) return discarded()
+        if (occurrence?.cancelled) { markGroupOccurrenceStop(occurrence); return discarded() }
+        // Supersession changes publication intent, not observation ownership.
+        // Retry exact reads only; an absent runtime/capability is not transient.
+        failedPolls++
+        if (marker.stop_requested || marker.hold_requested || roomAfterError.holds?.[memberKey]) return discarded()
+        if (failedPolls < GROUP_TURN_POLL_RETRY_LIMIT &&
+            ![4001, 4006, 4030, -32601].includes(error?.code)) {
+          recordGroupActivity(group, { kind: 'observing', member: member.name, thread,
+            reason: 'Retrying earlier turn status; no instruction is resubmitted' })
+          continue
+        }
+        if (!groupTurnMarkerIntentIsCurrent(roomAfterError, marker)) return discarded()
+        throw groupTurnOutcomeError({ state: 'unavailable',
+          reason: `Could not observe member turn: ${error?.message || 'gateway poll failed'}` })
+      }
+      failedPolls = 0
+      group = occurrence?.group || group
+      const roomAfterResume = $groupChats.get()[group] || {}
+      if (roomAfterResume.stranded?.[memberKey] !== marker) return discarded()
+      if (occurrence && (occurrence.cancelled || !groupOccurrenceRoomIsCurrent(occurrence))) {
+        if (occurrence.cancelled) markGroupOccurrenceStop(occurrence)
+        return discarded()
+      }
+      const outcome = readGroupTurnOutcome(state, marker.delivery)
+      if (!groupTurnMarkerIntentIsCurrent(roomAfterResume, marker)) {
+        if (['complete', 'error', 'interrupted'].includes(outcome.state)) {
+          // Evidence counts only once custody is actually retired; a refused
+          // consume (pending interrupt) keeps the marker and its locks.
+          if (consumeGroupTurnMarker(group, memberKey, marker) && occurrence) occurrence.terminalObserved = true
+          return discarded()
+        }
+        if (marker.stop_requested || marker.hold_requested || roomAfterResume.holds?.[memberKey]) return discarded()
+        // Do not publish superseded output, but keep watching until its locks
+        // can be released. A newer drive is waiting on this exact predecessor.
+        if (outcome.state === 'unavailable') throw groupTurnOutcomeError(outcome)
+        if (occurrence && occurrence.phase !== 'waiting') {
+          occurrence.phase = 'reconciling'
+          paintGroupOccurrences(occurrence.coordinator)
+        }
+        deadline = Math.min(started + GROUP_TURN_HARD_CAP_MS,
+          Math.max(deadline, Date.now() + GROUP_TURN_TIMEOUT_MS))
+        continue
+      }
+      const pendingQuestion = state?.pending_clarify?.request_id || state?.pending_approval?.request_id
+      const freshResumeRead = !occurrence?.resumeFence ||
+        (occurrence.resumeFence === resumeFenceAtPoll && responseAcknowledgedAtPoll)
+      // An old snapshot must not resurrect the answered card. A distinct
+      // question can be mirrored even while the prior response ACK is late.
+      if (!freshResumeRead && (outcome.state === 'waiting' || pendingQuestion) &&
+          (!pendingQuestion || occurrence.answeredQuestions?.has(pendingQuestion))) continue
+      const awaitingUser = syncGroupClarify(group, member,
+        outcome.state === 'waiting' || outcome.state === 'running' ||
+          (outcome.state === 'unavailable' && state?.pending_clarify_unavailable) ? state : null, requestMember) && Boolean(pendingQuestion)
+      if (outcome.state === 'waiting' || outcome.state === 'running') {
+        const reason = state.pending_clarify_unavailable ? 'clarification state is temporarily unavailable'
+          : state.pending_clarify ? 'needs your answer' : state.pending_approval ? 'needs your approval' : ''
+        const kind = awaitingUser || outcome.state === 'waiting' || reason ? 'waiting' : 'working'
+        const nextProgress = `${kind}:${reason}`
+        if (nextProgress !== progress && !(progress === 'working' && kind === 'working')) {
+          recordGroupActivity(group, { kind, member: member.name, thread, reason })
+        }
+        progress = nextProgress
+      }
+      // An unavailable child read keeps its card visible, but the old card is
+      // not proof that computation is waiting or its worker is free.
+      if (occurrence && (awaitingUser || outcome.state === 'waiting')) {
+        const fence = occurrence.resumeFence
+        if (!fence || (fence === resumeFenceAtPoll && responseAcknowledgedAtPoll)) {
+          occurrence.resumeFence = null
+          occurrence.phase = 'waiting'
+          occurrence.wasWaiting = true
+          releaseGroupOccurrenceWorker(occurrence)
+          pumpGroupOccurrences(occurrence.coordinator)
+          occurrence.markReady() // parked, but still owns its lease, marker and reservation
+        }
+        paintGroupOccurrences(occurrence.coordinator)
+      } else if (occurrence) {
+        if (occurrence.phase === 'waiting' && !['complete', 'error', 'interrupted'].includes(outcome.state)) {
+          await reserveGroupResumeWorker(occurrence)
+        }
+        if (occurrence.resumeFence === resumeFenceAtPoll && responseAcknowledgedAtPoll) occurrence.resumeFence = null
+        paintGroupOccurrences(occurrence.coordinator)
+      }
+      if (occurrence && ['complete', 'error', 'interrupted'].includes(outcome.state)) occurrence.terminalObserved = true
+      if (!awaitingUser && outcome.state === 'complete') {
+        if (!consumeGroupTurnMarker(group, memberKey, marker)) return discarded()
+        if (deliveryResult) deliveryResult.value = marker.delivery
+        recordGroupActivity(group, { kind: isGroupPassText(outcome.reply) ? 'passed' : 'replied', member: member.name, thread })
+        return outcome.reply
+      }
+      if (!awaitingUser && ['error', 'interrupted', 'unavailable'].includes(outcome.state)) {
+        if (outcome.state !== 'unavailable' && !consumeGroupTurnMarker(group, memberKey, marker)) return discarded()
+        throw groupTurnOutcomeError(outcome)
+      }
+      if (awaitingUser || outcome.state === 'running' || outcome.state === 'waiting') {
+        deadline = Math.min(started + GROUP_TURN_HARD_CAP_MS,
+          Math.max(deadline, Date.now() + GROUP_TURN_TIMEOUT_MS))
+      }
+    }
+    recordGroupActivity(group, { kind: 'timed-out', member: member.name, thread })
+    // Observation expiry cannot invalidate a retained unavailable child card.
+    return null
+  } catch (error) {
+    group = occurrence?.group || group
+    if (!submitAttempted || occurrence?.admissionRefused || error?.code === 4090 || error?.code === 'POOL_CAPACITY_EXCEEDED') {
+      if (occurrence?.admissionRefused || error?.code === 4090 || error?.code === 'POOL_CAPACITY_EXCEEDED') {
+        if (occurrence) occurrence.submitAttempted = false
+        error.data = { ...error.data, outcomeState: 'admission-refused', reason: error.message }
+      }
+      consumeGroupTurnMarker(group, memberKey, marker)
+      throw error
+    }
+    // An uncertain admission or unavailable projection must never be replayed.
+    // The round's existing catch surfaces the error once; harvest retains it.
+    if ($groupChats.get()[group]?.stranded?.[memberKey] === marker) {
+      updateGroupChat(group, room => {
+        room.stranded = { ...room.stranded, [memberKey]: { ...marker, reported: true,
+          reason: error?.data?.reason || error?.message || 'Member turn outcome is unavailable' } }
+        return room
+      }, { sync: false })
+    }
+    throw error
+  } finally {
+    collectingGroupTurnMarkers.delete(marker)
+    settleCollector()
   }
-
-  // Timeout — clear any still-mirrored question card (the server-side
-  // clarify timeout runs its own course) and read as a pass, but remember the baseline + thread
-  // (runtime-only) so the finished reply can be posted late into the RIGHT
-  // thread instead of vanishing.
-  recordGroupActivity(group, { kind: 'timed-out', member: member.name, thread })
-  syncGroupClarify(group, member, null)
-  updateGroupChat(group, r => {
-    r.stranded = { ...(r.stranded || {}), [groupMemberKey(member)]: { before, thread } }
-    return r
-  })
-
-  return null
 }
 
-/** Post a timed-out member's finished reply into the room, if it landed
- *  after we stopped waiting. Called at the member's next turn boundary and
- *  on user sends, so long-running work is delivered late rather than lost. */
+/** Harvest the captured admission from its source, never a newer session's
+ *  history. Missing/restarted/evicted receipts remain unresolved. */
 async function harvestStrandedGroupReply(group, member) {
   const memberKey = groupMemberKey(member)
   const room = $groupChats.get()[group] || {}
+  const lifetime = { group, roomId: room.roomId || null, roomToken: room.coordinationId || null }
   const marker = room.stranded?.[memberKey]
-  // Markers were a bare number before threads; normalize both shapes.
-  const strandedBefore = typeof marker === 'number' ? marker : marker?.before
-  const strandedThread = (typeof marker === 'object' && marker?.thread) || 'legacy'
-
-  if (typeof strandedBefore !== 'number') {
+  const reconciliationOnly = marker?.stop_requested || marker?.hold_requested
+  if (marker === undefined || (collectingGroupTurnMarkers.has(marker) && !reconciliationOnly) ||
+      (room.holds?.[memberKey] && !reconciliationOnly)) return
+  if (marker?.room_token && marker.room_token !== room.coordinationId) {
+    reportUnavailableGroupTurn(group, member, marker, 'Legacy room lifetime is unavailable after reload or replacement')
     return
   }
-
-  let state = null
-
+  const ownedOccurrence = [...(groupRoomCoordinators.get(group)?.occurrences || [])].find(o => o.id === marker?.occurrence_id)
+  if (ownedOccurrence?.answerPromise) return
+  const requested = member === ownedOccurrence?.captured.member
+    ? ownedOccurrence.captured : captureGroupTurnMember(member)
+  if (groupTurnOwnerKey(marker?.delivery?.owner) !== groupTurnOwnerKey(requested.owner) ||
+      (room.sessionOwners?.[memberKey] && groupTurnOwnerKey(room.sessionOwners[memberKey]) !== groupTurnOwnerKey(requested.owner))) {
+    reportUnavailableGroupTurn(group, member, marker, 'Member source or target profile changed')
+    return
+  }
+  const captured = ownedOccurrence?.captured || requested
+  if (!groupTurnDeliveryKey(marker?.delivery) || marker.delivery.member_key !== memberKey ||
+      groupTurnOwnerKey(marker.delivery.owner) !== groupTurnOwnerKey(captured.owner)) {
+    reportUnavailableGroupTurn(group, member, marker, 'Member turn admission or source identity is unavailable')
+    return
+  }
+  let state
+  const resumeFenceAtRead = ownedOccurrence?.resumeFence
+  const responseAcknowledgedAtRead = resumeFenceAtRead?.acknowledged
   try {
-    const stored = room.sessions?.[memberKey]
-    state = await requestForBot(member, 'session.resume', {
-      session_id: stored || `Group: ${room.roomId || group}`,
-      profile: member.name
-    })
-  } catch {
-    return // source unreachable — leave the marker for the next boundary
-  }
-
-  if (state?.inflight || state?.running) {
-    return // still grinding — keep waiting
-  }
-
-  // A stranded member blocked on a clarify is not "grinding" — surface the
-  // question card (#90694) and keep the marker until it resolves.
-  if (syncGroupClarify(group, member, state)) {
+    state = await requestForBot(captured.requestMember, 'session.turn.poll', {
+      session_id: marker.delivery.accepted_turn.session_id, profile: captured.member.name,
+      accepted_turn: marker.delivery.accepted_turn })
+  } catch (error) {
+    group = groupNameForLifetime(lifetime) || group
+    const current = $groupChats.get()[group]
+    if (current?.stranded?.[memberKey] !== marker || !groupTurnMarkerIntentIsCurrent(current, marker)) return
+    reportUnavailableGroupTurn(group, member, marker,
+      `Could not observe member turn: ${error?.message || 'gateway poll failed'}`)
     return
   }
-
-  // Done (or dead): the marker is consumed either way.
-  updateGroupChat(group, r => {
-    const next = { ...(r.stranded || {}) }
-    delete next[memberKey]
-    r.stranded = next
-    return r
-  })
-
-  const messages = Array.isArray(state?.messages) ? state.messages : []
-
-  if (messages.length <= strandedBefore) {
+  group = groupNameForLifetime(lifetime) || group
+  if ($groupChats.get()[group]?.stranded?.[memberKey] !== marker || ownedOccurrence?.answerPromise) return
+  const outcome = readGroupTurnOutcome(state, marker.delivery)
+  const freshResumeRead = !ownedOccurrence?.resumeFence ||
+    (ownedOccurrence.resumeFence === resumeFenceAtRead && responseAcknowledgedAtRead)
+  if (reconciliationOnly || ownedOccurrence?.cancelled) {
+    // A stopped/held receipt is reconciliation only, including after reload. No
+    // reply, attention, input consumption, clarify card or prompt replay.
+    if (['complete', 'error', 'interrupted'].includes(outcome.state) &&
+        !ownedOccurrence?.submissionPending && freshResumeRead) {
+      if (ownedOccurrence) ownedOccurrence.terminalObserved = true
+      if (consumeGroupTurnMarker(group, memberKey, marker) && ownedOccurrence) settleGroupPublication(ownedOccurrence)
+    } else if (ownedOccurrence && outcome.state === 'waiting' &&
+        !ownedOccurrence.submissionPending && freshResumeRead) {
+      ownedOccurrence.resumeFence = null
+      ownedOccurrence.phase = 'waiting'
+      releaseGroupOccurrenceWorker(ownedOccurrence)
+      paintGroupOccurrences(ownedOccurrence.coordinator)
+      pumpGroupOccurrences(ownedOccurrence.coordinator)
+    }
     return
   }
-
-  const reply = pickGroupTurnReply(messages, strandedBefore)
-
-  if (reply && !isGroupPassText(reply)) {
-    recordGroupActivity(group, { kind: 'delivered', member: member.name, thread: strandedThread })
-    appendGroupChatEntry(
-      group,
-      { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
-      reply,
-      strandedThread
-    )
-    updateGroupChat(group, r => {
-      r.watermarks[`${strandedThread}::${memberKey}`] = r.log.length
-      return r
-    })
+  if (!groupTurnMarkerIntentIsCurrent($groupChats.get()[group], marker)) {
+    if (['complete', 'error', 'interrupted'].includes(outcome.state)) {
+      consumeGroupTurnMarker(group, memberKey, marker)
+    }
+    return
+  }
+  if (!freshResumeRead && (outcome.state === 'waiting' || state?.pending_clarify || state?.pending_approval)) return
+  const waiting = syncGroupClarify(group, member,
+    outcome.state === 'waiting' || outcome.state === 'running' ||
+      (outcome.state === 'unavailable' && state?.pending_clarify_unavailable) ? state : null, captured.requestMember) &&
+    Boolean(state?.pending_clarify?.request_id || state?.pending_approval?.request_id)
+  if (ownedOccurrence && (waiting || outcome.state === 'waiting')) {
+    ownedOccurrence.resumeFence = null
+    ownedOccurrence.phase = 'waiting'
+    releaseGroupOccurrenceWorker(ownedOccurrence)
+    paintGroupOccurrences(ownedOccurrence.coordinator)
+    pumpGroupOccurrences(ownedOccurrence.coordinator)
+  }
+  if (waiting || outcome.state === 'running' || outcome.state === 'waiting') return
+  if (outcome.state === 'unavailable') {
+    reportUnavailableGroupTurn(group, member, marker, outcome.reason)
+    return
+  }
+  const current = $groupChats.get()[group]
+  if (!current || current.tombstone || current.holds?.[memberKey] ||
+      (marker.room_id !== undefined && marker.room_id !== (current.roomId || null))) return
+  const newerUser = groupTurnHasNewerUser(current, marker.thread, marker.user_ids, marker.anchor_id, marker.input_version)
+  if (!shouldCommitMemberTurn(marker.epoch ?? 0, current.epoch || 0, newerUser,
+    marker.input_version !== undefined || Array.isArray(marker.user_ids))) {
+    consumeGroupTurnMarker(group, memberKey, marker)
+    return
+  }
+  const continuationDrive = ownedOccurrence?.drive || restoreGroupDrive(group, marker)
+  const publishes = outcome.state === 'complete' && !isGroupPassText(outcome.reply)
+  if (!consumeGroupTurnMarker(group, memberKey, marker, publishes)) return
+  if (ownedOccurrence) settleGroupPublication(ownedOccurrence, publishes)
+  if (Array.isArray(marker.consumed_ids)) consumeGroupInputs(group, `${marker.thread}::${memberKey}`,
+    marker.consumed_ids, marker.anchor_id, current.roomId || null)
+  if (outcome.state === 'error' || outcome.state === 'interrupted') {
+    recordGroupActivity(group, { kind: outcome.state === 'error' ? 'failed' : 'interrupted',
+      member: captured.member.name, thread: marker.thread, reason: outcome.reason })
+    noteBotAttention(memberKey, outcome.reason)
+    return
+  }
+  if (!isGroupPassText(outcome.reply)) {
+    recordGroupActivity(group, { kind: 'delivered', member: captured.member.name, thread: marker.thread })
+    appendGroupChatEntry(group, { kind: 'member', name: captured.member.name,
+      ...(captured.member.remoteSource ? { source: captured.member.connectionLabel || captured.member.connectionId } : {}) },
+      outcome.reply, marker.thread, undefined, marker.delivery)
+    scheduleGroupDriveContinuation(group, continuationDrive)
   }
 }
 
@@ -8000,8 +9067,15 @@ async function harvestStrandedGroupReply(group, member) {
  *  filters are thread-scoped): a cross-thread epoch bump must NOT discard
  *  finished work no fresh loop will regenerate. Callers pass whether a newer
  *  USER entry landed in this thread since dispatch; the default (true)
- *  preserves the conservative drop when the caller can't tell. */
-function shouldCommitMemberTurn(epochAtDispatch, currentEpoch, newerUserEntryInThread = true) {
+ *  preserves the conservative drop when the caller can't tell. Modern turns
+ *  also capture per-thread input identity: proven supersession of that input
+ *  vetoes completion even when display-only remote sync keeps the epoch.
+ *  Legacy callers without that capture retain the epoch-equality behavior. */
+function shouldCommitMemberTurn(epochAtDispatch, currentEpoch, newerUserEntryInThread = true, hasCapturedInputIdentity = false) {
+  if (hasCapturedInputIdentity && newerUserEntryInThread) {
+    return false
+  }
+
   if (epochAtDispatch === currentEpoch) {
     return true
   }
@@ -8044,21 +9118,35 @@ function isDuplicateGroupAppend(lastEntry, from, text, thread, now = Date.now())
 
 // --- member-hold helpers (#93129) — pure, vm-sliced by tests ---
 
-/** #93129: classify a USER room message's effect on member holds. Only user
- *  sends ever reach this (bot replies are appended by the round loop, never
- *  through sendToGroupChat), so a bot saying "stopped working on it" can
- *  never set a hold. Conservative on purpose: any standalone stop/halt/pause
- *  word next to a mention holds those members — "don't stop @x" therefore
- *  also holds, which errs toward the bot staying quiet until re-addressed
- *  (a wrongly-held bot is one mention away from release; a wrongly-running
- *  one keeps doing work it was told to stop). A non-stop direct mention
- *  releases the mentioned members — the user addressing a bot directly
- *  overrides its hold. */
-function classifyGroupHoldDirective(text, mentionedKeys, everyone) {
-  const value = String(text || '')
+/** #93129: only a whole, affirmative USER command creates stop controls.
+ *  A stop word in negated, quoted, descriptive or conditional prose is not
+ *  an immediate stop instruction. Existing direct non-command mentions
+ *  still release the addressed members; the explicit Stop button is separate. */
+function classifyGroupHoldDirective(text, mentionedKeys, everyone, parseTargets) {
+  const value = String(text || '').trim()
   const mentioned = [...(mentionedKeys || [])]
-  const stop = /\b(stop|halt|pause)\b/i.test(value)
-  const resume = /\b(resume|continue|go|proceed)\b/i.test(value)
+  // Commands: "stop @member, please", "@member please pause for now", "@all resume".
+  // Match the entire message, not a keyword detached from its scope or timing.
+  const target = String.raw`@[a-z0-9][a-z0-9._-]*`
+  const targets = `${target}(?:(?:\\s*(?:,|&)\\s*|\\s+and\\s+|\\s+)${target})*`
+  const isCommand = verbs => new RegExp(
+    `^(?:please\\s+)?(?:${targets}(?:\\s*[:,]\\s*|\\s+)(?:please\\s+)?(?:${verbs})|(?:${verbs})\\s+${targets})(?:\\s+(?:now|for\\s+now|immediately))?(?:\\s+please|\\s*,\\s*please)?[.!]*$`,
+    'i'
+  ).test(value)
+  const stop = isCommand('stop|halt|pause')
+  const wholeResume = isCommand('resume|continue|go|proceed')
+  // A leading resume may carry a successor instruction. Its target prefix
+  // owns the control; mentions in the instruction cannot expand that scope.
+  const resumeInstruction = new RegExp(
+    '^(?:please\\s+)?(?:(' + targets + ')(?:\\s*[:,]\\s*|\\s+)(?:please\\s+)?resume|resume\\s+(' + targets + '))\\s+(.+)$',
+    'i'
+  ).exec(value)
+  const instruction = resumeInstruction?.[3] || ''
+  const deferredResume = /^(?:(?:please|now|immediately|for\s+now)[\s,]+)*(?:(?:only\s+)?(?:if|when|unless|until|after|before|once)|later)\b/i.test(instruction)
+  // Without an immediate marker, a negative prefix qualifies resume itself.
+  // After "now"/"immediately", it belongs to the successor instruction.
+  const negatedResume = /^(?:please[\s,]+)*(?:not|never|do\s+not|don['’]t)\b/i.test(instruction)
+  const resume = wholeResume || Boolean(resumeInstruction && !deferredResume && !negatedResume)
 
   if (stop) {
     // "@all stop" holds every member — symmetric with "@all resume".
@@ -8066,7 +9154,12 @@ function classifyGroupHoldDirective(text, mentionedKeys, everyone) {
   }
 
   if (resume) {
-    return { hold: [], holdAll: false, release: mentioned, releaseAll: Boolean(everyone) }
+    const targetText = resumeInstruction?.[1] || resumeInstruction?.[2] || ''
+    const scoped = !wholeResume && targetText ? parseTargets?.(targetText) : null
+    const release = !wholeResume && targetText ? [...(scoped?.mentioned || [])] : mentioned
+    const controlAll = /(?:^|[\s,&])@(?:all|everyone)(?=$|[\s,&])/i.test(targetText)
+    const releaseAll = wholeResume ? Boolean(everyone) : Boolean(scoped?.everyone ?? (everyone && controlAll))
+    return { hold: [], holdAll: false, release, releaseAll }
   }
 
   return { hold: [], holdAll: false, release: mentioned, releaseAll: false }
@@ -8077,9 +9170,9 @@ function classifyGroupHoldDirective(text, mentionedKeys, everyone) {
  *  mints a NEW thread, so a thread-scoped hold would never block the next
  *  send's turns and the stop would not stick. Returns the same object when
  *  nothing changed. */
-function applyGroupHoldDirective(holds, mentions, text, stamp, allMemberKeys = []) {
+function applyGroupHoldDirective(holds, mentions, text, stamp, allMemberKeys = [], parseTargets) {
   const prior = holds && typeof holds === 'object' ? holds : {}
-  const action = classifyGroupHoldDirective(text, mentions?.mentioned || [], Boolean(mentions?.everyone))
+  const action = classifyGroupHoldDirective(text, mentions?.mentioned || [], Boolean(mentions?.everyone), parseTargets)
 
   if (action.releaseAll) {
     return Object.keys(prior).length ? {} : prior
@@ -8187,410 +9280,519 @@ function unaddressedGroupMentions(group, members, thread) {
   })
 }
 
-/** #91868/#94569: the REAL stop path for a group round. The round loop's only
- *  cancellation primitives were the epoch bump (checked at member boundaries)
- *  and #93129 holds (skip FUTURE turns) — neither touches the member whose
- *  model call is in flight RIGHT NOW, so "stop" meant "finish this turn
- *  first". This primitive does all three legs atomically enough to matter:
- *
- *  1. Bumps the room epoch — the driving loop bails at its next boundary and
- *     never selects another member (`isCurrent()` in runGroupChatRounds).
- *  2. Sets a #93129 hold for EVERY member — future turns stay skipped until
- *     the user explicitly releases (resume / @all resume / direct mention),
- *     the exact contract user-typed "@all stop" already has.
- *  3. Sends session.interrupt to the member currently ON TURN (room.turn,
- *     runtime-only) via its own route, so the in-flight model call actually
- *     dies instead of grinding to completion in the background. Best-effort:
- *     an unreachable member still leaves the room stopped — the poll loop's
- *     staleness check (epoch moved AND member held) abandons the turn.
- *
- *  `members` is the live roster when the caller has one (the workspace);
- *  falls back to the room's durable roster so a two-arg call still works. */
+/** Capture retained input identity once. Numeric watermarks remain a projection
+ * for legacy rooms; timestamp sort/trim must never turn them into new truth. */
+function groupConsumedInputs(room) {
+  const consumed = { ...(room.consumedInputs || {}) }
+  for (const [key, seen] of Object.entries(room.watermarks || {})) {
+    if (!Object.prototype.hasOwnProperty.call(consumed, key)) {
+      consumed[key] = (room.log || []).slice(0, seen).map(groupChatSyncEntryKey)
+    }
+  }
+  return consumed
+}
+
+function consumeGroupInputs(group, markKey, ids, inputEndId, roomId) {
+  updateGroupChat(group, room => {
+    if (room.tombstone || (room.roomId || null) !== roomId) return room
+    const consumed = groupConsumedInputs(room)
+    // Retain historical receipts through trimming; bounded by retained history
+    // per member. New remote entries are reconciled by identity, never time.
+    const all = [...new Set([...(consumed[markKey] || []), ...ids])]
+    const retained = new Set(room.log.map(groupChatSyncEntryKey))
+    consumed[markKey] = [...new Set([...all.filter(id => retained.has(id)),
+      ...all.slice(-GROUP_CHAT_HISTORY_LIMIT * 16)])]
+    room.consumedInputs = consumed
+    const boundary = room.log.findIndex(e => groupChatSyncEntryKey(e) === inputEndId)
+    if (boundary >= 0) room.watermarks[markKey] = boundary + 1
+    return room
+  })
+}
+
+function groupIsUserInstruction(entry) {
+  return entry?.from?.kind === 'user' && !groupTurnDeliveryKey(entry.answer_to)
+}
+
+function groupTurnHasNewerUser(room, thread, userIds, anchorId, inputVersion) {
+  if (inputVersion !== undefined && (room.threadInputVersions?.[thread] || 0) !== inputVersion) return true
+  if (Array.isArray(userIds)) {
+    return room.log.some(e => groupIsUserInstruction(e) && groupThreadOf(e) === thread &&
+      !userIds.includes(groupChatSyncEntryKey(e)))
+  }
+  const anchor = room.log.findIndex(e => e.id === anchorId)
+  return (anchor >= 0 ? room.log.slice(anchor + 1) : room.log).some(
+    e => groupIsUserInstruction(e) && groupThreadOf(e) === thread)
+}
+
+/** Stop owns ALL captured occurrences, including queue/lease/session races.
+ * Locks remain held until late acquisition/submission and exact interrupts
+ * settle, so an old cleanup can never interrupt a replacement occurrence. */
 async function stopGroupThread(group, thread, members = null) {
   const room = $groupChats.get()[group] || {}
+  const lifetime = { group, roomId: room.roomId || null, roomToken: room.coordinationId || null }
+  const coordinator = groupRoomCoordinators.get(group)
+  const occurrences = coordinator && coordinator.roomId === (room.roomId || null) && coordinator.roomToken === (room.coordinationId || null)
+    ? [...coordinator.occurrences] : []
   const roster = Array.isArray(members) && members.length ? members : room.members || []
-  const turnName = room.turn || null
   const stamp = { at: Date.now(), byMessageId: null, thread: thread || null }
-
-  updateGroupChat(group, r => {
+  for (const occurrence of occurrences) occurrence.cancelled = true
+  for (const occurrence of occurrences) {
+    if (occurrence.phase === 'budget-queued') finishGroupOccurrence(occurrence)
+    markGroupOccurrenceStop(occurrence)
+    syncGroupClarify(group, occurrence.captured.member, null)
+  }
+  const stoppedRoom = updateGroupChat(group, r => {
     r.epoch = (r.epoch || 0) + 1
     r.running = false
     r.turn = null
-
-    // Same hold shape applyGroupHoldDirective mints for "@all stop" — the
-    // held-skip path (watermark consume + 'held' activity note) and every
-    // release gesture apply unchanged. An existing hold keeps its stamp.
+    r.turns = []
     const holds = { ...(r.holds || {}) }
-
-    for (const member of roster) {
-      const key = groupMemberKey(member)
-
-      if (key && !holds[key]) {
-        holds[key] = { ...stamp }
-      }
+    for (const key of [...roster.map(groupMemberKey), ...occurrences.map(o => o.memberKey)]) {
+      if (key && !holds[key]) holds[key] = { ...stamp }
     }
-
     r.holds = holds
     return r
   })
-
-  // Recorded AFTER the bump so the event is tagged with the new epoch — it
-  // stays visible as the current run's outcome instead of dropping out of
-  // view with the superseded run's events.
-  recordGroupActivity(group, { kind: 'stopped', member: 'You', thread: thread || null })
-
-  // Interrupt the member actually mid-turn. room.turn is runtime-only and
-  // names exactly one member (the loop is serial); a settled room has none.
-  const onTurn = turnName ? roster.find(member => member?.name === turnName) : null
-  const sessionId = onTurn ? (room.sessions || {})[groupMemberKey(onTurn)] : null
-
-  if (onTurn && sessionId) {
-    try {
-      await requestForBot(onTurn, 'session.interrupt', { session_id: sessionId })
-    } catch {
-      /* best-effort — the epoch/hold legs above already stopped the room;
-         the abandoned poll loop exits on its staleness check */
+  if (coordinator) {
+    for (const occurrence of [...coordinator.queue]) {
+      if (!coordinator.queue.includes(occurrence)) continue
+      coordinator.queue.splice(coordinator.queue.indexOf(occurrence), 1)
+      occurrence.deliveryResult.discarded = true
+      occurrence.resolve(null)
+      finishGroupOccurrence(occurrence)
     }
   }
+  if (coordinator) pumpGroupOccurrences(coordinator)
+  const interrupts = occurrences.map(occurrence => interruptGroupOccurrence(occurrence, occurrence.runtime, true))
+  let legacyUnconfirmed = 0
+  // A cold reload has no runtime registry: accepted durable receipts still
+  // identify exact runtime and source, never a display-name roster guess.
+  for (const [memberKey, marker] of Object.entries(room.stranded || {})) {
+    if (occurrences.some(o => o.memberKey === memberKey)) continue
+    const cardKey = `${group}::${memberKey}`
+    const card = $groupClarify.get()[cardKey]
+    if (card?.receipt === marker || card?.sessionId === marker?.delivery?.accepted_turn?.session_id) {
+      const cards = { ...$groupClarify.get() }; delete cards[cardKey]; $groupClarify.set(cards)
+    }
+    updateGroupChat(group, r => {
+      if (r.stranded?.[memberKey] === marker) { marker.stop_requested = true; r.stranded = { ...r.stranded } }
+      return r
+    }, { sync: false })
+    if (!groupTurnDeliveryKey(marker?.delivery)) continue
+    const owner = marker.delivery.owner
+    const target = Object.freeze({ ...owner, ...(owner.route ? { route: Object.freeze({ ...owner.route }) } : {}) })
+    interrupts.push(interruptStoppedGroupMarker(group, memberKey, marker, target))
+  }
+  // Legacy transient room.turn has no acceptance proof. Retain its old Stop
+  // behavior only when the name is unambiguous and no occurrences exist.
+  if (!occurrences.length && !Object.keys(room.stranded || {}).length && room.turn) {
+    const candidates = roster.filter(m => m.name === room.turn)
+    if (candidates.length === 1) {
+      const member = candidates[0]
+      const sid = room.sessions?.[groupMemberKey(member)]
+      if (sid) interrupts.push(Promise.resolve().then(() => requestForBot(member, 'session.interrupt', { session_id: sid }))
+        .then(() => { legacyUnconfirmed++ }, () => { legacyUnconfirmed++ }))
+    }
+  }
+  for (const interrupt of interrupts) await interrupt
+  const missingLifetime = () => {
+    const pending = Math.max(1, occurrences.filter(o => !o.released && !groupOccurrenceStopConfirmed(o)).length)
+    return { status: 'unconfirmed', unconfirmed: pending, pending }
+  }
+  group = groupNameForLifetime(lifetime)
+  if (!group) return missingLifetime()
+  // The ACK only applied cancellation. The existing exact-turn collector owns
+  // retirement; do not infer a vacant worker from a successful control write.
+  for (const [memberKey, marker] of Object.entries($groupChats.get()[group]?.stranded || {})) {
+    if (!marker?.stop_requested || !groupTurnDeliveryKey(marker.delivery)) continue
+    if ($groupChats.get()[group]?.stranded?.[memberKey] !== marker) continue
+    const occurrence = occurrences.find(o => o.id === marker.occurrence_id)
+    const owner = marker.delivery.owner
+    const target = occurrence?.captured.member || Object.freeze({ ...owner,
+      ...(owner.route ? { route: Object.freeze({ ...owner.route }) } : {}) })
+    // A slow/unavailable poll is observation, not part of the interrupt ACK.
+    // Its exact terminal may retire custody later through the same collector.
+    void harvestStrandedGroupReply(group, target).catch(() => undefined)
+  }
+  for (const occurrence of occurrences) {
+    if (occurrence.collectorDone) {
+      if (occurrence.answerPromise) await occurrence.answerPromise.catch(() => undefined)
+      await interruptGroupOccurrence(occurrence)
+      group = groupNameForLifetime(lifetime)
+      if (!group) return missingLifetime()
+      const settledMarker = $groupChats.get()[group]?.stranded?.[occurrence.memberKey]
+      if (settledMarker?.occurrence_id === occurrence.id && groupTurnDeliveryKey(settledMarker.delivery)) {
+        // A late human response advanced the generation after the first read
+        // was fenced. Observe only after its producer and final interrupt settle.
+        void harvestStrandedGroupReply(group, occurrence.captured.member).catch(() => undefined)
+      }
+      if (groupOccurrenceStopConfirmed(occurrence)) {
+        const marker = $groupChats.get()[group]?.stranded?.[occurrence.memberKey]
+        if (marker?.occurrence_id === occurrence.id) consumeGroupTurnMarker(group, occurrence.memberKey, marker)
+        finishGroupOccurrence(occurrence)
+      }
+    }
+  }
+  const pendingMarkers = Object.values($groupChats.get()[group]?.stranded || {}).filter(marker => marker?.stop_requested)
+  const unconfirmed = legacyUnconfirmed + pendingMarkers.filter(marker => {
+    const occurrence = occurrences.find(o => o.id === marker.occurrence_id)
+    return occurrence ? !groupOccurrenceInterruptApplied(occurrence) : !marker.interrupt_applied
+  }).length + occurrences.filter(o => !o.released && !groupOccurrenceStopConfirmed(o) &&
+    !pendingMarkers.some(marker => marker.occurrence_id === o.id) && !groupOccurrenceInterruptApplied(o)).length
+  const pending = pendingMarkers.length + occurrences.filter(o => !o.released && !groupOccurrenceStopConfirmed(o) &&
+    !pendingMarkers.some(marker => marker.occurrence_id === o.id)).length
+  if (coordinator) paintGroupOccurrences(coordinator)
+  const result = { status: unconfirmed ? 'unconfirmed' : pending ? 'stopping' : 'stopped', unconfirmed, pending }
+  const current = $groupChats.get()[group]
+  if (current && (current.roomId || null) === (room.roomId || null) &&
+      (current.coordinationId || null) === (room.coordinationId || null)) {
+    recordGroupActivity(group, { kind: unconfirmed ? 'stop-unconfirmed' : pending ? 'stopping' : 'stopped',
+      member: 'You', thread: thread || null, epoch: stoppedRoom.epoch })
+  }
+  if (pending && typeof window !== 'undefined') {
+    void harvestStrandedUntilSettled(group, occurrences.map(o => o.captured.member).concat(roster), thread)
+  }
+  return result
 }
 
-/** Drive one bounded round-robin turn for ONE THREAD. Serial — one member at
- *  a time. A newer user send bumps the room epoch; this loop notices at the
- *  next member boundary, bails, and the newest send's own loop takes over.
- *  Watermarks are per thread+member (`${thread}::${memberKey}`), so parallel
- *  topics never eat each other's deltas. */
-async function runGroupChatRounds(group, members, thread) {
-  const startEpoch = ($groupChats.get()[group] || {}).epoch || 0
-  const isCurrent = () => (($groupChats.get()[group] || {}).epoch || 0) === startEpoch
-  let posted = 0
-  let continuations = 0
-  // #94478: how this drive ended. 'settled' means quiet consensus (everyone
-  // passed with nothing pending); 'capped' means a round/message/continuation
-  // cap forced the exit — the activity feed must tell those apart.
+function groupRoomCanStop(room, clarifies = []) {
+  return Boolean(room?.running || clarifies.length || room?.turns?.length ||
+    Object.values(room?.stranded || {}).some(marker => groupTurnDeliveryKey(marker?.delivery)))
+}
+
+// Only accepted/pending receipts retain continuation context on disk. Original
+// inputs and source pins survive reload; neither prompts nor runtime jobs replay.
+function durableGroupDriveContexts(room) {
+  const keys = new Set(Object.values(room.stranded || {}).map(marker => marker?.drive_key).filter(Boolean))
+  return Object.fromEntries(Object.entries(room.driveContexts || {}).filter(([key]) => keys.has(key)))
+}
+
+function groupDriveKey(drive) {
+  return JSON.stringify([drive.roomId, drive.roomToken, drive.thread, drive.epoch, drive.userEntryId])
+}
+
+function persistGroupDrive(group, drive) {
+  const room = $groupChats.get()[group]
+  if (!room || (room.roomId || null) !== drive.roomId || (room.coordinationId || null) !== drive.roomToken) return
+  updateGroupChat(group, current => {
+    current.driveContexts = { ...durableGroupDriveContexts(current), [drive.key]: {
+      version: 1, roomId: drive.roomId, roomToken: drive.roomToken, epoch: drive.epoch,
+      thread: drive.thread, userEntryId: drive.userEntryId, userIds: drive.userIds,
+      inputIds: drive.inputIds, inputVersion: drive.inputVersion, members: drive.members, budget: drive.budget
+    } }
+    return current
+  }, { sync: false })
+}
+
+function restoreGroupDrive(group, marker) {
+  const room = $groupChats.get()[group], saved = room?.driveContexts?.[marker.drive_key]
+  if (!saved || saved.version !== 1 || groupDriveKey(saved) !== marker.drive_key ||
+      saved.roomId !== (room.roomId || null) || saved.roomToken !== (room.coordinationId || null) ||
+      saved.thread !== marker.thread || saved.epoch !== marker.epoch ||
+      !Array.isArray(saved.members) || !saved.members.length || saved.members.length > GROUP_CHAT_MAX_MEMBERS ||
+      !saved.members.every(c => typeof c?.member?.name === 'string' && c.member.name &&
+        typeof groupMemberKey(c.member) === 'string' && groupTurnOwnerKey(c.owner) &&
+        c.requestMember?.name === c.member.name &&
+        groupTurnOwnerKey(groupSessionOwner(c.requestMember)) === groupTurnOwnerKey(c.owner)) ||
+      new Set(saved.members.map(c => groupMemberKey(c.member))).size !== saved.members.length ||
+      !['inputIds', 'userIds'].every(key => Array.isArray(saved[key]) && saved[key].length <= GROUP_CHAT_HISTORY_LIMIT * 16 &&
+        saved[key].every(id => typeof id === 'string' && id)) ||
+      typeof saved.thread !== 'string' || !saved.thread || !Number.isSafeInteger(saved.epoch) || saved.epoch < 0 ||
+      !Number.isSafeInteger(saved.inputVersion) || saved.inputVersion < 0 ||
+      !(saved.userEntryId === null || typeof saved.userEntryId === 'string') || !saved.budget ||
+      !['posted', 'reserved', 'rounds', 'continuations'].every(key => Number.isSafeInteger(saved.budget[key]) && saved.budget[key] >= 0) ||
+      saved.budget.posted + saved.budget.reserved > GROUP_CHAT_MAX_MESSAGES ||
+      saved.budget.rounds > GROUP_CHAT_MAX_ROUNDS || saved.budget.continuations > GROUP_CHAT_MAX_CONTINUATIONS) return null
+  const source = saved.members.find(c => groupMemberKey(c.member) === marker.delivery.member_key)
+  if (!source || groupTurnOwnerKey(source.owner) !== groupTurnOwnerKey(marker.delivery.owner)) return null
+  const coordinator = groupRoomCoordinator(group)
+  if (coordinator.capturedDrives.has(marker.drive_key)) return coordinator.capturedDrives.get(marker.drive_key)
+  // Unstarted in-memory queue jobs vanish on reload. Every producer writes its
+  // marker before session preparation; unknown markers keep their reservation.
+  const reserved = Object.values(room.stranded || {}).filter(m => m?.drive_key === marker.drive_key).length
+  if (saved.budget.posted + reserved > GROUP_CHAT_MAX_MESSAGES) return null
+  const drive = { ...saved, key: marker.drive_key, budget: { ...saved.budget, reserved }, onlyHandoffs: true }
+  coordinator.capturedDrives.set(drive.key, drive)
+  return drive
+}
+
+function groupDriveMemberIsCurrent(room, captured) {
+  const key = groupMemberKey(captured.member)
+  const current = (room.members || []).find(member => groupMemberKey(member) === key)
+  if (!current || groupTurnOwnerKey(captureGroupTurnMember(current).owner) !== groupTurnOwnerKey(captured.owner)) return false
+  const sessionOwner = room.sessionOwners?.[key]
+  return !sessionOwner || groupTurnOwnerKey(sessionOwner) === groupTurnOwnerKey(captured.owner)
+}
+
+function captureGroupDrive(group, members, thread) {
+  groupRoomCoordinator(group)
+  const room = $groupChats.get()[group] || {}
+  const user = (room.log || []).findLast(e => groupIsUserInstruction(e) && groupThreadOf(e) === thread)
+  return { roomId: room.roomId || null, roomToken: room.coordinationId || null, epoch: room.epoch || 0, thread,
+    userEntryId: user ? groupChatSyncEntryKey(user) : null,
+    inputIds: (room.log || []).map(groupChatSyncEntryKey),
+    inputVersion: room.threadInputVersions?.[thread] || 0,
+    members: members.map(member => captureGroupTurnMember(member)),
+    userIds: (room.log || []).filter(e => groupIsUserInstruction(e) && groupThreadOf(e) === thread).map(groupChatSyncEntryKey) }
+}
+
+/** A frozen round, never a raw Promise.all over roster members. The room
+ * coordinator is the sole start owner; each completion publishes immediately. */
+function runGroupChatRounds(group, members, thread, capturedDrive) {
+  if (capturedDrive) {
+    group = groupNameForLifetime({ ...capturedDrive, group })
+    if (!group) return Promise.resolve() // deletion/replacement cannot revive a captured drive
+  }
+  const drive = capturedDrive || captureGroupDrive(group, members, thread)
+  const coordinator = groupRoomCoordinator(group)
+  const key = groupDriveKey(drive)
+  drive.key = key
+  drive.group = group
+  const prior = coordinator.drives.get(key)
+  if (prior) return prior
+  // Defer the body one microtask so drive ownership exists before first await.
+  drive.budget ||= { posted: 0, reserved: 0, continuations: 0, rounds: 0 }
+  coordinator.capturedDrives.set(key, drive)
+  persistGroupDrive(group, drive)
+  drive.running = true
+  const running = Promise.resolve().then(() => driveFrozenGroupRounds(group, members, drive, coordinator))
+  coordinator.drives.set(key, running)
+  void running.finally(() => {
+    group = coordinator.group
+    if (coordinator.drives.get(key) === running) coordinator.drives.delete(key)
+    drive.running = false
+    if (!Object.values($groupChats.get()[group]?.stranded || {}).some(m => m?.drive_key === key)) {
+      coordinator.capturedDrives.delete(key)
+      const room = $groupChats.get()[group]
+      if (room && !room.tombstone && (room.roomId || null) === drive.roomId &&
+          (room.coordinationId || null) === drive.roomToken) {
+        updateGroupChat(group, current => { current.driveContexts = durableGroupDriveContexts(current); return current }, { sync: false })
+      }
+    }
+    if (drive.continuationRequested) {
+      drive.continuationRequested = false
+      scheduleGroupDriveContinuation(group, drive)
+    }
+  }).catch(() => undefined)
+  return running
+}
+
+function settleGroupPublication(job, published = false) {
+  if (!job?.reservation) return
+  job.reservation = false
+  job.drive.budget.reserved--
+  if (published) job.drive.budget.posted++
+  persistGroupDrive(job.group, job.drive)
+  job.onBudgetRelease?.()
+}
+
+function scheduleGroupDriveContinuation(group, drive) {
+  const room = $groupChats.get()[group]
+  if (!drive || !room || room.tombstone || (room.roomId || null) !== drive.roomId ||
+      (room.coordinationId || null) !== drive.roomToken ||
+      groupTurnHasNewerUser(room, drive.thread, drive.userIds, drive.userEntryId, drive.inputVersion) ||
+      drive.budget.continuations >= GROUP_CHAT_MAX_CONTINUATIONS ||
+      drive.budget.posted + drive.budget.reserved >= GROUP_CHAT_MAX_MESSAGES ||
+      !unaddressedGroupMentions(group, drive.members.map(c => c.member), drive.thread).length) return
+  if (drive.running) { drive.continuationRequested = true; return }
+  drive.onlyHandoffs = true
+  // The original captured drive owns identity, consumed inputs and all budgets.
+  void runGroupChatRounds(group, drive.members.map(c => c.member), drive.thread, drive).catch(() => undefined)
+}
+
+async function driveFrozenGroupRounds(group, members, drive, coordinator) {
+  const { thread } = drive
+  members = drive.members.map(captured => captured.member)
+  const sameRoom = () => {
+    group = coordinator.group
+    const room = $groupChats.get()[group]
+    return room && !room.tombstone && (room.roomId || null) === drive.roomId &&
+      (room.coordinationId || null) === drive.roomToken
+  }
+  const isCurrent = () => sameRoom() && (drive.onlyHandoffs
+    ? !groupTurnHasNewerUser($groupChats.get()[group], thread, drive.userIds, drive.userEntryId, drive.inputVersion)
+    : ($groupChats.get()[group].epoch || 0) === drive.epoch)
+  const budget = drive.budget
   let exitKind = 'settled'
-
-  try {
-    for (let round = 0; round < GROUP_CHAT_MAX_ROUNDS; round++) {
-      // Deliver any replies that finished after their turn timed out —
-      // every member, not just this round's responders, so long work is
-      // late, never lost.
-      for (const member of members) {
-        if (!isCurrent()) {
-          recordGroupActivity(group, { kind: 'cancelled', member: null, thread })
-          return
+  const freeze = responders => {
+    const room = $groupChats.get()[group]
+    const consumed = groupConsumedInputs(room)
+    const userIds = room.log.filter(e => groupIsUserInstruction(e) && groupThreadOf(e) === thread).map(groupChatSyncEntryKey)
+    const inputEndId = room.log.length ? groupChatSyncEntryKey(room.log.at(-1)) : null
+    const jobs = []
+    for (const member of responders) {
+      const memberKey = groupMemberKey(member)
+      if (drive.onlyHandoffs && !groupDriveMemberIsCurrent(room, drive.members.find(c => groupMemberKey(c.member) === memberKey))) continue
+      const markKey = `${thread}::${memberKey}`
+      const seen = new Set(consumed[markKey] || [])
+      const delta = room.log.filter(e => groupThreadOf(e) === thread && !seen.has(groupChatSyncEntryKey(e)) &&
+        // A member's own final is never fresh peer input; its siblings' are.
+        !(e.delivery?.member_key === memberKey) &&
+        !(drive.onlyHandoffs && drive.inputIds?.includes(groupChatSyncEntryKey(e))))
+      if (!delta.length || groupTurnMarkerBlocksDispatch(room, memberKey, coordinator) ||
+          [...coordinator.occurrences].some(o => o.memberKey === memberKey && o.phase === 'waiting' && !o.cancelled)) continue
+      if (room.holds?.[memberKey]) {
+        consumeGroupInputs(group, markKey, delta.map(groupChatSyncEntryKey), inputEndId, drive.roomId)
+        if (!room.holds[memberKey].noted) {
+          recordGroupActivity(group, { kind: 'held', member: member.name, thread })
+          updateGroupChat(group, r => { r.holds = { ...r.holds, [memberKey]: { ...r.holds[memberKey], noted: true } }; return r })
         }
-
-        await harvestStrandedGroupReply(group, member)
+        continue
       }
-
-      const roomLog = (($groupChats.get()[group] || {}).log || []).filter(e => groupThreadOf(e) === thread)
-      // Exclude members the harvest pass just above confirmed are STILL
-      // running (their stranded marker survived harvest because
-      // state.inflight/running was true). Re-selecting one here would
-      // prompt.submit into their live session — the gateway's default busy
-      // policy redirects or hard-interrupts that turn (tui_gateway's
-      // _handle_busy_submit), killing exactly the long-running work this
-      // stranded/harvest mechanism exists to protect. Skip them; the next
-      // harvest pass picks the reply up once it actually lands. A marker's
-      // mere presence means "still stranded" (harvestStrandedGroupReply
-      // deletes it once the member is confirmed done/dead) — presence, not
-      // value shape, since markers are a bare number pre-thread or
-      // {before, thread} post-thread.
-      const strandedNow = ($groupChats.get()[group] || {}).stranded || {}
-      const responders = rotateGroupSpeakers(resolveGroupResponders(roomLog, members), round)
-        .filter(member => !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member)))
-      let spokeThisRound = 0
-
-      for (const member of responders) {
-        if (!isCurrent() || posted >= GROUP_CHAT_MAX_MESSAGES) {
-          if (!isCurrent()) {
-            recordGroupActivity(group, { kind: 'cancelled', member: null, thread })
-          } else {
-            exitKind = 'capped' // message cap, not consensus (#94478)
-          }
-          return
-        }
-
-        const room = $groupChats.get()[group] || { log: [], watermarks: {} }
-        const memberKey = groupMemberKey(member)
-        const markKey = `${thread}::${memberKey}`
-        const seen = room.watermarks[markKey] || 0
-        // Delta: NEW room entries, narrowed to this thread — the member's
-        // turn sees only the conversation it's part of.
-        const delta = room.log.slice(seen).filter(e => groupThreadOf(e) === thread)
-
-        if (!delta.length) {
+      const deliveryResult = {}
+      const occurrence = registerGroupOccurrence(group, member, thread, deliveryResult,
+        drive.members.find(captured => groupMemberKey(captured.member) === memberKey))
+      occurrence.epoch = drive.epoch
+      occurrence.inputEndId = inputEndId
+      occurrence.consumedIds = delta.map(groupChatSyncEntryKey)
+      occurrence.inputVersion = room.threadInputVersions?.[thread] || 0
+      occurrence.userIds = userIds
+      occurrence.markKey = markKey
+      occurrence.drive = drive
+      occurrence.phase = 'budget-queued'
+      occurrence.prompt = buildGroupChatTurnPrompt({ groupName: group, members, viewer: member,
+        deltaLines: delta.slice(-GROUP_CHAT_HISTORY_LIMIT).map(e => formatGroupChatLine(e, member.name)) })
+      occurrence.images = delta.flatMap(e => Array.isArray(e.images) ? e.images : []).map(image => Object.freeze({ ...image }))
+      jobs.push(occurrence)
+    }
+    return jobs
+  }
+  const dispatch = async responders => {
+    const jobs = freeze(responders)
+    let spoke = 0
+    const pending = [...jobs]
+    const admitted = []
+    const pumpPublication = () => {
+      for (const job of [...pending]) {
+        if (!pending.includes(job)) continue
+        if (job.released || budget.posted >= GROUP_CHAT_MAX_MESSAGES || !groupOccurrenceCanSubmit(job) || !sameRoom() ||
+            groupTurnHasNewerUser($groupChats.get()[group], thread, drive.userIds, drive.userEntryId, drive.inputVersion)) {
+          pending.splice(pending.indexOf(job), 1)
+          finishGroupOccurrence(job)
           continue
         }
-
-        // #93129: a member the user told to stop is HELD — no turn until an
-        // explicit release (resume / @all resume / a direct non-stop
-        // mention). Consume the delta exactly once (watermark past the
-        // current log) so the same entries never re-trigger this skip, and
-        // surface WHY the bot is silent in the activity feed the first time.
-        const heldEntry = (room.holds || {})[memberKey]
-
-        if (heldEntry) {
-          const advance = heldMemberWatermarkAdvance(seen, room.log.length)
-
-          updateGroupChat(group, r => {
-            if (advance !== null) {
-              r.watermarks[markKey] = advance
-            }
-
-            if (r.holds?.[memberKey] && !r.holds[memberKey].noted) {
-              r.holds = { ...r.holds, [memberKey]: { ...r.holds[memberKey], noted: true } }
-            }
-
-            return r
-          })
-
-          if (!heldEntry.noted) {
-            recordGroupActivity(group, { kind: 'held', member: member.name, thread })
-          }
-
-          continue
-        }
-
-        const prompt = buildGroupChatTurnPrompt({
-          groupName: group,
-          members,
-          viewer: member,
-          deltaLines: delta.slice(-GROUP_CHAT_HISTORY_LIMIT).map(e => formatGroupChatLine(e, member.name))
-        })
-
-        // Images riding this delta (user attachments — member entries don't
-        // carry images today, but flatMap keeps this future-proof) get staged
-        // into the member's session so the model sees the pixels, not just
-        // the transcript's [attached image: …] marker.
-        const deltaImages = delta.flatMap(e => (Array.isArray(e.images) ? e.images : []))
-
-        // Surface WHO is on turn (runtime-only, like running/epoch) so the
-        // room shows "Radar is thinking…" instead of a generic working line —
-        // long model turns otherwise read as the room being stuck.
-        updateGroupChat(group, r => {
-          r.turn = member.name
-          return r
-        })
-
-        let reply = null
-
-        try {
-          reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages)
-
-          // Needs-attention hook (#93091 item 3): a turn that produced a real
-          // reply (or an explicit pass) is a good turn — clear the badge.
-          // A timed-out turn also returns null but never threw; leaving any
-          // prior badge in place there is the conservative choice.
-          if (reply !== null) {
-            clearBotAttention(groupMemberKey(member))
-          }
-        } catch (error) {
-          const reason = String(error?.data?.reason || '').trim()
-          recordGroupActivity(group, {
-            kind: 'failed',
-            member: member.name,
-            thread,
-            ...(reason ? { reason } : {})
-          })
-          noteBotAttention(groupMemberKey(member), reason || error?.message || error)
-          reply = null // a failed turn is a pass, never a room error
-        }
-
-        // #93127: the turn may have finished AFTER a newer user send bumped
-        // the room epoch. That newer send's loop re-drives this member with
-        // the full delta, so committing this stale result (watermark advance
-        // + append) would double-deliver the same reply. Drop it here —
-        // BEFORE the watermark advance and BEFORE the append. Only a newer
-        // USER entry in THIS thread makes the re-drive premise true: a
-        // cross-thread send bumps the epoch too, but its loop filters this
-        // thread out and would never regenerate the finished reply. The
-        // during-turn tail is anchored by entry id, not index — the history
-        // trim drops entries from the FRONT, so an index slice could
-        // overshoot after a mid-turn trim and silently commit a stale turn.
-        const roomNow = $groupChats.get()[group] || { log: [] }
-        const epochNow = roomNow.epoch || 0
-        const anchorId = room.log.length ? room.log[room.log.length - 1].id : null
-        const anchorIdx = anchorId === null ? -1 : roomNow.log.findIndex(e => e.id === anchorId)
-        // Anchor trimmed away ⇒ every pre-turn entry was dropped, so every
-        // surviving entry is newer — scanning the whole log stays exact.
-        const turnTail = anchorIdx >= 0 ? roomNow.log.slice(anchorIdx + 1) : roomNow.log
-        const newerUserEntryInThread = turnTail.some(
-          e => e.from?.kind === 'user' && groupThreadOf(e) === thread
-        )
-
-        if (!shouldCommitMemberTurn(startEpoch, epochNow, newerUserEntryInThread)) {
-          recordGroupActivity(group, { kind: 'cancelled', member: member.name, thread })
+        if (budget.posted + budget.reserved >= GROUP_CHAT_MAX_MESSAGES) break
+        pending.splice(pending.indexOf(job), 1)
+        admitted.push(job)
+        start(job)
+      }
+      if (!pending.length) coordinator.budgetPumps.delete(pumpPublication)
+    }
+    const start = job => {
+      budget.reserved++ // reserve potential publication BEFORE async admission
+      job.reservation = true
+      persistGroupDrive(group, drive)
+      job.onBudgetRelease = pumpPublication
+      job.phase = 'queued'
+      const complete = runGroupChatMemberTurn(group, job.captured.member, job.prompt, thread,
+        job.images, job.deliveryResult, job).then(reply => {
+        if (!sameRoom()) return
+        const room = $groupChats.get()[group]
+        if (job.cancelled) return // Stop owns the confirmation/unconfirmed activity.
+        if (!sameRoom() || job.deliveryResult.discarded ||
+            !shouldCommitMemberTurn(job.epoch, room.epoch || 0,
+              groupTurnHasNewerUser(room, thread, job.userIds, job.inputEndId, job.inputVersion), true)) {
+          recordGroupActivity(group, { kind: 'cancelled', member: job.captured.member.name, thread })
           return
         }
-
-        // The member has now seen everything up to the pre-reply log length.
-        updateGroupChat(group, r => {
-          r.watermarks[markKey] = r.log.length
-          return r
-        })
-
+        if (!Object.prototype.hasOwnProperty.call(room.stranded || {}, job.memberKey)) {
+          consumeGroupInputs(group, job.markKey, job.consumedIds, job.inputEndId, drive.roomId)
+        }
+        if (reply !== null) clearBotAttention(job.memberKey)
         if (reply !== null && !isGroupPassText(reply)) {
-          appendGroupChatEntry(
-            group,
-            { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
-            reply,
-            thread
-          )
-          // Its own message counts as seen too.
-          updateGroupChat(group, r => {
-            r.watermarks[markKey] = r.log.length
-            return r
-          })
-          posted += 1
-          spokeThisRound += 1
+          appendGroupChatEntry(group, { kind: 'member', name: job.captured.member.name,
+            ...(job.captured.member.remoteSource ? { source: job.captured.member.connectionLabel || job.captured.member.connectionId } : {}) },
+            reply, thread, undefined, job.deliveryResult.value)
+          settleGroupPublication(job, true); spoke++
+          if (job.wasWaiting) scheduleGroupDriveContinuation(group, drive)
         }
-      }
-
-      if (spokeThisRound === 0) {
-        // #94478: "everyone passed" is NOT the only way a round can go quiet —
-        // responders can be narrowed to members with no new delta while the
-        // thread's tail carries an @mention handoff that was never answered.
-        // Before settling, check for cited members still owed a turn and run
-        // one bounded continuation round for exactly those members. If none
-        // exist (or the continuation also goes quiet), the room genuinely
-        // settled.
+      }, error => {
+        if (!sameRoom()) return
+        const room = $groupChats.get()[group]
+        if (!sameRoom() || job.cancelled || !shouldCommitMemberTurn(job.epoch, room.epoch || 0,
+          groupTurnHasNewerUser(room, thread, job.userIds, job.inputEndId, job.inputVersion), true)) return
+        const unresolved = error?.data?.outcomeState === 'unavailable' ||
+          Object.prototype.hasOwnProperty.call(room.stranded || {}, job.memberKey)
+        if (!unresolved) consumeGroupInputs(group, job.markKey, job.consumedIds, job.inputEndId, drive.roomId)
+        const kind = ['interrupted', 'unavailable'].includes(error?.data?.outcomeState) ? error.data.outcomeState : 'failed'
+        const reason = String(error?.data?.reason || '').trim()
+        recordGroupActivity(group, { kind, member: job.captured.member.name, thread, ...(reason ? { reason } : {}) })
+        noteBotAttention(job.memberKey, reason || error?.message || error)
+      }).finally(() => {
+        if (job.reservation && !Object.prototype.hasOwnProperty.call($groupChats.get()[group]?.stranded || {}, job.memberKey)) {
+          settleGroupPublication(job)
+        }
+        job.markReady()
+      })
+      // Prevent parked collector failures from becoming unhandled rejections.
+      void complete.catch(() => undefined)
+    }
+    coordinator.budgetPumps.add(pumpPublication)
+    pumpPublication()
+    // Admit frozen excess jobs whenever terminal non-publications release budget.
+    // Waiting/unknown keeps its reservation; the round may quiesce with excess queued.
+    let observed = 0
+    while (observed < admitted.length) {
+      const batch = admitted.slice(observed); observed = admitted.length
+      for (const job of batch) await job.ready
+      pumpPublication()
+    }
+    if (pending.length) exitKind = 'capped'
+    return spoke
+  }
+  try {
+    while (drive.onlyHandoffs ? budget.continuations < GROUP_CHAT_MAX_CONTINUATIONS : budget.rounds < GROUP_CHAT_MAX_ROUNDS) {
+      const round = budget.rounds
+      if (!drive.onlyHandoffs) budget.rounds++
+      persistGroupDrive(group, drive)
+      if (!sameRoom()) return
+      const room = $groupChats.get()[group]
+      // A callback captured for an older thread may still run its FIRST round.
+      // Same-thread newer input discards it before any admission.
+      if (round === 0 && groupTurnHasNewerUser(room, thread, drive.userIds, drive.userEntryId, drive.inputVersion)) return
+      if (round > 0 && !isCurrent()) return
+      for (const member of members) await harvestStrandedGroupReply(group, member)
+      if (!sameRoom() || groupTurnHasNewerUser($groupChats.get()[group], thread, drive.userIds, drive.userEntryId, drive.inputVersion)) return
+      const log = $groupChats.get()[group].log.filter(e => groupThreadOf(e) === thread)
+      let spoke
+      if (drive.onlyHandoffs) {
         const pendingKeys = unaddressedGroupMentions(group, members, thread)
-
-        // #94478 review: bound continuation rounds independently of the
-        // message cap so a pathological mention chain can't consume the
-        // room's entire budget on back-and-forth handoffs.
-        continuations += 1
-
-        if (pendingKeys.length && continuations <= GROUP_CHAT_MAX_CONTINUATIONS) {
-          const citedMembers = members.filter(member => pendingKeys.includes(groupMemberKey(member)))
-
-          if (citedMembers.length && posted < GROUP_CHAT_MAX_MESSAGES) {
-            const strandedNow = ($groupChats.get()[group] || {}).stranded || {}
-            const continuationResponders = citedMembers.filter(
-              member => !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member))
-            )
-
-            for (const member of continuationResponders) {
-              if (!isCurrent() || posted >= GROUP_CHAT_MAX_MESSAGES || continuations > GROUP_CHAT_MAX_CONTINUATIONS) {
-                break
-              }
-
-              const room = $groupChats.get()[group] || { log: [], watermarks: {} }
-              const memberKey = groupMemberKey(member)
-              const markKey = `${thread}::${memberKey}`
-              const seen = room.watermarks[markKey] || 0
-              const delta = room.log.slice(seen).filter(e => groupThreadOf(e) === thread)
-
-              // A cited member always has delta here (the citing reply IS in
-              // its tail); skip defensively anyway so an empty prompt never
-              // fires.
-              if (!delta.length) {
-                continue
-              }
-
-              const heldEntry = (room.holds || {})[memberKey]
-
-              if (heldEntry) {
-                continue // holds still apply to continuation turns (#93129)
-              }
-
-              const prompt = buildGroupChatTurnPrompt({
-                groupName: group,
-                members,
-                viewer: member,
-                // The continuation prompt centers on what the member missed:
-                // everything since its watermark, which includes the reply
-                // that cites it.
-                deltaLines: delta.slice(-GROUP_CHAT_HISTORY_LIMIT).map(e => formatGroupChatLine(e, member.name))
-              })
-
-              updateGroupChat(group, r => {
-                r.turn = member.name
-                return r
-              })
-
-              let continuationReply = null
-
-              try {
-                continuationReply = await runGroupChatMemberTurn(group, member, prompt, thread)
-
-                if (continuationReply !== null) {
-                  clearBotAttention(memberKey)
-                }
-              } catch (error) {
-                recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
-                noteBotAttention(memberKey, error?.message || error)
-                continuationReply = null
-              }
-
-              if (!isCurrent()) {
-                return
-              }
-
-              updateGroupChat(group, r => {
-                r.watermarks[markKey] = r.log.length
-                return r
-              })
-
-              if (continuationReply !== null && !isGroupPassText(continuationReply)) {
-                appendGroupChatEntry(
-                  group,
-                  { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
-                  continuationReply,
-                  thread
-                )
-                updateGroupChat(group, r => {
-                  r.watermarks[markKey] = r.log.length
-                  return r
-                })
-                posted += 1
-
-                // The continuation's own reply may cite someone else — fall
-                // through to the normal loop so the next round handles it via
-                // the same responder machinery. Reaching here means the loop
-                // continues rather than settling; the outer for-loop's next
-                // iteration re-evaluates everything.
-                spokeThisRound += 1
-              }
-            }
-          }
+        if (!pendingKeys.length || budget.continuations >= GROUP_CHAT_MAX_CONTINUATIONS) return
+        budget.continuations++
+        persistGroupDrive(group, drive)
+        spoke = await dispatch(members.filter(m => pendingKeys.includes(groupMemberKey(m))))
+      } else spoke = await dispatch(rotateGroupSpeakers(resolveGroupResponders(log, members), round))
+      if (!isCurrent()) return
+      if (budget.posted + budget.reserved >= GROUP_CHAT_MAX_MESSAGES) { exitKind = 'capped'; return }
+      if (!spoke) {
+        if (drive.onlyHandoffs) return
+        const pendingKeys = unaddressedGroupMentions(group, members, thread)
+        if (pendingKeys.length && budget.continuations >= GROUP_CHAT_MAX_CONTINUATIONS) { exitKind = 'capped'; return }
+        if (pendingKeys.length) { budget.continuations++; persistGroupDrive(group, drive) }
+        if (pendingKeys.length) {
+          spoke = await dispatch(members.filter(m => pendingKeys.includes(groupMemberKey(m))))
         }
-
-        if (spokeThisRound === 0) {
-          // Genuinely nothing left to say — including after the continuation
-          // attempt above produced no spoken turns. Settle honestly, but if
-          // cited members are STILL owed a turn and only the continuation /
-          // message caps stopped us from driving them, this is a capped
-          // exit, not consensus. (#94478)
-          if (pendingKeys.length && (continuations > GROUP_CHAT_MAX_CONTINUATIONS || posted >= GROUP_CHAT_MAX_MESSAGES)) {
-            exitKind = 'capped'
-          }
+        if (!spoke) {
           return
         }
       }
     }
-
-    // All GROUP_CHAT_MAX_ROUNDS rounds ran with someone still speaking —
-    // the round cap ended the drive, not consensus. (#94478)
     exitKind = 'capped'
   } finally {
     if (isCurrent()) {
-      recordGroupActivity(group, { kind: exitKind, member: null, thread })
-      updateGroupChat(group, r => {
-        r.running = false
-        r.turn = null
-        return r
-      })
-
-      // #89545: the loop's harvest pass only ran at the top of each round of
-      // an ACTIVE loop — a member whose turn timed out after the final round
-      // stayed stranded until the user's NEXT send. Poll for the late reply
-      // in the background (bounded) so long work is late, never lost.
-      // (window feature-detect: the engine also runs under node in tests.)
-      const strandedLeft = Object.keys(($groupChats.get()[group] || {}).stranded || {})
-
-      if (strandedLeft.length && typeof window !== 'undefined') {
+      const current = $groupChats.get()[group]
+      const entry = current?.log.findLast(item => item.from?.kind === 'user' && groupThreadOf(item) === thread)
+      const blocked = groupBlockedMembers(current, members)
+      if (blocked.length && entry) {
+        for (const member of blocked) recordGroupActivity(group, { kind: 'blocked', member: member.name,
+          memberKey: groupMemberKey(member), userEntryId: entry.id, thread, reason: 'previous-outcome-unknown' })
+      } else {
+        recordGroupActivity(group, { kind: exitKind, member: null, thread })
+      }
+      if ((current.epoch || 0) === drive.epoch) {
+        updateGroupChat(group, r => { r.running = false; r.turn = null; return r })
+      }
+      if (Object.keys($groupChats.get()[group].stranded || {}).length && typeof window !== 'undefined') {
         void harvestStrandedUntilSettled(group, members, thread)
       }
     }
@@ -8604,10 +9806,15 @@ async function runGroupChatRounds(group, members, thread) {
 async function harvestStrandedUntilSettled(group, members, thread) {
   const HARVEST_INTERVAL_MS = 5000
   const HARVEST_MAX_TRIES = 60
+  const initial = $groupChats.get()[group]
+  if (!initial) return
+  const lifetime = { group, roomId: initial.roomId || null, roomToken: initial.coordinationId || null }
 
   for (let attempt = 0; attempt < HARVEST_MAX_TRIES; attempt++) {
     await new Promise(resolve => window.setTimeout(resolve, HARVEST_INTERVAL_MS))
 
+    group = groupNameForLifetime(lifetime)
+    if (!group) return
     const room = $groupChats.get()[group]
 
     if (!room || room.running) {
@@ -8673,30 +9880,38 @@ function sendToGroupChat(group, members, text, thread, images) {
       parseGroupChatMentions(trimmed, members),
       trimmed,
       { at: sent?.at, byMessageId: sent?.id, thread: target },
-      members.map(member => groupMemberKey(member))
+      members.map(member => groupMemberKey(member)),
+      targetText => parseGroupChatMentions(targetText, members)
     )
+    for (const [memberKey, marker] of Object.entries(room.stranded || {})) {
+      if (room.holds?.[memberKey] && marker && typeof marker === 'object') {
+        // A future-turn hold suppresses this result; it is not death evidence.
+        // Keep the live collector/CAS identity and persist reconciliation intent.
+        marker.hold_requested = true
+        room.stranded = { ...room.stranded }
+      }
+    }
     return room
   })
 
   recordGroupActivity(group, { kind: 'queued', member: 'You', thread: target })
+  const capturedDrive = captureGroupDrive(group, members, target)
+  const clearFailedDrive = () => {
+    const currentGroup = groupNameForLifetime({ ...capturedDrive, group })
+    if (!currentGroup) return
+    updateGroupChat(currentGroup, room => {
+      if ((room.epoch || 0) === capturedDrive.epoch) room.running = false
+      return room
+    })
+  }
 
   if (!wasRunning) {
-    void runGroupChatRounds(group, members, target).catch(() => {
-      updateGroupChat(group, r => {
-        r.running = false
-        return r
-      })
-    })
+    void runGroupChatRounds(group, members, target, capturedDrive).catch(clearFailedDrive)
   } else {
     // A loop is live; it bails at its next boundary. Chain the fresh loop
     // after a short settle so exactly one drive owns the room.
     setTimeout(() => {
-      void runGroupChatRounds(group, members, target).catch(() => {
-        updateGroupChat(group, r => {
-          r.running = false
-          return r
-        })
-      })
+      void runGroupChatRounds(group, members, target, capturedDrive).catch(clearFailedDrive)
     }, 250)
   }
 
@@ -9353,9 +10568,11 @@ function useModelOptions(bot = null) {
   const resolved = bot ? resolveBotConnectionRoute(bot) : null
   const route = resolved?.status === 'resolved' ? resolved.route : null
   const orphaned = resolved?.status === 'owner_removed'
+  const catalogProfile = bot ? botBackendProfileScope(route, bot.name) : (host.state.profile?.get?.() || 'default')
+  const catalogSource = route ? botRouteKey(route) : (host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
 
   return useQuery({
-    queryKey: [ID, 'model-options', route ? botRouteKey(route) : 'active'],
+    queryKey: [ID, 'model-options', catalogSource, catalogProfile],
     // No forced `refresh`: forcing a network read on EVERY mount bypassed the
     // staleTime cache, so each Bots view remount (tab re-front, dialog reopen,
     // pane visibility flip) knocked the picker back into its loading state and
@@ -9364,6 +10581,7 @@ function useModelOptions(bot = null) {
     queryFn: () =>
       boundedModelOptionsFetch(
         requestForBot(bot, 'model.options', {
+          profile: catalogProfile,
           include_unconfigured: true,
           explicit_only: false
         })
@@ -9387,8 +10605,18 @@ function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway 
   const NONE = '__default__'
   const CUSTOM = '__custom__'
   const providers = (data?.providers || []).filter(p => p && p.slug)
+  const activeProvider = providers.find(p =>
+    [p.slug, p.name, ...(p.aliases || [])].some(alias => String(alias || '').toLowerCase() === value.provider.toLowerCase())
+  ) || null
   const isKnown =
-    !value.provider || value.provider === NONE || providers.some(p => p.slug === value.provider)
+    !value.provider || value.provider === NONE || Boolean(activeProvider)
+  const selectionNotice = data && !isKnown && !error
+    ? jsx('p', {
+        className: 'col-span-2 text-xs text-(--ui-text-secondary)',
+        role: 'status',
+        children: "The selected provider is absent from this profile's catalog. Configure it here or choose another provider. Your selection is preserved."
+      })
+    : null
   const [useFreeText, setUseFreeText] = useState(!isKnown)
 
   if (isLoading) {
@@ -9403,6 +10631,7 @@ function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway 
     return jsxs('div', {
       style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' },
       children: [
+        selectionNotice,
         labeled(
           'Provider',
           jsx(Input, {
@@ -9427,6 +10656,7 @@ function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway 
     return jsxs('div', {
       style: { display: 'flex', flexDirection: 'column', gap: '8px' },
       children: [
+        selectionNotice,
         jsxs('div', {
           style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' },
           children: [
@@ -9459,7 +10689,6 @@ function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway 
     })
   }
 
-  const activeProvider = providers.find(p => p.slug === value.provider) || null
   const models = activeProvider
     ? (activeProvider.models || []).map(m => (typeof m === 'string' ? m : m.id || m.name || ''))
     : []
@@ -9467,10 +10696,11 @@ function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway 
   return jsxs('div', {
     style: { display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: '10px' },
     children: [
+      selectionNotice,
       labeled(
         'Provider',
         jsxs(Select, {
-          value: value.provider || NONE,
+          value: activeProvider?.slug || value.provider || NONE,
           onValueChange: v => {
             if (v === NONE) {
               onChange({ provider: '', model: '' })
@@ -10246,6 +11476,18 @@ async function applyAdvancedConfig(bot, state) {
   return { ...result, ok: Object.values(merged).every(Boolean), applied: merged }
 }
 
+function advancedFailureMessage(result) {
+  const failed = Object.entries(result?.applied || {}).filter(([, ok]) => !ok).map(([section]) => section)
+  // Older gateways may omit the code. Render only bounded messages we own;
+  // never display arbitrary exception text from model_error.message.
+  const modelMessage = result?.model_error?.code === 'provider_configuration_unavailable'
+    ? 'The selected provider is missing, disabled, or incomplete in this profile. Configure it here or choose another provider. Your previous model is preserved.'
+    : result?.model_error?.code === 'model_save_failed'
+      ? 'The model could not be saved. Your previous model is preserved.'
+      : ''
+  return `Some sections failed: ${failed.join(', ')}${failed.includes('model') && modelMessage ? `. ${modelMessage}` : ''}`
+}
+
 // ── edit profile dialog ──────────────────────────────────────────────────────
 
 function labeled(label, control) {
@@ -10341,7 +11583,7 @@ function EditProfileDialog({ bot, open, onClose }) {
 
         if (failed.length) {
           advancedFailed = true
-          host.notify({ kind: 'error', message: `Some sections failed: ${failed.map(([k]) => k).join(', ')}` })
+          host.notify({ kind: 'error', message: advancedFailureMessage(res) })
         }
       } catch (err) {
         advancedFailed = true
@@ -12535,7 +13777,11 @@ function GroupImageControls({ image, onImage, seedName, seedMembers }) {
  *  the room record. Both apply on Save so a cancelled dialog changes nothing. */
 function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }) {
   const rooms = useValue($groupChats)
-  const current = (rooms[group] || {}).image || null
+  const displayedRoom = rooms[group]
+  const displayedLifetime = { group, roomId: displayedRoom?.roomId || null,
+    roomToken: displayedRoom?.coordinationId || null }
+  const metadataOnlyGroup = !displayedRoom && knownGroups($botMeta.get()).includes(group)
+  const current = (displayedRoom || {}).image || null
   const [name, setName] = useState(group)
   const [image, setImage] = useState(current)
 
@@ -12548,11 +13794,31 @@ function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }) {
   }, [open, group])
 
   const save = async () => {
-    const finalName = await renameGroupChat(group, name, members)
-
-    if (finalName === null) {
-      return // collision — dialog stays open for a different name
+    let savingGroup = group
+    if (displayedRoom) {
+      savingGroup = groupNameForLifetime(displayedLifetime)
+      // A button rendered for a deleted/replaced room cannot adopt today's
+      // same-name record. Unidentified legacy rooms require the same object
+      // until their existing canonical lifetime token is minted below.
+      if (!savingGroup || (!displayedLifetime.roomId && !displayedLifetime.roomToken &&
+          $groupChats.get()[group] !== displayedRoom)) return
+    } else if (!metadataOnlyGroup || $groupChats.get()[group] || !knownGroups($botMeta.get()).includes(group)) {
+      return
     }
+    const original = $groupChats.get()[savingGroup]
+    if (original?.tombstone) return
+    const savingRoom = original?.roomId || original?.coordinationId ? original : updateGroupChat(savingGroup, room => {
+      room.coordinationId = groupChatEntryId()
+      return room
+    }, { sync: false })
+    const lifetime = { group: savingGroup, roomId: savingRoom.roomId || null, roomToken: savingRoom.coordinationId || null }
+    const renamed = await renameGroupChat(savingGroup, name, members)
+
+    if (renamed === null) {
+      return // collision or removed lifetime — the dialog cannot update another room
+    }
+    const finalName = groupNameForLifetime(lifetime)
+    if (finalName === null) return
 
     if (image !== current) {
       setGroupChatImage(finalName, image)
@@ -12617,7 +13883,7 @@ function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }) {
  *  search), name the group, create. Assignment appends to each local bot's
  *  group membership list, so the room appears in the roster and syncs
  *  cross-machine via ui_meta without replacing its other groups. */
-function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
+function CreateGroupChatDialog({ open, roster, onClose, onCreated, recoverySource = null }) {
   const allMeta = useValue($botMeta)
   const [query, setQuery] = useState('')
   const [checked, setChecked] = useState({})
@@ -12628,8 +13894,8 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
   useEffect(() => {
     if (open) {
       setQuery('')
-      setChecked({})
-      setName('')
+      setChecked(recoverySource ? Object.fromEntries(recoverySource.members.map(member => [botRosterKey(member), true])) : {})
+      setName(recoverySource ? `${recoverySource.group} (new)` : '')
       setImage(null)
     }
   }, [open])
@@ -12652,44 +13918,13 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
       return
     }
 
-    // Creating a group is always a FRESH room. Without this, re-creating a
-    // group under an existing name (easy — the default name is just the
-    // member names) silently reopens the old room with its full log, which
-    // reads as "not a fresh group" (db's Aug 2026 report). Uniquify against
-    // both live rooms and any bot's current grouping, then mint a fresh
-    // roomId: member sessions are titled by that roomId, so a
-    // disbanded-and-recreated group with the SAME display name still gets
-    // new sessions instead of resuming the old room's by title.
-    const taken = new Set(liveGroupChatNames())
-
-    for (const meta of Object.values($botMeta.get() || {})) {
-      for (const existing of botGroups(meta)) {
-        taken.add(existing)
-      }
+    let groupName
+    try {
+      groupName = createFreshGroupChat(base, selected, { image, recoverySource })
+    } catch (error) {
+      host.notifyError(error, 'Could not create the new group')
+      return
     }
-
-    const groupName = uniqueGroupChatName(base, taken)
-    const roomId = mintGroupRoomId()
-
-    for (const bot of selected) {
-      void saveBotMeta(bot, groupMembershipPatch(botRosterMeta(bot, allMeta), groupName, true))
-    }
-
-    // Persist every machine identity, including today's active source. That
-    // member becomes remote after a source switch and cannot rely on the new
-    // gateway's name-keyed bot metadata to remain seated in this room.
-    const roomMembers = durableGroupChatMembers(selected)
-
-    updateGroupChat(groupName, room => {
-      room.members = roomMembers
-      room.roomId = roomId
-
-      if (image) {
-        room.image = image
-      }
-
-      return room
-    })
 
     host.notify({ kind: 'info', message: `“${groupName}” created with ${selected.length} bots` })
     onClose()
@@ -12710,7 +13945,9 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
           children: [
             jsx(DialogTitle, { children: 'New Group Chat' }),
             jsx(DialogDescription, {
-              children: `Pick 2–${GROUP_CHAT_MAX_MEMBERS} bots. Local memberships sync through each Bot profile; cross-machine members stay scoped to this room.`
+              children: recoverySource
+                ? 'Create a separate group with new sessions and its own stop controls. The original group, stop holds and unknown outcomes stay intact. Selected text is an unsent draft: review it before Send. Attachments are omitted; reattach any files you want to send.'
+                : `Pick 2–${GROUP_CHAT_MAX_MEMBERS} bots. Local memberships sync through each Bot profile; cross-machine members stay scoped to this room.`
             })
           ]
         }),
@@ -13075,7 +14312,6 @@ function GroupMentionInput({ members, onChange, onSubmitDraft, value, ...inputPr
  *    (once/session/always/deny) as buttons — no free text; approvals are a
  *    closed choice. Answer sends via the member's own source. */
 function GroupClarifyCard({ entry, members }) {
-  const { group } = entry
   const isApproval = entry.kind === 'approval'
   const member = members.find(m => groupMemberKey(m) === entry.memberKey) || members.find(m => m.name === entry.member)
   const [drafts, setDrafts] = useState({})
@@ -13128,7 +14364,11 @@ function GroupClarifyCard({ entry, members }) {
         : questions
             .map(q => (questions.length > 1 ? `${q.question}: ${answerFor(q)}` : answerFor(q)))
             .join('\n')
-      appendGroupChatEntry(group, { kind: 'user', name: 'You' }, summary, entry.thread || 'legacy')
+      const currentRoom = $groupChats.get()[entry.group]
+      if (!currentRoom || currentRoom.tombstone || (currentRoom.roomId || null) !== entry.roomId ||
+          (currentRoom.coordinationId || null) !== entry.roomToken) return
+      appendGroupChatEntry(entry.group, { kind: 'user', name: 'You' }, summary, entry.thread || 'legacy',
+        undefined, undefined, entry.receipt?.delivery)
     } catch (err) {
       host.notify({ kind: 'error', message: `Could not send the answer to @${botHandle(entry.member, member)}: ${err?.message || err}` })
     } finally {
@@ -13318,6 +14558,111 @@ function migrateGroupComposerDraft(oldKey, newKey) {
   groupComposerDrafts.delete(oldKey)
 }
 
+/** This is presentation of retained custody, not evidence that old work ended.
+ * Derive it from durable receipts so reported:true and a cold activity feed
+ * cannot hide the reason a new message has not been admitted. */
+function groupBlockedMembers(room, members) {
+  return members.filter(member => {
+    const key = groupMemberKey(member)
+    return Object.prototype.hasOwnProperty.call(room?.stranded || {}, key) &&
+      !collectingGroupTurnMarkers.has(room.stranded[key])
+  })
+}
+
+/** Explicit exact observation: no session adoption, prompt or control replay.
+ * Concurrent clicks coalesce, but a later click starts a new bounded read. */
+function checkGroupTurnStatus(group, members) {
+  const room = $groupChats.get()[group]
+  if (!room || room.tombstone) return Promise.resolve()
+  const coordinator = groupRoomCoordinator(group)
+  coordinator.statusCheck ||= { current: null }
+  const captured = members.map(member => captureGroupTurnMember(member).member)
+  const pending = singleFlight(coordinator.statusCheck, async () => {
+    for (const member of captured) {
+      if (!groupNameForLifetime(coordinator)) return
+      await harvestStrandedGroupReply(coordinator.group, member)
+    }
+  })
+  return pending.finally(() => {
+    if (coordinator.statusCheck.current === pending) coordinator.statusCheck.current = null
+  })
+}
+
+/** Shared by ordinary New Group and the explicit blocked-room handoff. It
+ * creates UI context only. No session or turn is created until a later Send.
+ * A repeated handoff reopens its room without restaging a consumed/edited draft. */
+function createFreshGroupChat(base, selected, { image = null, recoverySource = null } = {}) {
+  if (selected.length < 2 || selected.length > GROUP_CHAT_MAX_MEMBERS) throw new Error('Select at least two bots for the new group.')
+  let source = null, entry = null, origin = null
+  if (recoverySource) {
+    source = $groupChats.get()[recoverySource.group]
+    if (!source || source.tombstone || source.roomId !== recoverySource.roomId ||
+        (!source.roomId && source !== recoverySource.room)) {
+      throw new Error('The original group changed. Open the new-group action again.')
+    }
+    if (recoverySource.entry) {
+      entry = source.log.find(item => item.id === recoverySource.entry.id && item.from?.kind === 'user')
+      if (!entry || entry.text !== recoverySource.entry.text || groupThreadOf(entry) !== recoverySource.entry.thread) {
+        throw new Error('The selected message changed. Select it again.')
+      }
+    }
+    origin = { roomId: source.roomId || null, group: recoverySource.group,
+      userEntryId: entry?.id || null, members: selected.map(groupMemberKey).sort() }
+    const prior = Object.entries($groupChats.get()).find(([, room]) => !room.tombstone &&
+      room.recoveryOrigin && JSON.stringify(room.recoveryOrigin) === JSON.stringify(origin))
+    if (prior) return prior[0]
+  }
+  const taken = new Set(liveGroupChatNames())
+  for (const meta of Object.values($botMeta.get() || {})) {
+    for (const existing of botGroups(meta)) taken.add(existing)
+  }
+  base = String(base || 'New group').trim().slice(0, 64)
+  const groupName = uniqueGroupChatName(base, taken)
+  const roomId = mintGroupRoomId()
+  const roomMembers = durableGroupChatMembers(selected)
+  updateGroupChat(groupName, room => {
+    Object.assign(room, { image: null, log: [], sessions: {}, sessionOwners: {},
+      watermarks: {}, stranded: {}, holds: {}, recoveryOrigin: origin, epoch: 0, running: false })
+    room.roomId = roomId
+    room.members = roomMembers
+    if (image) {
+      room.image = image
+    }
+    return room
+  })
+  if (entry) {
+    updateGroupComposerDraft(groupComposerDraftKey(groupName, $groupChats.get()[groupName]), draft => ({
+      ...draft, main: entry.text || '', pendingAttachments: {}, replies: {}, activeReplyThread: null
+    }))
+  }
+  for (const bot of selected) {
+    void saveBotMeta(bot, groupMembershipPatch(botRosterMeta(bot, $botMeta.get()), groupName, true))
+      .catch(error => host.notifyError(error, 'Group membership could not be synced'))
+  }
+  return groupName
+}
+
+function GroupBlockedNotice({ room, members, onCreate, onCheck }) {
+  const blocked = groupBlockedMembers(room, members)
+  if (!blocked.length) return null
+  return jsxs('div', {
+    className: 'grid gap-1 border-b border-(--ui-stroke-secondary) px-2.5 py-2 text-xs text-(--ui-text-tertiary)',
+    role: 'status',
+    children: [
+      ...blocked.map(member => {
+        const marker = room.stranded[groupMemberKey(member)]
+        const reason = marker?.reason || (!groupTurnDeliveryKey(marker?.delivery)
+          ? 'Earlier turn has no accepted identity; it cannot be replayed safely.'
+          : 'Earlier turn status has not been reconciled yet.')
+        return jsx('div', { children: `${groupSpeakerLabel(member.name)}${member.remoteSource ? ` (${member.connectionLabel || member.connectionId})` : ''}: reconciliation pending; new messages are blocked. ${reason}` }, groupMemberKey(member))
+      }),
+      onCheck ? jsx(Button, { variant: 'secondary', size: 'sm', onClick: onCheck, children: 'Check earlier turn status' }) : null,
+      jsx('span', { children: 'You can create a separate group with new sessions. This group and its earlier work remain unchanged. Nothing is sent automatically.' }),
+      jsx(Button, { variant: 'secondary', size: 'sm', onClick: () => onCreate(null), children: 'Create a new group' })
+    ]
+  })
+}
+
 function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
@@ -13366,6 +14711,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     }))
   const [confirmDisband, setConfirmDisband] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [recoverySource, setRecoverySource] = useState(null)
   // Click-to-disambiguate: which log entry is showing its speaker's full
   // @handle (the roster's name-device form when names collide across
   // connections). Naturally every speaker just shows its display name.
@@ -13555,6 +14901,9 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
       ...b,
       title: (b.remoteSource ? '' : allMeta[b.name]?.title) || b.title || ''
     }))
+  const openNewGroup = entry => setRecoverySource({ group, roomId: room.roomId, room,
+    members: memberDescriptors(),
+    entry: entry ? { id: entry.id, text: entry.text, thread: groupThreadOf(entry) } : null })
 
   // Activity disclosure: quiet, collapsed by default. The collapsed row shows
   // the latest event; expanding lists the current run's events newest-first.
@@ -13566,8 +14915,12 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   // epoch bump + holds the loop marched on to the next member. Thread scope:
   // the run being stopped is the one the latest activity belongs to.
   const stopRoomRun = async () => {
-    await stopGroupThread(group, latestActivity?.thread || null, memberDescriptors())
-    host.notify({ kind: 'success', message: `Stopped ${group} — remaining turns are held until you resume` })
+    const result = await stopGroupThread(group, latestActivity?.thread || null, memberDescriptors())
+    host.notify(result.status === 'stopped'
+      ? { kind: 'success', message: `Stopped ${group} — remaining turns are held until you resume` }
+      : result.status === 'stopping'
+        ? { kind: 'info', message: `Stopping ${group} — waiting for the remaining turns to finish.` }
+        : { kind: 'info', message: `Held ${group} — ${result.unconfirmed} interruption(s) are unconfirmed. Stop can retry.` })
   }
 
   const activityPanel = jsxs('div', {
@@ -13598,10 +14951,10 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                 : null
             ]
           }),
-          room.running
+          groupRoomCanStop(room, roomClarifies)
             ? jsx('button', {
                 type: 'button',
-                title: 'Stop this run — interrupts the member on turn and holds the rest',
+                title: 'Stop this run — interrupts all active members and holds queued turns',
                 className:
                   'inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[0.7rem] font-medium text-(--ui-accent) transition-colors hover:bg-(--chrome-action-hover)',
                 onClick: () => void stopRoomRun(),
@@ -13639,7 +14992,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                         event.kind === 'working'
                           ? jsx('button', {
                               type: 'button',
-                              title: 'Stop this run — interrupts the member on turn and holds the rest',
+                              title: 'Stop this run — interrupts all active members and holds queued turns',
                               className:
                                 'inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-px text-[0.65rem] font-medium text-(--ui-accent) transition-colors hover:bg-(--chrome-action-hover)',
                               onClick: () => void stopRoomRun(),
@@ -13895,6 +15248,10 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                                       }, `${entryKey}:img:${imgIndex}`)
                                 )
                               })
+                            : null,
+                          entry.from.kind === 'user' && groupBlockedMembers(room, members).length
+                            ? jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => openNewGroup(entry),
+                                children: 'Use this text as an unsent draft in a new group' })
                             : null
                         ]
                       })
@@ -14060,6 +15417,10 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
         : null,
       header,
       activityPanel,
+      jsx(GroupBlockedNotice, { room, members, onCreate: openNewGroup,
+        onCheck: () => void checkGroupTurnStatus(group, members).catch(error => host.notifyError(error, 'Earlier turn status could not be checked')) }),
+      jsx(CreateGroupChatDialog, { open: Boolean(recoverySource), roster: members,
+        recoverySource, onClose: () => setRecoverySource(null), onCreated: name => openGroupChat(name) }),
       jsx(ScrollArea, {
         className: 'min-h-0 flex-1',
         children: jsxs('div', {
@@ -14076,12 +15437,20 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
             ...roomClarifies.map(entry =>
               jsx(GroupClarifyCard, { entry, members }, `clarify:${entry.memberKey}:${entry.requestId}`)
             ),
-            room.running
+            (room.running || roomClarifies.length || room.turns?.length)
               ? jsx('div', {
                   className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
-                  children: roomClarifies.length
-                    ? 'Waiting for your answer…'
-                    : room.turn
+                  children: room.turns?.some(turn => turn.phase === 'running' || turn.phase === 'starting')
+                    ? `${room.turns.filter(turn => turn.phase === 'running' || turn.phase === 'starting').map(turn => groupSpeakerLabel(turn.member)).join(', ')} ${room.turns.filter(turn => turn.phase === 'running' || turn.phase === 'starting').length > 1 ? 'are' : 'is'} thinking…`
+                    : room.turns?.some(turn => turn.phase === 'stop-unconfirmed')
+                      ? 'Interruption is unconfirmed. Stop can retry.'
+                    : room.turns?.some(turn => turn.phase === 'stopping')
+                      ? 'Finishing stopped turns…'
+                    : room.turns?.some(turn => turn.phase === 'reconciling')
+                      ? 'Checking earlier turn outcomes; retained work is not proof of active computation.'
+                    : roomClarifies.length
+                      ? 'Waiting for your answer…'
+                      : room.turn
                       ? `${groupSpeakerLabel(room.turn)} is thinking…`
                       : 'The room is working…'
                 }, 'working')
@@ -15690,7 +17059,27 @@ function BotsPane() {
 
 // ── plugin ───────────────────────────────────────────────────────────────────
 
+/** Group room host boundary shared by production callers and offline behavior tests. */
+const groupTurnRuntime = {
+  runGroupChatMemberTurn, runGroupChatRounds, harvestStrandedGroupReply, stopGroupChatServerSync,
+  currentGroupActivity, groupActivityLabel, $groupChats, $groupClarify, $botAttention,
+  appendGroupChatEntry, syncGroupClarify, answerGroupClarify, groupChatSyncSnapshot,
+  groupChatSyncEntryKey, stopGroupThread, mergeRemoteGroupChatSnapshotIntoRooms,
+  durableGroupChatRooms, sendToGroupChat, groupRoomCoordinators, groupRuntimeSessionOwners,
+  groupMemberKey, updateGroupChat, groupBlockedMembers, GroupBlockedNotice, checkGroupTurnStatus,
+  stopGroupTurnObservation,
+  CreateGroupChatDialog, createFreshGroupChat, groupComposerDraftKey,
+  groupComposerDraftSnapshot, updateGroupComposerDraft, GroupChatWorkspace, GroupClarifyCard,
+  groupRoomCanStop, renameGroupChat, pullGroupChatServerState, GroupChatSettingsDialog, $groupChatWorkspace,
+  bindGroupTurnPorts(ports) {
+    ({ Date, setTimeout, clearTimeout, setInterval, clearInterval, document } = createGroupTurnPorts(ports))
+  },
+  bindGroupTurnStorage(storage) { pluginCtx = { ...pluginCtx, storage } }
+}
+
+
 export default {
+  groupTurnRuntime,
   id: ID,
   name: 'Bots',
   description: 'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',
@@ -15699,6 +17088,7 @@ export default {
   register(ctx) {
     pluginCtx = ctx
     groupChatSyncDisposed = false
+    groupObservationStopped = false
     startFaceClock()
     // The cross-connection relay rides every gateway socket this Desktop
     // holds: roster sync + envelope drain/deliver/reply loops.
@@ -15708,6 +17098,7 @@ export default {
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(stopFaceClock)
       ctx.onDispose(stopBotRelay)
+      ctx.onDispose(stopGroupTurnObservation)
     }
 
     // @-mention autocomplete: typing "@rese…" in ANY composer offers the
@@ -15834,10 +17225,15 @@ export default {
                   // Pre-thread entries get synthetic thread ids on hydrate so
                   // every UI/engine path can assume entry.thread exists.
                   log: assignLegacyThreads(room.log),
+                  consumedInputs: groupConsumedInputs(room),
+                  threadInputVersions: room.threadInputVersions || {},
                   watermarks: room.watermarks && typeof room.watermarks === 'object' ? room.watermarks : {},
                   sessions: room.sessions && typeof room.sessions === 'object' ? room.sessions : {},
                   sessionOwners: room.sessionOwners && typeof room.sessionOwners === 'object' ? room.sessionOwners : {},
+                  recoveryOrigin: room.recoveryOrigin && typeof room.recoveryOrigin === 'object' ? room.recoveryOrigin : null,
                   stranded: room.stranded && typeof room.stranded === 'object' ? room.stranded : {},
+                  driveContexts: room.driveContexts && typeof room.driveContexts === 'object' ? room.driveContexts : {},
+                  coordinationId: typeof room.coordinationId === 'string' ? room.coordinationId : null,
                   // #93129: rehydrate sticky stop holds with the same shape
                   // guard as the other maps — a held bot stays held across
                   // window restarts until explicitly released.

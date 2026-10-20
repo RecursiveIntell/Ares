@@ -49,6 +49,9 @@ class AcceptedResponseRoute:
     provider: str
     model: str
     served_model: str | None
+    # Physical dispatch transport; required when display identity is an alias.
+    base_url: str | None = None
+    api_mode: str | None = None
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:

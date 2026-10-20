@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 PREFIX = "HERMES_NPM_DIAGNOSTIC "
-SCHEMA = "npm-install-diagnostic/v1"
+SCHEMA = "npm-install-diagnostic/v2"
 LIMIT = 256 * 1024
 CAUSES = {
     "ERESOLVE": "Dependency resolution conflict",
@@ -20,6 +20,7 @@ CAUSES = {
     "EPERM": "Operation not permitted",
     "ENOSPC": "Insufficient disk space",
     "ENOENT": "Required file or executable missing",
+    "ENOTEMPTY": "Filesystem directory is not empty",
     "EINTEGRITY": "Package integrity verification failed",
     "E401": "Registry authentication required or rejected",
     "E403": "Registry access forbidden",
@@ -34,11 +35,18 @@ CAUSES = {
     "SELF_SIGNED_CERT_IN_CHAIN": "TLS certificate chain is not trusted",
     "DEPTH_ZERO_SELF_SIGNED_CERT": "TLS peer certificate is self-signed",
     "UNABLE_TO_VERIFY_LEAF_SIGNATURE": "TLS certificate issuer cannot be verified",
+    "UNABLE_TO_GET_ISSUER_CERT": "TLS certificate issuer unavailable",
     "UNABLE_TO_GET_ISSUER_CERT_LOCALLY": "TLS issuer unavailable in configured trust",
     "ERR_TLS_CERT_ALTNAME_INVALID": "TLS certificate hostname mismatch",
     "ELIFECYCLE": "Package lifecycle script failed",
 }
 CODE_LINE = re.compile(r"^npm (?:ERR!|error) code ([A-Z0-9_]+)\s*$", re.MULTILINE)
+OUTPUT_DETAILS = {
+    "empty": "no non-whitespace output in bounded tail",
+    "unrecognized-code": "only unrecognized code lines in bounded tail",
+    "non-code": "non-code output in bounded tail",
+    "recognized-code": "Allowlisted npm error codes only",
+}
 
 
 def bounded_tail(path: Path) -> tuple[str, bool]:
@@ -53,7 +61,8 @@ def bounded_tail(path: Path) -> tuple[str, bool]:
         return stream.read(LIMIT).decode("utf-8", "replace"), info.st_size > LIMIT
 
 
-def record(stage: str, exit_code: int, elapsed: int, codes: list[str], truncated: bool) -> dict:
+def record(stage: str, exit_code: int, elapsed: int, codes: list[str], truncated: bool,
+           *, output_kind: str) -> dict:
     if stage not in ("root", "tui") or type(exit_code) is not int or not 1 <= exit_code <= 255:
         raise ValueError("invalid status")
     if type(elapsed) is not int or not 0 <= elapsed <= 86400 or type(truncated) is not bool:
@@ -61,17 +70,26 @@ def record(stage: str, exit_code: int, elapsed: int, codes: list[str], truncated
     if not isinstance(codes, list) or any(not isinstance(code, str) or code not in CAUSES for code in codes):
         raise ValueError("invalid codes")
     codes = sorted(set(codes))
+    if not isinstance(output_kind, str) or output_kind not in OUTPUT_DETAILS:
+        raise ValueError("invalid output kind")
+    if (output_kind == "recognized-code") != bool(codes):
+        raise ValueError("inconsistent output kind")
     return {"schema": SCHEMA, "stage": stage, "exit_code": exit_code,
             "elapsed_seconds": elapsed, "timeout_status": exit_code == 124,
             "npm_codes": codes, "safe_causes": [CAUSES[code] for code in codes],
-            "output_truncated": truncated,
-            "detail": "Raw npm output intentionally omitted; no recognized error code" if not codes else "Allowlisted npm error codes only"}
+            "output_truncated": truncated, "output_kind": output_kind,
+            "detail": ("Raw npm output intentionally omitted; no recognized error code; " + OUTPUT_DETAILS[output_kind])
+                      if not codes else OUTPUT_DETAILS[output_kind]}
 
 
 def summarize(path: Path, stage: str, exit_code: int, elapsed: int) -> dict:
     text, truncated = bounded_tail(path)
-    codes = [code for code in CODE_LINE.findall(text) if code in CAUSES]
-    return record(stage, exit_code, elapsed, codes, truncated)
+    code_lines = CODE_LINE.findall(text)
+    codes = [code for code in code_lines if code in CAUSES]
+    # Describe retained output shape, never a cause inferred from process status.
+    output_kind = ("recognized-code" if codes else "unrecognized-code" if code_lines
+                   else "non-code" if text.strip() else "empty")
+    return record(stage, exit_code, elapsed, codes, truncated, output_kind=output_kind)
 
 
 def collect(path: Path) -> list[dict]:
@@ -88,7 +106,7 @@ def collect(path: Path) -> list[dict]:
             if value.get("schema") != SCHEMA:
                 continue
             rebuilt = record(value["stage"], value["exit_code"], value["elapsed_seconds"],
-                             value["npm_codes"], value["output_truncated"])
+                             value["npm_codes"], value["output_truncated"], output_kind=value["output_kind"])
             if value != rebuilt:
                 continue
             records.append(rebuilt)

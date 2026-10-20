@@ -162,6 +162,8 @@ class ComputeHost:
         # A completed worker can invoke its done callback during registration.
         self._turn_futures_lock = threading.RLock()
         self._active_request_ids: dict[str, str] = {}
+        # Admission binds a wire reservation to the exact session object.
+        self._admitted_request_sessions: dict[str, tuple[str, dict]] = {}
         self._pending_interrupts: dict[str, str] = {}
         self._transport = _HostTransport(self.emit)
         self._heartbeat_secs = (
@@ -330,7 +332,7 @@ class ComputeHost:
                                 "session_id": sid,
                                 "running": bool(request_id or session.get("running")),
                                 "request_id": request_id,
-                                "session_info": server._session_info(agent, session),
+                                "session_info": server._session_info(agent, session, lock_held=True),
                             }
                         )
             except Exception as exc:
@@ -366,7 +368,7 @@ class ComputeHost:
         with self._turn_futures_lock:
             self._turn_futures.pop(future, None)
 
-    def _emit_real_turn_terminal(self, frame: dict[str, Any]) -> None:
+    def _emit_real_turn_terminal(self, frame: dict[str, Any], *, admitted_session: dict | None = None) -> None:
         # The computation has reached its terminal point. Release only this
         # request's admission before publishing; output I/O must not hold the
         # admission lock. Future retirement is resource accounting and cannot
@@ -376,14 +378,32 @@ class ComputeHost:
         sid = str(frame.get("sid") or "")
         request_id = str(frame.get("request_id") or "")
         with self._turn_futures_lock:
-            session = server._sessions.get(sid)
-            if session is not None:
+            binding = self._admitted_request_sessions.get(sid)
+            session = admitted_session
+            owns_binding = binding is None or (binding[0] == request_id and binding[1] is session)
+            if session is not None and server._sessions.get(sid) is session:
                 with session["history_lock"]:
                     if session.get("_host_turn_request_id") == request_id:
+                        window = session.get("_turn_outcomes")
+                        if isinstance(window, server.TurnOutcomeWindow) and window.owns(session, sid):
+                            try:
+                                window.finish(request_id, interrupted=bool(frame.get("interrupted")),
+                                              error=frame.get("type") == "turn.error")
+                                outcome = window.find(request_id)
+                                if outcome is not None:
+                                    import copy
+                                    frame = {**frame, "turn_outcome": copy.deepcopy(outcome)}
+                            except Exception:
+                                # Losing an advisory projection cannot retain
+                                # execution ownership or suppress its terminal.
+                                if (outcome := window.find(request_id)) is not None:
+                                    window.invalidate(outcome, "projection_failed")
                         session.pop("_host_turn_request_id", None)
-            if self._active_request_ids.get(sid) == request_id:
+            if owns_binding and self._active_request_ids.get(sid) == request_id:
                 self._active_request_ids.pop(sid, None)
-            if self._pending_interrupts.get(sid) == request_id:
+            if owns_binding and binding is not None and binding[0] == request_id:
+                self._admitted_request_sessions.pop(sid, None)
+            if owns_binding and self._pending_interrupts.get(sid) == request_id:
                 self._pending_interrupts.pop(sid, None)
         self.emit(frame)
 
@@ -392,6 +412,30 @@ class ComputeHost:
         if sid in self._sessions:
             self._handle_spike_turn_start(frame)
             return
+        admitted, request_id = self._admit_real_turn(frame)
+        if not admitted:
+            self.emit({"type": "turn.error", "sid": sid, "request_id": request_id,
+                       "message": "session busy", "reason": "admission_refused_busy"})
+
+    def admit_autonomous_turn(self, frame: dict[str, Any]) -> bool:
+        """Admit an autonomously-initiated turn through the same registry as a
+        wire turn.start.
+
+        Autonomous producers running inside this child (the notification
+        poller, kanban delivery, /loop wakeups) call this instead of mutating
+        ``running`` directly, so owner lookup and resume always observe a
+        complete owner (running + request identity) and adopt it rather than
+        refusing with "compute-host running owner omitted its request id".
+        Returns True when the turn was admitted; False when another owner
+        holds the session (the caller retries later).
+        """
+        if not str(frame.get("sid") or ""):
+            return False
+        return self._admit_real_turn(frame)[0]
+
+    def _admit_real_turn(self, frame: dict[str, Any]) -> tuple[bool, str]:
+        """Register and submit one real turn. Returns (admitted, request_id)."""
+        sid = str(frame.get("sid") or "")
         payload = dict(frame)
         request_id = str(payload.get("request_id") or uuid.uuid4().hex)
         payload["request_id"] = request_id
@@ -406,9 +450,8 @@ class ComputeHost:
                         self._pending_interrupts.pop(sid, None)
                     raise
                 self._track_turn_future(future, sid)
-                return
-        self.emit({"type": "turn.error", "sid": sid, "request_id": request_id,
-                   "message": "session busy", "reason": "admission_refused_busy"})
+                return True, request_id
+        return False, request_id
 
     def _handle_spike_turn_start(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
@@ -451,11 +494,19 @@ class ComputeHost:
                 session = server._sessions.get(sid)
                 ack = {"type": "interrupt.ack", "sid": sid,
                        "request_id": frame.get("request_id"), "applied": False,
+                       **({"operation_id": frame["operation_id"]} if frame.get("operation_id") is not None else {}),
                        **({"target_request_id": target} if target is not None else {})}
                 if target is not None and (type(target) is not str or not target):
                     ack["message"] = "invalid target request id"
                 elif target is not None and self._active_request_ids.get(sid) != target:
                     ack["message"] = "turn owner changed or unknown"
+                    ack["failure_code"] = "turn_owner_changed"
+                    ack["effect_disposition"] = "not_applied"
+                elif ((binding := self._admitted_request_sessions.get(sid)) is not None
+                      and (binding[0] != self._active_request_ids.get(sid) or binding[1] is not session)):
+                    ack["message"] = "admitted session owner changed"
+                    ack["failure_code"] = "turn_owner_changed"
+                    ack["effect_disposition"] = "not_applied"
                 elif session is not None or target is not None:
                     # Accepted requests can still be constructing their session.
                     # Retain the exact cancellation through that window; the
@@ -468,19 +519,36 @@ class ComputeHost:
                         # for A cannot cancel B on the same reused agent.
                         agent = session.get("agent")
                         previous_receipt = getattr(agent, "_context_stop_receipt", None)
-                        server._interrupt_session_turn(sid, session, request_id=frame.get("request_id"))
+                        server._interrupt_session_turn(sid, session, request_id=frame.get("request_id"),
+                            **({"operation_id": frame["operation_id"]} if frame.get("operation_id") is not None else {}))
                         receipt = getattr(agent, "_context_stop_receipt", None)
                         if isinstance(receipt, dict) and receipt is not previous_receipt:
                             ack["stop_receipt"] = {"session_key": receipt.get("session_key"),
                                                    "control": receipt.get("control")}
+                            if (frame.get("operation_id") is not None
+                                    and isinstance(receipt.get("operation"), dict)
+                                    and receipt["operation"].get("operation_id") == frame["operation_id"]):
+                                ack["stop_receipt"]["operation"] = receipt["operation"]
                         if getattr(agent, "_context_stop_unacknowledged", False) is True:
                             ack["durable_stop_unconfirmed"] = True
                     ack.update(applied=True, applied_ns=now_ns())
                     if pending:
                         ack["pending"] = True
             self.emit(ack)
-        except Exception as exc:
-            self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": False, "message": str(exc)})
+        except Exception:
+            # Application may have cancelled the socket before a later step
+            # failed. Preserve correlation, but never label that as non-effect
+            # or put arbitrary exception/prompt/credential text on the wire.
+            self.emit({
+                "type": "interrupt.ack", "sid": sid,
+                "request_id": frame.get("request_id"),
+                **({"operation_id": frame["operation_id"]} if frame.get("operation_id") is not None else {}),
+                **({"target_request_id": frame["target_request_id"]}
+                   if frame.get("target_request_id") is not None else {}),
+                "applied": False, "message": "Stop application could not be confirmed",
+                "failure_code": "interrupt_application_failed",
+                "effect_disposition": "indeterminate",
+            })
 
     def _run_spike_turn(self, session: HostSession, frame: dict[str, Any]) -> None:
         request_id = frame.get("request_id") or uuid.uuid4().hex
@@ -541,9 +609,35 @@ class ComputeHost:
 
     # ── Real dashboard turn path ───────────────────────────────────────
 
+    def _join_run_thread_chain(self, server: Any, session: dict, sid: str, request_id: str) -> None:
+        """Settle this admission's workers without holding a lifecycle lock."""
+        run_thread = server._get_run_thread(session)
+        while run_thread is not None and hasattr(run_thread, "join"):
+            with session["history_lock"]:
+                if session.get("_host_turn_request_id") != request_id:
+                    raise RuntimeError("run-thread admission owner changed before settlement")
+            execution = getattr(run_thread, "_turn_outcome_execution", None)
+            # Queued inputs intentionally have no advisory outcome id, while
+            # remaining in this accepted host request's physical thread chain.
+            if execution is not None and (execution[0] is not session or execution[1] != sid
+                                          or execution[2] not in (None, request_id)):
+                # A pre-dispatch failure can restore the prior turn's handle.
+                # Only a real, already-started and now terminated native thread
+                # proves that this stale slot carries no outstanding execution.
+                if isinstance(run_thread, threading.Thread) and run_thread.ident is not None and not run_thread.is_alive():
+                    return
+                raise RuntimeError("run-thread execution owner changed before settlement")
+            run_thread.join()
+            successor = server._get_run_thread(session)
+            if successor is run_thread:
+                return
+            run_thread = successor
+
     def _run_real_turn(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
+        admitted_session = None
+        terminal_attempted = False
         if not sid:
             self._emit_real_turn_terminal({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "sid required"})
             return
@@ -553,6 +647,7 @@ class ComputeHost:
             with self._turn_futures_lock:
                 cancelled_before_construction = self._pending_interrupts.get(sid) == request_id
             if cancelled_before_construction:
+                terminal_attempted = True
                 self._emit_real_turn_terminal({"type": "turn.end", "sid": sid, "request_id": request_id,
                                                "interrupted": True, "ended_ns": now_ns()})
                 return
@@ -587,11 +682,15 @@ class ComputeHost:
                 else:
                     session["running"] = True
                     session["_host_turn_request_id"] = request_id
+                    admitted_session = session
+                    self._admitted_request_sessions[sid] = (request_id, session)
+                    server._begin_turn_outcome(session, sid, request_id, "compute_host", self._boot_id)
                     session["_turn_cancel_requested"] = False
                     session["last_active"] = time.time()
                     server._start_inflight_turn(session, frame.get("text") if "text" in frame else frame.get("prompt"))
             if terminal is not None:
-                self._emit_real_turn_terminal(terminal)
+                terminal_attempted = True
+                self._emit_real_turn_terminal(terminal, admitted_session=admitted_session)
                 return
             self.emit({"type": "turn.started", "sid": sid, "request_id": request_id, "started_ns": now_ns()})
             try:
@@ -611,20 +710,15 @@ class ComputeHost:
                 session,
                 text,
                 display_kind=frame.get("display_kind") or None,
+                **({"display_metadata": frame["display_metadata"]}
+                   if isinstance(frame.get("display_metadata"), dict) else {}),
                 **({"context_input_event_id": frame["context_input_event_id"]}
                    if frame.get("context_input_event_id") is not None else {}),
             )
             # Goal/notification follow-ups install their next run thread before
             # their predecessor exits. Keep the accepted request alive through
             # that chain instead of publishing a false terminal at the handoff.
-            run_thread = session.get("_run_thread")
-            while run_thread is not None and hasattr(run_thread, "join"):
-                run_thread.join()
-                with session["history_lock"]:
-                    successor = session.get("_run_thread")
-                if successor is run_thread:
-                    break
-                run_thread = successor
+            self._join_run_thread_chain(server, session, sid, request_id)
             with session["history_lock"]:
                 history_version = int(session.get("history_version", 0))
                 message_count = len(session.get("history") or [])
@@ -634,6 +728,7 @@ class ComputeHost:
             session_info = server._session_info(session.get("agent"), session)
             session_info["running"] = running
             self._bump_progress()
+            terminal_attempted = True
             self._emit_real_turn_terminal(
                 {
                     "type": "turn.end",
@@ -649,22 +744,31 @@ class ComputeHost:
                     # Child reply boundaries remain busy while this request
                     # owns the chain. Parent settlement publishes the final info.
                     "session_info_emitted": False,
-                }
+                }, admitted_session=admitted_session,
             )
         except Exception as exc:
-            try:
-                from tui_gateway import server
-
-                session = server._sessions.get(sid)
-                if session is not None:
-                    with self._turn_futures_lock, session.get("history_lock", threading.Lock()):
-                        owner = self._active_request_ids.get(sid)
-                        if owner is None or owner == request_id:
-                            session["running"] = False
-                            server._clear_inflight_turn(session)
-            except Exception:
-                pass
-            self._emit_real_turn_terminal({"type": "turn.error", "sid": sid, "request_id": request_id, "reason": "exception", "message": str(exc)})
+            if terminal_attempted:
+                # Execution is settled and ownership already released. Do not
+                # turn failed output into another terminal or touch a successor.
+                server.logger.exception("compute-host terminal output failed: sid=%s request=%s", sid, request_id)
+                return
+            if admitted_session is not None:
+                try:
+                    self._join_run_thread_chain(server, admitted_session, sid, request_id)
+                except Exception:
+                    # No settlement proof: retain admission and recovery evidence.
+                    # Stop remains available; never manufacture idle/terminal.
+                    server.logger.exception("compute-host worker settlement unconfirmed: sid=%s request=%s", sid, request_id)
+                    return
+                with self._turn_futures_lock, admitted_session["history_lock"]:
+                    binding = self._admitted_request_sessions.get(sid)
+                    if (binding is not None and binding[0] == request_id and binding[1] is admitted_session
+                            and admitted_session.get("_host_turn_request_id") == request_id):
+                        admitted_session["running"] = False
+                # Do not clear inflight: it is failed-turn recovery evidence.
+            terminal_attempted = True
+            self._emit_real_turn_terminal({"type": "turn.error", "sid": sid, "request_id": request_id,
+                "reason": "exception", "message": str(exc)}, admitted_session=admitted_session)
 
     def _ensure_server_session(self, server: Any, frame: dict[str, Any]) -> dict:
         sid = str(frame.get("sid") or "")
@@ -709,7 +813,14 @@ class ComputeHost:
             history_db = session_db if session_db is not None else server._get_db()
             if history_db.get_session(key) is not None:
                 persisted_history = history_db.get_messages_as_conversation(
-                    key, repair_alternation=True, include_row_ids=True
+                    key,
+                    repair_alternation=True,
+                    include_row_ids=True,
+                    # Model-facing cold replay must retain the owner's durable
+                    # summary discriminator so the Governor projection matches
+                    # the authenticated receipt parent. This remains opt-in;
+                    # display/export paths use their separate projections.
+                    include_summary_markers=True,
                 )
                 if persisted_history:
                     history = server.sanitize_replay_history(persisted_history)
@@ -751,6 +862,7 @@ class ComputeHost:
                     cols=int(frame.get("cols") or 80),
                     cwd=str(frame.get("cwd") or "") or None,
                     session_db=session_db,
+                    profile_home=profile_home or None,
                     source=frame.get("source"),
                 )
             finally:
@@ -762,6 +874,7 @@ class ComputeHost:
             server._sessions[sid] = {
                 "agent": agent,
                 "session_key": key,
+                "profile_home": profile_home or None,
                 "history": list(history),
                 "history_lock": threading.Lock(),
                 "history_version": int(frame.get("history_version") or 0),
@@ -789,6 +902,12 @@ class ComputeHost:
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
+        if frame.get("reasoning_config_override") is not None:
+            session["create_reasoning_override"] = frame["reasoning_config_override"]
+        if frame.get("service_tier_override") is not None:
+            session["create_service_tier_override"] = frame["service_tier_override"]
+        if frame.get("pending_runtime_options"):
+            session["pending_model_switch"] = {"runtime_options": dict(frame["pending_runtime_options"])}
         return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:
@@ -832,16 +951,50 @@ class ComputeHost:
                 return
             if session is None:
                 snapshot = frame.get("session_snapshot")
-                if route_name in {"config.set.model", "config.set.reasoning"} and isinstance(snapshot, dict) and snapshot.get("sid") == sid:
+                if route_name in {"config.set.model", "config.set.reasoning", "config.set.fast", "config.set.runtime_options", "session.compress"} and isinstance(snapshot, dict) and snapshot.get("sid") == sid:
                     # A new draft has no host session until its first turn.
                     # Rebuild from the serving gateway's committed snapshot;
-                    # this also repairs a host restart before another turn.
+                    # this also repairs a host restart or manual compaction
+                    # of a resumed session before another provider turn.
                     session = self._ensure_server_session(server, snapshot)
                 else:
                     self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": "session not found"})
                     return
             if route == "idle-gated" and session.get("running"):
-                self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": "session busy"})
+                self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
+                           "route_name": route_name, "delivery": "not_applied", "message": "session busy"})
+                return
+            if route_name in {"clarify.snapshot", "clarify.respond"}:
+                from tui_gateway.transport import bind_transport, reset_transport
+                params = frame.get("params")
+                if not isinstance(params, dict) or params.get("session_id") != sid:
+                    self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
+                               "message": "clarification session mismatch"})
+                    return
+                with server._sessions_lock:
+                    generation = session.setdefault("_clarify_host_generation", uuid.uuid4().hex)
+                    expected = frame.get("clarify_generation")
+                    if server._sessions.get(sid) is not session or expected is not None and expected != generation:
+                        self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
+                                   "message": "clarification generation changed"})
+                        return
+                    if route_name == "clarify.snapshot":
+                        response = server._ok(request_id, {"generation": generation,
+                            "pending_clarify": server._pending_clarify_request_payload(sid)})
+                    else:
+                        if expected is None:
+                            self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
+                                       "message": "clarification generation required"})
+                            return
+                        transport_token = bind_transport(self._transport)
+                        generation_token = server._host_clarify_expected_generation.set(generation)
+                        try:
+                            response = server._respond(request_id, params, "answer", allow_expired=True, idempotent=True)
+                        finally:
+                            server._host_clarify_expected_generation.reset(generation_token)
+                            reset_transport(transport_token)
+                self.emit({"type": "control.ack", "sid": sid, "request_id": request_id,
+                           "route_name": route_name, "response": response})
                 return
             if route_name in {"session.run_checkpoint.claim", "session.run_checkpoint.refresh", "session.run_checkpoint.release", "session.run_checkpoint.basis"}:
                 from tui_gateway.transport import bind_transport, reset_transport
@@ -893,7 +1046,7 @@ class ComputeHost:
                     }
                 )
                 return
-            if route_name in {"config.set.fast", "config.set.reasoning"}:
+            if route_name in {"config.set.fast", "config.set.reasoning", "config.set.runtime_options"}:
                 option = route_name.removeprefix("config.set.")
                 params = frame.get("params")
                 if not isinstance(params, dict):
@@ -903,9 +1056,13 @@ class ComputeHost:
                     {"key": option, "value": params.get("value", ""), "session_id": sid},
                 )
                 if "error" in response:
+                    error = response.get("error") or {}
+                    error_data = error.get("data") if isinstance(error, dict) else None
+                    delivery = error_data.get("delivery") if isinstance(error_data, dict) else None
                     self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
-                               "code": response["error"].get("code"),
-                               "message": str(response["error"].get("message") or "option switch failed")})
+                               "code": error.get("code"),
+                               "message": str(error.get("message") or "option switch failed"),
+                               **({"delivery": delivery} if delivery in {"not_sent", "not_applied"} else {})})
                     return
                 self.emit({"type": "control.ack", "sid": sid, "request_id": request_id,
                            "route_name": route_name, "result": response.get("result") or {},
@@ -1072,6 +1229,13 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
     os.environ["HERMES_COMPUTE_HOST_CHILD"] = "1"
     stdin = stdin or sys.stdin
     host = ComputeHost(stdout=stdout or sys.stdout)
+    from tui_gateway import server as _server
+
+    # Autonomous producers in this child (the notification poller, kanban
+    # delivery, /loop wakeups) dispatch through this admission so owner
+    # lookup and resume always observe a complete owner (running + request
+    # identity) instead of refusing with "omitted its request id".
+    _server.register_local_host_turn_admitter(host.admit_autonomous_turn)
     shutting_down = threading.Event()
 
     def _signal_handler(_signum, _frame) -> None:

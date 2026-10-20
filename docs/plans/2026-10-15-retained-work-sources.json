@@ -1,0 +1,145 @@
+{
+  "schema": "RetainedWorkReconciliationSourcesV1",
+  "cutoff_utc": "2026-10-15T09:48:56.014327+00:00",
+  "planning_only": true,
+  "implementation_complete": false,
+  "activation_authorized_by_document": false,
+  "repositories": {
+    "Ares": {
+      "remote": "https://github.com/RecursiveIntell/Ares.git",
+      "main": "0369fdd20d7419f332e0c718d469d6898682fb2e"
+    },
+    "recursive-agent": {
+      "remote": "https://github.com/RecursiveIntell/recursive-agent.git",
+      "main": "88e121e479e48accfbf361ad9d392042ef4d7eda"
+    },
+    "agent-graph-mcp": {
+      "remote": "https://github.com/RecursiveIntell/agent-graph-mcp.git",
+      "main": "720f06055b0bb8b301cbbdd9969aea664592d03d"
+    }
+  },
+  "carriers": [
+    {
+      "pr": 154,
+      "url": "https://github.com/RecursiveIntell/Ares/pull/154",
+      "head": "cccc329412b72e5dcccb00701a1403fbad085245",
+      "base_branch": "main",
+      "author": "RecursiveIntell",
+      "complete_pr_relative_path_count": 29,
+      "role": "adjacent_overlap"
+    },
+    {
+      "pr": 162,
+      "url": "https://github.com/RecursiveIntell/Ares/pull/162",
+      "head": "f354416f278cf5c3fc4d04be90094f662d1709f7",
+      "base_branch": "main",
+      "author": "RecursiveIntell",
+      "complete_pr_relative_path_count": 152,
+      "role": "existing_unmerged_reliability_carrier"
+    },
+    {
+      "pr": 163,
+      "url": "https://github.com/RecursiveIntell/Ares/pull/163",
+      "head": "74d8bfde8af48fc3cebf9fafa7f6646e35647efc",
+      "base_branch": "rebase/completion-on-main-20261014",
+      "author": "RecursiveIntell",
+      "complete_pr_relative_path_count": 18,
+      "role": "existing_unmerged_reliability_carrier"
+    },
+    {
+      "pr": 165,
+      "url": "https://github.com/RecursiveIntell/Ares/pull/165",
+      "head": "954adf3f0bbc65f5ac8c9d3038e9de4cbb436183",
+      "base_branch": "fix/rg-verified-20261015",
+      "author": "RecursiveIntell",
+      "complete_pr_relative_path_count": 14,
+      "role": "existing_unmerged_reliability_carrier"
+    },
+    {
+      "pr": 166,
+      "url": "https://github.com/RecursiveIntell/Ares/pull/166",
+      "head": "99fa8ad7b86ca6bfa5a4df5e0bd486cb114943e8",
+      "base_branch": "fix/rg-spawn-goal-lsp-20261015",
+      "author": "RecursiveIntell",
+      "complete_pr_relative_path_count": 8,
+      "role": "existing_unmerged_reliability_carrier"
+    },
+    {
+      "pr": 168,
+      "url": "https://github.com/RecursiveIntell/Ares/pull/168",
+      "head": "4af08f766d095ab9596dd12cb0a13e1c92cd6a34",
+      "base_branch": "fix/rg-attachments-ci-20261015",
+      "author": "RecursiveIntell",
+      "complete_pr_relative_path_count": 14,
+      "role": "existing_unmerged_reliability_carrier"
+    }
+  ],
+  "source_inputs": [
+    {
+      "label": "inherited_plan",
+      "artifact_name": "2026-10-10_130746-final-unified-reliability.md",
+      "sha256": "adfa33239c328b17047df7330f99b059ae9459d56fb2d7a95c0dc00543372baa",
+      "public_access": "local source identity only; criteria are projected into the companion coverage index, not a public runtime proof"
+    },
+    {
+      "label": "completion_plan_current_markdown",
+      "artifact_name": "COMPLETION_PLAN.md",
+      "sha256": "3b669926587f964ebb915ebeb96da0f354b340ca44b132402f7caa7bcffade75",
+      "public_access": "local source identity only; criteria are projected into the companion coverage index, not a public runtime proof"
+    },
+    {
+      "label": "completion_dag_older_projection",
+      "artifact_name": "COMPLETION_DAG.json",
+      "sha256": "7912a183a28900108d66423f3fc93f42f634eb4aa00e3ac35cfc003ee7ecfd9c",
+      "public_access": "local source identity only; criteria are projected into the companion coverage index, not a public runtime proof"
+    },
+    {
+      "label": "case_coverage_projection",
+      "artifact_name": "COVERAGE.json",
+      "sha256": "d56b4222a4445db4acc078ed760d652a8b801a581d1cb7c44568ac3c58072abc",
+      "public_access": "local source identity only; criteria are projected into the companion coverage index, not a public runtime proof"
+    },
+    {
+      "label": "subordinate_context_plan",
+      "artifact_name": "2026-10-12_161050-context-recovery.md",
+      "sha256": "76be51292fd3f71d1f25d5cd2d19e38b5aeddf5fe0b6f4698330b1cf45bf55c8",
+      "public_access": "local source identity only; criteria are projected into the companion coverage index, not a public runtime proof"
+    }
+  ],
+  "source_projection_mismatch": {
+    "current_completion_markdown_sha256": "3b669926587f964ebb915ebeb96da0f354b340ca44b132402f7caa7bcffade75",
+    "dag_declared_plan_sha256": "7279f4f9512d60f27601bd2a8a4ce5b985b3c7b5e504c664696496854c8b3277",
+    "current_markdown_matches_old_dag": false,
+    "disposition": "Reconcile and regenerate from admitted current source at R0; no silent rehash or inherited PASS."
+  },
+  "coverage_counts": {
+    "inherited_case": 74,
+    "supplemental_case": 20,
+    "master_card": 14,
+    "issue": 40,
+    "inherited_task": 19,
+    "gate": 13,
+    "context_task": 17,
+    "context_criterion": 44
+  },
+  "coverage_rows": 241,
+  "coverage_sha256": "5a3c862c3f59f87b9c339d2888c3dd24dfaf17a717b910329613247f2c588ac8",
+  "coverage_meaning": "Criteria/dispositions only; not result, authority or a replacement task/input/goal store.",
+  "historical_installed_source_diagnostic": {
+    "ares": "12962d39c7deb2772f734eca2db08e5a84861052",
+    "attachment_staging": {
+      "cases": 21,
+      "failed": 12,
+      "passed": 9
+    },
+    "pdf_responsiveness": {
+      "cases": 17,
+      "failed": 17,
+      "passed": 0
+    },
+    "scope": "Historical installed-source12962 diagnostic with disposable state and an external development venv; not canonical exact-lock CI parity or live-GUI/provider execution."
+  },
+  "source_files_copied_from_carriers": false,
+  "historical_evidence_promoted_to_current_acceptance": false,
+  "no_private_payloads": "No local absolute paths, raw logs, media, conversation transcripts, credentials or live configuration included."
+}

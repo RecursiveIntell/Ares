@@ -3100,6 +3100,24 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+@dataclass(frozen=True)
+class UnstartedFireClaimReceipt:
+    """Ephemeral fence for a claim whose runner is proven unstarted.
+
+    Presence flags distinguish missing fields from explicit nulls. Values
+    are detached snapshots; this descriptor is never stored in jobs.json.
+    """
+
+    job_id: str
+    owner: str
+    prior_next_present: bool
+    prior_next_value: Any
+    claimed_next_present: bool
+    claimed_next_value: Any
+    claimed_schedule_present: bool
+    claimed_schedule_value: Any
+
+
 def claim_job_for_fire(
     job_id: str,
     *,
@@ -3124,7 +3142,8 @@ def _claim_job_for_fire_locked(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
-) -> Union[bool, Dict[str, Any]]:
+    return_unstarted_receipt: bool = False,
+) -> Union[bool, Dict[str, Any], Tuple[Dict[str, Any], UnstartedFireClaimReceipt]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
 
@@ -3177,6 +3196,9 @@ def _claim_job_for_fire_locked(
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
+            if return_unstarted_receipt:
+                prior_next_present = "next_run_at" in job
+                prior_next_value = copy.deepcopy(job.get("next_run_at"))
             if force:
                 job["enabled"] = True
                 job["state"] = "scheduled"
@@ -3192,9 +3214,111 @@ def _claim_job_for_fire_locked(
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
                     job["next_run_at"] = nxt
+            if return_unstarted_receipt:
+                claimed = copy.deepcopy(job)
+                receipt = UnstartedFireClaimReceipt(
+                    job_id=job_id,
+                    owner=owner,
+                    prior_next_present=prior_next_present,
+                    prior_next_value=prior_next_value,
+                    claimed_next_present="next_run_at" in job,
+                    claimed_next_value=copy.deepcopy(job.get("next_run_at")),
+                    claimed_schedule_present="schedule" in job,
+                    claimed_schedule_value=copy.deepcopy(job.get("schedule")),
+                )
+                # Prepare both snapshots before publication so copying cannot
+                # turn a confirmed claim into a post-save descriptor failure.
+                save_jobs(jobs)
+                return claimed, receipt
             save_jobs(jobs)
             return copy.deepcopy(job) if return_job else True
         return False
+
+
+def claim_job_for_fire_with_unstarted_receipt(
+    job_id: str,
+    *,
+    claim_ttl_seconds: int = 300,
+) -> Optional[Tuple[Dict[str, Any], UnstartedFireClaimReceipt]]:
+    """Claim without forced resume and return an ephemeral release fence.
+
+    Ordinary claim callers keep their existing bool/dict contract. This
+    opt-in path is for dispatch admission that can prove work never started.
+    """
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return None
+        result = _claim_job_for_fire_locked(
+            job_id,
+            claim_ttl_seconds=claim_ttl_seconds,
+            force=False,
+            return_job=True,
+            return_unstarted_receipt=True,
+        )
+        return result if isinstance(result, tuple) else None
+
+
+def release_unstarted_fire_claim(
+    receipt: UnstartedFireClaimReceipt,
+) -> Dict[str, Any]:
+    """Release only a positively unstarted claim; never an uncertain submit.
+
+    Owner and field fences preserve concurrent edits. A receipt is not a
+    general cancellation API and does not authorize restoring a whole job.
+    """
+    if not isinstance(receipt, UnstartedFireClaimReceipt):
+        return {"released": False, "status": "conflict", "reason": "invalid_receipt"}
+    try:
+        with _fire_job_lock(receipt.job_id) as acquired:
+            if not acquired:
+                return {"released": False, "status": "lock_unavailable"}
+            return _release_unstarted_fire_claim_locked(receipt)
+    except Exception as exc:
+        # Lock/load failures cannot certify the claim's current disposition.
+        return {
+            "released": False, "status": "release_unavailable",
+            "claim_release": "uncertain", "error": str(exc),
+        }
+
+
+def _release_unstarted_fire_claim_locked(
+    receipt: UnstartedFireClaimReceipt,
+) -> Dict[str, Any]:
+    """Release under the existing fire-job then jobs-store lock order."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != receipt.job_id:
+                continue
+            claim = job.get("fire_claim")
+            if not isinstance(claim, dict) or claim.get("by") != receipt.owner:
+                return {"released": False, "status": "conflict", "reason": "owner_changed"}
+            if (
+                ("schedule" in job) != receipt.claimed_schedule_present
+                or job.get("schedule") != receipt.claimed_schedule_value
+            ):
+                return {"released": False, "status": "conflict", "reason": "schedule_changed"}
+            if (
+                ("next_run_at" in job) != receipt.claimed_next_present
+                or job.get("next_run_at") != receipt.claimed_next_value
+            ):
+                return {"released": False, "status": "conflict", "reason": "next_run_changed"}
+            job.pop("fire_claim", None)
+            if receipt.prior_next_present:
+                job["next_run_at"] = copy.deepcopy(receipt.prior_next_value)
+            else:
+                job.pop("next_run_at", None)
+            try:
+                save_jobs(jobs)
+            except Exception as exc:
+                # A save may raise after publication. Do not certify release
+                # or claim retention and never compensate by running the job.
+                return {
+                    "released": False, "status": "write_uncertain",
+                    "claim_release": "uncertain", "error": str(exc),
+                }
+            return {"released": True, "status": "released"}
+        return {"released": False, "status": "missing"}
 
 
 # Completed one-shot job records are retained in jobs.json (final status +

@@ -1,4 +1,5 @@
 """Session identity and owner readback boundaries for model-option repair."""
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -36,13 +37,14 @@ def test_retired_runtime_never_becomes_profile_write(monkeypatch, key, value, sc
 def test_host_owned_effort_never_falls_back_to_stale_parent(monkeypatch, mirror, expected):
     parent = SimpleNamespace(model="fixture", provider="fixture", reasoning_config={"enabled": True, "effort": "low"})
     session = {"session_key": "stored", "agent": parent, "_compute_host_active": True,
-               "_metadata_mirror": mirror}
+               "_metadata_mirror": mirror, "history_lock": threading.Lock()}
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda s: True)
     assert server._session_info(parent, session)["reasoning_effort"] == expected
 
 
 def test_local_agent_remains_reasoning_owner(monkeypatch):
     parent = SimpleNamespace(model="fixture", provider="fixture", reasoning_config={"enabled": True, "effort": "low"})
-    session = {"session_key": "stored", "agent": parent, "_metadata_mirror": {"reasoning_effort": "high"}}
+    session = {"session_key": "stored", "agent": parent, "_metadata_mirror": {"reasoning_effort": "high"},
+               "history_lock": threading.Lock()}
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda s: False)
     assert server._session_info(parent, session)["reasoning_effort"] == "low"

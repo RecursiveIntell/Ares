@@ -704,6 +704,7 @@ const sidebars: SidebarsConfig = {
         'integrations/index',
         'integrations/nous-portal',
         'integrations/providers',
+        'integrations/ollama-cloud',
         'integrations/buzz',
         'user-guide/features/mcp',
         'user-guide/features/acp',

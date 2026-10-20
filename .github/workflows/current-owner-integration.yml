@@ -1,37 +1,19 @@
 name: Current owner integration
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/current-owner-integration.yml'
-      - 'ares_runtime/collaboration.py'
-      - 'ares_runtime/governed_context.py'
-      - 'ares_runtime/__init__.py'
-      - 'tests/owner_integration/**'
-      - 'tests/test_ares_collaboration.py'
-      - 'tests/ares_runtime/test_governed_context_materialization.py'
-      - 'tests/ares_runtime/test_memory_witness_v2.py'
-      - 'tests/ares_runtime/test_policy_basis_v2.py'
-      - 'tests/ares_runtime/fixtures/profile_runtime_v2_owner.json'
-  pull_request:
-    paths:
-      - '.github/workflows/current-owner-integration.yml'
-      - 'ares_runtime/collaboration.py'
-      - 'ares_runtime/governed_context.py'
-      - 'ares_runtime/__init__.py'
-      - 'tests/owner_integration/**'
-      - 'tests/test_ares_collaboration.py'
-      - 'tests/ares_runtime/test_governed_context_materialization.py'
-      - 'tests/ares_runtime/test_memory_witness_v2.py'
-      - 'tests/ares_runtime/test_policy_basis_v2.py'
-      - 'tests/ares_runtime/fixtures/profile_runtime_v2_owner.json'
+  workflow_call:
+    outputs:
+      profile_runtime_consumer_result:
+        description: Result of the canonical owner to Ares consumer qualification.
+        value: ${{ jobs.profile-runtime-consumer.outputs.qualification_result }}
 
 permissions:
   contents: read
 
 jobs:
   profile-runtime-consumer:
+    outputs:
+      qualification_result: ${{ job.status }}
     name: Current profile-runtime owner to Ares
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -48,7 +30,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: RecursiveIntell/Libraries
-          ref: 9849d12adc8a5ef852d56e36abec4ffbb5122c62
+          ref: 12c55d5cd08e0b986a56d344cbe261d01bf2957f
           path: Libraries
           persist-credentials: false
       - name: Generate inputs with the exact current canonical Rust owner

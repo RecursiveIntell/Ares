@@ -55,7 +55,7 @@ export function TerminalInstance({
     <div
       className={cn(INSTANCE_CLASS, active ? 'visible' : 'invisible pointer-events-none')}
       // Focus-scope marker so isFocusWithin('[data-terminal]') can route ⌘W here.
-      data-terminal=""
+      data-terminal={id}
     >
       {status === 'starting' && (
         <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center">
@@ -108,7 +108,7 @@ export function AgentTerminalInstance({ active, id, procId }: AgentTerminalInsta
       className={cn(INSTANCE_CLASS, active ? 'visible' : 'invisible pointer-events-none')}
       // Same focus-scope marker as the user terminal so isFocusWithin('[data-terminal]')
       // routes ⌘W here and closes the focused agent tab (not a preview).
-      data-terminal=""
+      data-terminal={id}
     >
       <div className={HOST_CLASS} ref={hostRef} />
     </div>

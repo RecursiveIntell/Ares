@@ -553,7 +553,7 @@ class SessionManager:
         # for the rest of the session (see hermes_state.get_messages_as_conversation).
         try:
             history = db.get_messages_as_conversation(
-                session_id, repair_alternation=True
+                session_id, repair_alternation=True, include_summary_markers=True
             )
         except Exception:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)

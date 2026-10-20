@@ -2664,12 +2664,32 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
         except Exception:
             return "bot-chat delivery failed: hermes CLI not resolvable"
 
-    env = os.environ.copy()
+    try:
+        from agent.secret_scope import (
+            build_profile_env_boundary, build_profile_secret_scope,
+            reset_secret_scope, set_secret_scope,
+        )
+        from hermes_constants import get_hermes_home, get_process_hermes_home
+        from hermes_cli.profiles import resolve_profile_env
+        from tools.environments.local import hermes_subprocess_env
+
+        target_home = Path(resolve_profile_env(profile)) if profile else get_hermes_home()
+        scope_token = set_secret_scope(build_profile_secret_scope(
+            target_home, fail_closed_external=True,
+        ))
+        try:
+            boundary = build_profile_env_boundary(
+                source_home=get_process_hermes_home(), target_home=target_home,
+            )
+            env = hermes_subprocess_env(
+                inherit_credentials=True, profile_boundary=boundary,
+            )
+        finally:
+            reset_secret_scope(scope_token)
+    except Exception:
+        return "bot-chat delivery failed: profile authority unavailable"
     if profile:
         argv += ["-p", profile]
-        # -p owns profile resolution in the child; a leftover HERMES_HOME
-        # from THIS scheduler's profile must not shadow it.
-        env.pop("HERMES_HOME", None)
 
     # The prefix tells the receiving bot this is scheduled output, not the
     # human typing — mirrors the Bot Mode sender-attribution convention.

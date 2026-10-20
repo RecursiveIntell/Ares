@@ -62,6 +62,8 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
+
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
 # graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
@@ -100,7 +102,8 @@ class _OpenAIProxy:
     __slots__ = ()
 
     def __call__(self, *args, **kwargs):
-        return _load_openai_cls()(*args, **kwargs)
+        from ares_runtime.physical_dispatch import bind_inference_client
+        return bind_inference_client(_load_openai_cls()(*args, **kwargs))
 
     def __instancecheck__(self, obj):
         return isinstance(obj, _load_openai_cls())
@@ -479,6 +482,17 @@ def _run_protected_sync_provider_call(
     callback: Callable[[dict[str, Any]], Any],
     kwargs: dict[str, Any],
 ) -> Any:
+    if not _aux_interrupt_protected() or not callable(_capture_aux_cancel_check()):
+        return callback(kwargs)
+    from ares_runtime.physical_dispatch import unsupported_transport_scope
+    with unsupported_transport_scope('protected_auxiliary_daemon'):
+        return _run_protected_sync_provider_worker(callback, kwargs)
+
+
+def _run_protected_sync_provider_worker(
+    callback: Callable[[dict[str, Any]], Any],
+    kwargs: dict[str, Any],
+) -> Any:
     """Run one protected provider callback in an attempt-isolated daemon.
 
     A hard cancel must release the compression-owning thread promptly, but
@@ -836,15 +850,17 @@ def _update_compressor_model(
     api_key: Any = "",
     provider: str = "",
     api_mode: str = "",
+    max_tokens: Optional[int] = None,
     threshold_percent: Optional[float] = None,
 ) -> None:
-    """Call ``update_model``, forwarding ``threshold_percent`` when supported.
+    """Forward route budget fields accepted by the engine's ``update_model``.
 
     The built-in ContextCompressor re-resolves its threshold internally and
     does not accept the kwarg; external engines (e.g. ri-context-governor)
     accept it so the resolved host threshold (including the Codex gpt-5.x
-    autoraise) reaches their trigger. A signature guard keeps every engine
-    on its own contract.
+    autoraise) reaches their trigger. The response reserve is also forwarded
+    when explicitly supported, including None to clear an old reservation.
+    A signature guard keeps every engine on its own contract.
     """
     _kwargs = {
         "model": model,
@@ -854,13 +870,15 @@ def _update_compressor_model(
         "provider": provider,
         "api_mode": api_mode,
     }
-    if threshold_percent is not None:
-        try:
-            import inspect
+    try:
+        import inspect
 
-            _params = inspect.signature(compressor.update_model).parameters
-        except (TypeError, ValueError):
-            _params = {}
+        _params = inspect.signature(compressor.update_model).parameters
+    except (TypeError, ValueError):
+        _params = {}
+    if "max_tokens" in _params:
+        _kwargs["max_tokens"] = max_tokens
+    if threshold_percent is not None:
         if "threshold_percent" in _params:
             _kwargs["threshold_percent"] = threshold_percent
     compressor.update_model(**_kwargs)
@@ -1679,6 +1697,10 @@ class _CodexCompletionsAdapter:
         timeout = kwargs.get("timeout")
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
+        # Per-request HTTP headers (OpenCode session affinity, Copilot
+        # x-initiator) map to real headers via the SDK kwarg — forward them.
+        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
+            resp_kwargs["extra_headers"] = dict(kwargs["extra_headers"])
 
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
         # support max_output_tokens or temperature — omit to avoid 400 errors.
@@ -2029,6 +2051,8 @@ class _CodexCompletionsAdapter:
                     total_tokens=getattr(resp_usage, "total_tokens", 0)
                         or (resp_usage.get("total_tokens", 0) if isinstance(resp_usage, dict) else 0),
                 )
+        except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+            raise
         except Exception as exc:
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc
@@ -2046,15 +2070,39 @@ class _CodexCompletionsAdapter:
             content=content,
             tool_calls=tool_calls_raw or None,
         )
+        response_status = _obj_get(final, "status")
+        incomplete_details = _obj_get(final, "incomplete_details")
+        final_finish_reason = _obj_get(final, "finish_reason") or _obj_get(
+            final, "stop_reason"
+        )
+        terminal_observed = _obj_get(final, "terminal_observed")
+        if terminal_observed is None:
+            terminal_observed = response_status in {
+                "completed",
+                "incomplete",
+                "failed",
+            } or final_finish_reason is not None
+        if tool_calls_raw:
+            finish_reason = "tool_calls"
+        elif response_status == "completed":
+            finish_reason = final_finish_reason or "stop"
+        elif response_status == "incomplete":
+            finish_reason = final_finish_reason or "length"
+        else:
+            finish_reason = final_finish_reason
         choice = SimpleNamespace(
             index=0,
             message=message,
-            finish_reason="stop" if not tool_calls_raw else "tool_calls",
+            finish_reason=finish_reason,
+            terminal_observed=bool(terminal_observed),
         )
         return SimpleNamespace(
             choices=[choice],
             model=model,
             usage=usage,
+            status=response_status,
+            incomplete_details=incomplete_details,
+            error=_obj_get(final, "error"),
         )
 
 
@@ -2094,8 +2142,8 @@ class _AsyncCodexCompletionsAdapter:
         self._sync = sync_adapter
 
     async def create(self, **kwargs) -> Any:
-        import asyncio
-        return await asyncio.to_thread(self._sync.create, **kwargs)
+        from ares_runtime.physical_dispatch import legacy_thread_bridge
+        return await legacy_thread_bridge(self._sync.create, kwargs, transport=type(self).__name__)
 
 
 class _AsyncCodexChatShim:
@@ -2248,6 +2296,13 @@ class _AnthropicCompletionsAdapter:
             from agent.anthropic_adapter import _forbids_sampling_params
             if not _forbids_sampling_params(model):
                 anthropic_kwargs["temperature"] = temperature
+        # Per-request HTTP headers (OpenCode session affinity) — the Anthropic
+        # SDK accepts ``extra_headers`` on messages.create/stream too.
+        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
+            anthropic_kwargs["extra_headers"] = {
+                **(anthropic_kwargs.get("extra_headers") or {}),
+                **kwargs["extra_headers"],
+            }
 
         # Pass through caller-supplied extra_body so providers behind
         # Anthropic-compatible gateways receive their per-vendor request
@@ -2371,8 +2426,8 @@ class _AsyncAnthropicCompletionsAdapter:
         self._sync = sync_adapter
 
     async def create(self, **kwargs) -> Any:
-        import asyncio
-        return await asyncio.to_thread(self._sync.create, **kwargs)
+        from ares_runtime.physical_dispatch import legacy_thread_bridge
+        return await legacy_thread_bridge(self._sync.create, kwargs, transport=type(self).__name__)
 
 
 class _AsyncAnthropicChatShim:
@@ -2472,8 +2527,8 @@ class _AsyncBedrockCompletionsAdapter:
         self._sync = sync_adapter
 
     async def create(self, **kwargs) -> Any:
-        import asyncio
-        return await asyncio.to_thread(self._sync.create, **kwargs)
+        from ares_runtime.physical_dispatch import legacy_thread_bridge
+        return await legacy_thread_bridge(self._sync.create, kwargs, transport=type(self).__name__)
 
 
 class _AsyncBedrockChatShim:
@@ -3498,6 +3553,23 @@ def _relay_auxiliary_metadata(
     }
 
 
+def _auxiliary_dispatch_context(payload, *, provider=None, api_mode=None):
+    # Observed context from existing owners, not invented session/materialization
+    # authority. A missing session remains missing for enforce-mode admission.
+    runtime = _RUNTIME_MAIN_CONTEXT.get() or {}
+    auxiliary = _RELAY_AUX_CALL_CONTEXT.get() or {}
+    return {
+        "session_id": runtime.get("session_id"),
+        "provider": provider or auxiliary.get("provider"),
+        "model": payload.get("model"),
+        "api_mode": api_mode or auxiliary.get("api_mode"),
+        "auxiliary_task": auxiliary.get("task"),
+        "purpose": ("background_summary" if auxiliary.get("task") in {
+            "compression", "title_generation", "session_search", "summary"} else
+            "synthesis" if auxiliary.get("task") == "moa_aggregator" else "specialist"),
+    }
+
+
 def _relay_sync_completion(
     client: Any,
     kwargs: dict[str, Any],
@@ -3506,7 +3578,11 @@ def _relay_sync_completion(
     api_mode: str | None = None,
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
-    callback = create or (lambda request: client.chat.completions.create(**request))
+    provider_callback = create or (lambda request: client.chat.completions.create(**request))
+    def callback(request):
+        from hermes_cli.middleware import run_llm_dispatch
+        return run_llm_dispatch(request, provider_callback,
+            **_auxiliary_dispatch_context(request, provider=provider, api_mode=api_mode))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
@@ -3534,7 +3610,11 @@ async def _relay_async_completion(
     api_mode: str | None = None,
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
-    callback = create or (lambda request: client.chat.completions.create(**request))
+    provider_callback = create or (lambda request: client.chat.completions.create(**request))
+    async def callback(request):
+        from hermes_cli.middleware import async_run_llm_dispatch
+        return await async_run_llm_dispatch(request, provider_callback,
+            **_auxiliary_dispatch_context(request, provider=provider, api_mode=api_mode))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return await callback(kwargs)
@@ -3558,15 +3638,19 @@ def _relay_sync_stream(
     provider: str | None = None,
     api_mode: str | None = None,
 ) -> Any:
+    def callback(request):
+        from hermes_cli.middleware import run_llm_dispatch
+        return run_llm_dispatch(request, lambda body: client.chat.completions.create(**body), stream=True,
+            **_auxiliary_dispatch_context(request, provider=provider, api_mode=api_mode))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
-        return client.chat.completions.create(**kwargs)
+        return callback(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return relay_llm.stream_current(
         kwargs,
-        lambda request: client.chat.completions.create(**request),
+        callback,
         name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model),
         finalizer=dict,
@@ -3623,6 +3707,7 @@ def set_runtime_main(
     auth_mode: str = "",
     session_id: str = "",
     cache_scope: str = "",
+    context_dispatch_required: bool = False,
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -3651,7 +3736,20 @@ def set_runtime_main(
         "auth_mode": (auth_mode or "").strip().lower(),
         "session_id": (session_id or "").strip(),
         "cache_scope": (cache_scope or "").strip(),
+        "context_dispatch_required": bool(context_dispatch_required),
     }
+    inherited = _RUNTIME_MAIN_CONTEXT.get()
+    if (
+        isinstance(inherited, dict)
+        and inherited.get("api_mode") == "codex_app_server"
+        and inherited.get("context_dispatch_required") is True
+    ):
+        runtime = {field: "" for field in _MAIN_RUNTIME_FIELDS}
+        runtime.update(
+            requested_provider="",
+            context_dispatch_required=True,
+        )
+        runtime.update(inherited)
     # Publish authoritative context before updating locked compatibility
     # mirrors; concurrent sessions never read those mirrors at runtime.
     token = _RUNTIME_MAIN_CONTEXT.set(runtime)
@@ -3686,6 +3784,13 @@ def reset_runtime_main(token: contextvars.Token) -> None:
 def scoped_runtime_main(main_runtime: Optional[Dict[str, Any]]):
     """Temporarily bind an explicit runtime without touching legacy mirrors."""
     runtime = _normalize_main_runtime(main_runtime)
+    inherited = _RUNTIME_MAIN_CONTEXT.get()
+    if (
+        isinstance(inherited, dict)
+        and inherited.get("api_mode") == "codex_app_server"
+        and inherited.get("context_dispatch_required") is True
+    ):
+        runtime = dict(inherited)
     token = _RUNTIME_MAIN_CONTEXT.set(runtime or None)
     try:
         yield runtime
@@ -4124,7 +4229,9 @@ _AUTO_PROVIDER_LABELS = {
 }
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
-_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider",)
+_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
+    "requested_provider", "context_dispatch_required",
+)
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -4153,6 +4260,9 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
         if field == "api_key" and callable(value) and not isinstance(value, str):
             normalized[field] = value
             continue
+        if field == "context_dispatch_required" and isinstance(value, bool):
+            normalized[field] = value
+            continue
         if isinstance(value, str) and value.strip():
             normalized[field] = value.strip()
     for identity_field in ("provider", "requested_provider"):
@@ -4160,6 +4270,30 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
         if isinstance(identity, str):
             normalized[identity_field] = identity.lower()
     return normalized
+
+
+def _ensure_auxiliary_context_qualified(
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Reject auxiliary provider dispatch for a required native trial context.
+
+    The continuity runtime owns the requirement; this context-local flag only
+    carries that decision across auxiliary APIs. An explicit runtime override
+    can add a requirement, but cannot clear one already bound to the turn.
+    """
+    ambient = _RUNTIME_MAIN_CONTEXT.get()
+    candidates = (ambient, main_runtime)
+    for runtime in candidates:
+        if not isinstance(runtime, dict):
+            continue
+        api_mode = str(runtime.get("api_mode") or "").strip().lower()
+        if (
+            api_mode == "codex_app_server"
+            and runtime.get("context_dispatch_required") is True
+        ):
+            from ares_runtime.continuity.runtime import ContextDispatchError
+
+            raise ContextDispatchError("CODEX_NATIVE_AUXILIARY_UNQUALIFIED")
 
 
 def _get_provider_chain() -> List[tuple]:
@@ -4707,6 +4841,16 @@ def _is_model_incompatible_error(exc: Exception) -> bool:
     ))
 
 
+class AuxiliaryIncompleteTerminalError(RuntimeError):
+    """A compression summary response lacked a completed final terminal.
+
+    The provider answered, but with ``length``/``content_filter``/incomplete/
+    failed/refused/tool-call output. That route cannot produce a usable
+    summary for this request, so it is fallback-worthy like any other
+    invalid auxiliary response.
+    """
+
+
 def _is_invalid_aux_response_error(exc: Exception) -> bool:
     """Detect provider responses that authenticated but cannot serve aux shape.
 
@@ -4716,6 +4860,8 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
     need ``choices[0].message`` and should be able to continue through the
     same fallback path as explicit model-incompatibility errors.
     """
+    if isinstance(exc, AuxiliaryIncompleteTerminalError):
+        return True
     if not isinstance(exc, RuntimeError):
         return False
     msg = str(exc).lower()
@@ -4959,7 +5105,7 @@ def _retry_same_provider_sync(
     # ``x-initiator: user``) across the rebuilt-client retry — dropping them
     # here would let a recovery retry silently lose capability gating (#60293).
     if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+        retry_kwargs["extra_headers"] = {**(retry_kwargs.get("extra_headers") or {}), **extra_headers}
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -5033,7 +5179,7 @@ async def _retry_same_provider_async(
     # Preserve per-request attribution headers across the rebuilt-client
     # retry — see the sync variant above (#60293).
     if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+        retry_kwargs["extra_headers"] = {**(retry_kwargs.get("extra_headers") or {}), **extra_headers}
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -5378,6 +5524,8 @@ def _call_fallback_candidate_sync(
             ),
             task,
         )
+    except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+        raise
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
@@ -5423,6 +5571,8 @@ def _call_fallback_candidate_sync(
                         ),
                         task,
                     )
+                except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                    raise
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
                         raise
@@ -5484,6 +5634,8 @@ async def _call_fallback_candidate_async(
             ),
             task,
         )
+    except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+        raise
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
@@ -5530,6 +5682,8 @@ async def _call_fallback_candidate_async(
                         ),
                         task,
                     )
+                except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                    raise
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
                         raise
@@ -6061,6 +6215,7 @@ def _resolve_auto_route(
     """
     global auxiliary_is_nous, _stale_base_url_warned
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
+    _ensure_auxiliary_context_qualified(main_runtime)
     runtime = _normalize_main_runtime(main_runtime)
     runtime_provider = runtime.get("provider", "")
     runtime_model = str(runtime.get("model") or "")
@@ -6362,7 +6517,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     # See _create_openai_client: disable SDK-internal retries so Hermes owns
     # the auxiliary retry/timeout budget (issue #54465).
     async_kwargs.setdefault("max_retries", 0)
-    return AsyncOpenAI(**async_kwargs), model
+    from ares_runtime.physical_dispatch import bind_inference_client
+    return bind_inference_client(AsyncOpenAI(**async_kwargs)), model
 
 
 def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optional[str]:
@@ -6419,6 +6575,7 @@ def resolve_provider_client(
     Returns:
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
+    _ensure_auxiliary_context_qualified(main_runtime)
     _validate_proxy_env_urls()
     # Preserve the original provider name before alias normalization so a
     # user-declared ``custom_providers`` entry whose name coincidentally
@@ -7153,7 +7310,8 @@ def resolve_provider_client(
             # proxy for every other branch of this function (breaking both the
             # Bedrock Mantle branch below and patch("agent.auxiliary_client.OpenAI")).
             from openai import OpenAI as _VertexOpenAI
-            client = _VertexOpenAI(api_key=token, base_url=base_url)
+            from ares_runtime.physical_dispatch import bind_inference_client
+            client = bind_inference_client(_VertexOpenAI(api_key=token, base_url=base_url))
         except Exception as exc:
             logger.warning("resolve_provider_client: cannot create Vertex "
                            "client: %s", exc)
@@ -7439,6 +7597,7 @@ def resolve_vision_provider_client(
     backends, so users can intentionally force experimental providers. Auto mode
     stays conservative and only tries vision backends known to work today.
     """
+    _ensure_auxiliary_context_qualified(main_runtime)
     runtime = _normalize_main_runtime(main_runtime)
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         "vision", provider, model, base_url, api_key
@@ -8081,6 +8240,7 @@ def _get_cached_client(
     preventing the fd-exhaustion that previously occurred in long-running
     gateways where recycled worker threads created unbounded entries (#10200).
     """
+    _ensure_auxiliary_context_qualified(main_runtime)
     # Resolve the current event loop for async clients so we can validate
     # cached entries.  Loop identity is NOT in the cache key — instead we
     # check at hit time whether the cached loop is still current and open.
@@ -8939,7 +9099,14 @@ def _build_call_kwargs(
         ):
             kwargs["_reasoning_config"] = dict(reasoning_config)
 
-    return kwargs
+    # Reuse the same rotation-stable scope as auxiliary Responses routing,
+    # falling back to the physical session when no cache scope is published.
+    from agent.opencode_affinity import merge_opencode_session_headers
+
+    return merge_opencode_session_headers(
+        kwargs, provider, base_url,
+        _runtime_main_value("cache_scope") or _runtime_main_value("session_id") or None,
+    )
 
 
 def _validate_llm_response(
@@ -8977,19 +9144,27 @@ def _validate_llm_response(
         if not choices or not hasattr(choices[0], "message"):
             raise AttributeError("missing choices[0].message")
     except (AttributeError, TypeError, IndexError) as exc:
-        recovered = _recover_aux_response_message(response)
+        recovered = _recover_aux_response_message(
+            response, require_completed_terminal=(task == "compression")
+        )
         if recovered is not None:
-            _record_relay_auxiliary_response_model(response)
-            _complete_relay_auxiliary_call()
-            return recovered
-        response_type = type(response).__name__
-        response_preview = str(response)[:120]
-        raise RuntimeError(
-            f"Auxiliary {task or 'call'}: LLM returned invalid response "
-            f"(type={response_type}): {response_preview!r}. "
-            f"Expected object with .choices[0].message — check provider "
-            f"adapter or custom endpoint compatibility."
-        ) from exc
+            response = recovered
+        else:
+            response_type = type(response).__name__
+            response_preview = str(response)[:120]
+            raise RuntimeError(
+                f"Auxiliary {task or 'call'}: LLM returned invalid response "
+                f"(type={response_type}): {response_preview!r}. "
+                f"Expected object with .choices[0].message — check provider "
+                f"adapter or custom endpoint compatibility."
+            ) from exc
+    if task == "compression" and not _auxiliary_response_has_completed_terminal(
+        response
+    ):
+        raise AuxiliaryIncompleteTerminalError(
+            "Auxiliary compression response did not prove a completed final "
+            "terminal; refusing to use partial summary text"
+        )
     _record_relay_auxiliary_response_model(response)
     _complete_relay_auxiliary_call()
     return response
@@ -9035,32 +9210,75 @@ def _fail_relay_auxiliary_call() -> None:
         )
 
 
-def _recover_aux_response_message(response: Any) -> Optional[Any]:
-    """Synthesize chat-completions shape from Responses-style text fields.
+def _recover_aux_response_message(
+    response: Any, *, require_completed_terminal: bool = False
+) -> Optional[Any]:
+    """Synthesize a chat-completions shape without erasing terminal evidence.
 
-    Auxiliary callers consume ``choices[0].message``.  Some compatible
-    endpoints return text outside ``choices`` (for example ``output_text`` or
-    ``output`` items).  Preserve that response before declaring it malformed.
+    Auxiliary callers consume ``choices[0].message``. Some compatible
+    endpoints return text outside ``choices``. For checkpoint callers, preserve
+    typed Responses status and an explicit indication of whether a terminal was
+    actually observed; a nonempty text field alone is not completion evidence.
     """
     text = _extract_aux_response_text(response)
     if not text:
         return None
 
+    status = _obj_get(response, "status")
+    raw_finish_reason = _obj_get(response, "finish_reason") or _obj_get(
+        response, "stop_reason"
+    )
+    if _obj_get(response, "terminal_observed") is False:
+        # A raw stream final reports ``status="completed"`` as a compatibility
+        # value after EOF; its explicit witness says no terminal was seen.
+        finish_reason = raw_finish_reason or (
+            None if require_completed_terminal else "stop"
+        )
+        terminal_observed = False
+    elif status == "completed":
+        finish_reason = raw_finish_reason or "stop"
+        terminal_observed = True
+    elif raw_finish_reason:
+        finish_reason = raw_finish_reason
+        terminal_observed = True
+    elif status is not None:
+        # Preserve incomplete/failed/unknown status; do not translate it to stop.
+        finish_reason = None
+        terminal_observed = True
+    elif require_completed_terminal:
+        finish_reason = None
+        terminal_observed = False
+    else:
+        # Non-checkpoint callers retain the historical shape, while a private
+        # witness prevents this compatibility sentinel becoming summary proof.
+        finish_reason = "stop"
+        terminal_observed = False
+
     choice = SimpleNamespace(
         message=SimpleNamespace(content=text),
-        finish_reason=getattr(response, "finish_reason", None) or "stop",
+        finish_reason=finish_reason,
+        terminal_observed=terminal_observed,
     )
     try:
         response.choices = [choice]
         return response
     except Exception:
-        return SimpleNamespace(
-            id=getattr(response, "id", ""),
-            model=getattr(response, "model", ""),
-            object=getattr(response, "object", "chat.completion"),
+        recovered = SimpleNamespace(
+            id=_obj_get(response, "id", ""),
+            model=_obj_get(response, "model", ""),
+            object=_obj_get(response, "object", "chat.completion"),
             choices=[choice],
-            usage=getattr(response, "usage", None),
+            usage=_obj_get(response, "usage"),
         )
+        if status is not None:
+            recovered.status = status
+        incomplete_details = _obj_get(response, "incomplete_details")
+        if incomplete_details is not None:
+            recovered.incomplete_details = incomplete_details
+        error = _obj_get(response, "error")
+        if error is not None:
+            recovered.error = error
+        return recovered
 
 
 def _extract_aux_response_text(response: Any) -> str:
@@ -9091,6 +9309,35 @@ def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
     if value is default and isinstance(obj, dict):
         value = obj.get(key, default)
     return value
+
+
+def _auxiliary_response_has_completed_terminal(response: Any) -> bool:
+    """Prove an auxiliary text response is a completed, final text result.
+
+    This gate is used only for summary/checkpoint admission. Ordinary
+    conversation-loop partial-stream continuation keeps its existing contract.
+    """
+    status = _obj_get(response, "status")
+    if _obj_get(response, "error") is not None:
+        return False
+    if status is not None and status != "completed":
+        return False
+    if _obj_get(response, "incomplete_details") is not None:
+        return False
+    choices = _obj_get(response, "choices")
+    if not choices:
+        return False
+    choice = choices[0]
+    if _obj_get(choice, "terminal_observed", True) is False:
+        return False
+    if _obj_get(choice, "finish_reason") not in {"stop", "end_turn"}:
+        return False
+    message = _obj_get(choice, "message")
+    if message is None or _obj_get(message, "tool_calls"):
+        return False
+    if _obj_get(message, "refusal"):
+        return False
+    return True
 
 
 # ── Streamed aggregation for progress-hooked auxiliary calls ─────────────
@@ -9220,6 +9467,8 @@ def _create_with_progress(
     stream_kwargs["stream_options"] = {"include_usage": True}
     try:
         chunks = client.chat.completions.create(**stream_kwargs)
+    except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+        raise
     except Exception as exc:
         # Genuine provider failures (auth, credit, rate limit, network) are
         # not streaming's fault — surface them unchanged so the existing
@@ -9371,6 +9620,9 @@ class _ChatStreamAccumulator:
             index=0,
             message=message,
             finish_reason=self.finish_reason or "stop",
+            # Keep the historical chat-facing sentinel; compression summary
+            # admission separately requires that a terminal chunk was seen.
+            terminal_observed=self.finish_reason is not None,
         )
         return SimpleNamespace(
             id=self.resp_id,
@@ -9456,6 +9708,7 @@ def call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
+    _ensure_auxiliary_context_qualified(main_runtime)
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
         semaphore.acquire()
@@ -9564,6 +9817,7 @@ def _call_llm_impl(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    _ensure_auxiliary_context_qualified(main_runtime)
     # Capture one immutable runtime snapshot for keying, resolution, retries,
     # and fallbacks. Reading ambient state independently in each phase lets a
     # concurrent /model switch produce a key for one runtime and a client for
@@ -9684,7 +9938,7 @@ def _call_llm_impl(
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
     if extra_headers:
-        kwargs["extra_headers"] = dict(extra_headers)
+        kwargs["extra_headers"] = {**(kwargs.get("extra_headers") or {}), **extra_headers}
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
@@ -9712,7 +9966,9 @@ def _call_llm_impl(
             # Return the provider call directly; the MoA facade converts a
             # completed response into a one-chunk delta iterator at its
             # boundary.
-            return client.chat.completions.create(**kwargs)
+            return _relay_sync_completion(
+                client, kwargs, provider=request_provider, api_mode=resolved_api_mode,
+            )
         return _relay_sync_stream(
             client,
             kwargs,
@@ -9757,6 +10013,8 @@ def _call_llm_impl(
                 ),
                 task,
                 provider=request_provider, base_url=_base_info)
+        except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+            raise
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
@@ -9804,12 +10062,16 @@ def _call_llm_impl(
                             ),
                         ),
                         task)
+                except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                    raise
                 except Exception as retry_transient:
                     if not _is_transient_transport_error(retry_transient):
                         raise
                     _last_transient = retry_transient
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
+    except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+        raise
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -9826,6 +10088,8 @@ def _call_llm_impl(
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
                     ), task)
+            except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                raise
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 # If retry still fails, fall through to the max_tokens /
@@ -9860,6 +10124,8 @@ def _call_llm_impl(
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
                         ), task)
+                except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                    raise
                 except Exception as retry_err:
                     # Same contract as the temperature rung: fall through to
                     # the max_tokens / payment / auth chains below with the
@@ -9902,6 +10168,8 @@ def _call_llm_impl(
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
                     ), task)
+            except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                raise
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -9937,6 +10205,8 @@ def _call_llm_impl(
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
                         ), task)
+                except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                    raise
                 except Exception as retry_err:
                     first_err = retry_err
 
@@ -9975,6 +10245,8 @@ def _call_llm_impl(
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
                         ), task)
+                except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                    raise
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
@@ -10063,6 +10335,8 @@ def _call_llm_impl(
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
                         ), task)
+                except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                    raise
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
@@ -10091,6 +10365,8 @@ def _call_llm_impl(
                         reasoning_config=reasoning_config,
                         extra_headers=extra_headers,
                     )
+                except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                    raise
                 except Exception as retry2_err:
                     # The rotated key also hit a quota/auth wall.  Mark it
                     # immediately so concurrent processes don't make a
@@ -10345,6 +10621,7 @@ async def async_call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
+    _ensure_auxiliary_context_qualified(main_runtime)
     semaphore = _acquire_async_aux_semaphore(task)
     if semaphore is not None:
         await semaphore.acquire()
@@ -10391,6 +10668,7 @@ async def _async_call_llm_impl(
 
     Same as call_llm() but async. See call_llm() for full documentation.
     """
+    _ensure_auxiliary_context_qualified(main_runtime)
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
@@ -10532,6 +10810,8 @@ async def _async_call_llm_impl(
                 ),
                 task,
                 provider=request_provider, base_url=_client_base)
+        except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+            raise
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
@@ -10559,6 +10839,8 @@ async def _async_call_llm_impl(
                     create=_acreate,
                 ),
                 task)
+    except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+        raise
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -10575,6 +10857,8 @@ async def _async_call_llm_impl(
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
                     ), task)
+            except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                raise
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 if not (
@@ -10606,6 +10890,8 @@ async def _async_call_llm_impl(
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
                         ), task)
+                except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                    raise
                 except Exception as retry_err:
                     # Same contract as the temperature rung: fall through to
                     # the max_tokens / payment / auth chains below with the
@@ -10648,6 +10934,8 @@ async def _async_call_llm_impl(
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
                     ), task)
+            except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                raise
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -10682,6 +10970,8 @@ async def _async_call_llm_impl(
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
                         ), task)
+                except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                    raise
                 except Exception as retry_err:
                     first_err = retry_err
 
@@ -10719,6 +11009,8 @@ async def _async_call_llm_impl(
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
                         ), task)
+                except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                    raise
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
@@ -10800,6 +11092,8 @@ async def _async_call_llm_impl(
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
                         ), task)
+                except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                    raise
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
@@ -10826,6 +11120,8 @@ async def _async_call_llm_impl(
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
                     )
+                except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                    raise
                 except Exception as retry2_err:
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                             or _is_rate_limit_error(retry2_err)):

@@ -2355,6 +2355,8 @@ export interface Translations {
   }
 
   modelPicker: {
+    selectionUnavailable: string
+    sessionSelection: string
     title: string
     current: string
     unknown: string
@@ -2807,6 +2809,7 @@ export interface Translations {
       sendFailed: string
       responseExpired: string
       responseUncertain: string
+      responseAccepted: string
       responseRejected: string
       loadingQuestion: string
       other: string
@@ -2930,6 +2933,9 @@ export interface Translations {
     setProfileFailed: string
     sttDisabled: string
     stopFailed: string
+    stopNotSent: string
+    stopAlreadySettled: string
+    stopUnconfirmed: string
     regenerateFailed: string
     editFailed: string
     editTurnUnavailable: string

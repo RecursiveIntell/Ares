@@ -1,3 +1,4 @@
+/* eslint-disable no-restricted-globals -- actual DOM focus is the regression contract */
 import { act, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -93,8 +94,8 @@ vi.mock('./buffer', () => ({
   registerTerminalReader: terminalRegistrations.registerReader
 }))
 
-function Harness() {
-  const { hostRef } = useAgentTerminal({ active: false, id: 'agent-tab', procId: 'proc-1' })
+function Harness({ active = false }: { active?: boolean }) {
+  const { hostRef } = useAgentTerminal({ active, id: 'agent-tab', procId: 'proc-1' })
 
   return <div ref={hostRef} />
 }
@@ -132,6 +133,43 @@ describe('useAgentTerminal', () => {
     vi.clearAllMocks()
     vi.unstubAllGlobals()
     Reflect.deleteProperty(globalThis.document, 'fonts')
+  })
+
+  it('async agent-terminal activation must not steal an already-focused prompt', async () => {
+    const frames: FrameRequestCallback[] = []
+    vi.stubGlobal('requestAnimationFrame', (fn: FrameRequestCallback) => {
+      frames.push(fn)
+
+      return frames.length
+    })
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+    const prompt = document.createElement('input')
+    prompt.id = 'prompt-witness'
+    const terminalInput = document.createElement('textarea')
+    terminalInput.id = 'terminal-witness'
+    document.body.append(prompt, terminalInput)
+    xterm.focus.mockImplementation(() => terminalInput.focus())
+    const { rerender, unmount } = render(<Harness />)
+    await waitFor(() => expect(document.fonts.load).toHaveBeenCalled())
+    await act(async () => {
+      resolveFontLoad([])
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(xterm.open).toHaveBeenCalledOnce())
+    prompt.focus()
+    expect(document.activeElement).toBe(prompt)
+    rerender(<Harness active />)
+    act(() => {
+      while (frames.length) {
+        frames.shift()!(0)
+      }
+    })
+    const observed = document.activeElement?.id
+    console.log('WITNESS asynchronous terminal activation focus target:', observed)
+    unmount()
+    prompt.remove()
+    terminalInput.remove()
+    expect(observed).toBe('prompt-witness')
   })
 
   it('unmounts safely while initial font preparation is pending', async () => {

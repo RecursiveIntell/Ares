@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { assertFixturePoll, fixtureAdmission, fixtureProjection } from './group-turn-wire-fixture.mjs'
 import vm from 'node:vm'
 
 // #91868/#94569: a REAL stop path for group-chat rounds. Before
@@ -15,9 +16,9 @@ import vm from 'node:vm'
 const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
 /** Harness mirroring group-turn-lease.test.mjs: run plugin.js in a vm with a
- *  scripted gateway. `busyPolls` makes session.resume report the member as
+ *  scripted gateway. `busyPolls` makes session.turn.poll report the member as
  *  inflight for the first N polls, so a stop can land mid-turn. */
-function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}) {
+function load({ reply = 'long answer', busyPolls = 0, onTurnPoll = null } = {}) {
   const values = new Map()
   const atom = initial => {
     const slot = { get: () => values.get(slot), set: value => values.set(slot, value) }
@@ -30,7 +31,7 @@ function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}
   const titleToStored = new Map()
   let sessionSequence = 0
   const rpcLog = []
-  let resumePolls = 0
+  let turnPolls = 0
 
   const resolveSession = (profile, target) =>
     (stored => (stored ? sessions.get(stored) : null))(
@@ -51,7 +52,7 @@ function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}
       return { session_id: runtime, stored_session_id: stored, message_count: 0, messages: [] }
     }
 
-    if (method === 'session.resume') {
+    if (method === 'session.resume' || method === 'session.turn.poll') {
       const session = resolveSession(params.profile, params.session_id)
 
       if (!session) {
@@ -60,23 +61,26 @@ function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}
         throw err
       }
 
-      sessionSequence += 1
-      const runtime = `rt-${sessionSequence}`
-      session.runtime = runtime
-      runtimeToStored.set(runtime, session.stored)
+      if (!session.accepted_turn) {
+        sessionSequence += 1
+        session.runtime = `rt-${sessionSequence}`
+        runtimeToStored.set(session.runtime, session.stored)
+      }
+      const runtime = session.runtime
+      if (method === 'session.turn.poll') assertFixturePoll(session, params)
 
       // Post-submit polls: stay "busy" for the first `busyPolls` polls so a
-      // stop can land mid-turn, then settle. `onResumePoll` lets a test fire
+      // stop can land mid-turn, then settle. `onTurnPoll` lets a test fire
       // the stop from inside the poll cadence.
       const submitted = session.messages.length > 0
       let busy = false
 
       if (submitted) {
-        resumePolls += 1
-        busy = resumePolls <= busyPolls
+        turnPolls += 1
+        busy = turnPolls <= busyPolls
 
-        if (typeof onResumePoll === 'function') {
-          onResumePoll(resumePolls)
+        if (typeof onTurnPoll === 'function') {
+          onTurnPoll(turnPolls)
         }
       }
 
@@ -85,6 +89,7 @@ function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}
         session_key: session.stored,
         message_count: busy ? 0 : session.messages.length,
         messages: busy ? [] : [...session.messages],
+        turn_outcomes: fixtureProjection(session, { state: busy ? 'running' : 'complete' }),
         inflight: busy,
         running: false
       }
@@ -101,11 +106,12 @@ function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}
 
       session.messages.push({ role: 'user', content: params.text })
       session.messages.push({ role: 'assistant', content: reply })
-      return {}
+      session.finalized = [{ text: reply, status: 'complete' }]
+      return { accepted_turn: fixtureAdmission(session, `owned-${session.runtime}`) }
     }
 
     if (method === 'session.interrupt') {
-      return { interrupted: true }
+      return { status: 'interrupted' }
     }
 
     return {}
@@ -218,21 +224,25 @@ test('stopGroupThread with nobody on turn stops the room without any interrupt R
   assert.equal(gc.$groupChats.get().Room.epoch, 4)
 })
 
-test('stopGroupThread records a stopped activity event visible in the CURRENT run', async () => {
+test('stopGroupThread records an honest legacy stop-unconfirmed event in the CURRENT run', async () => {
   const gc = load()
   seedRoom(gc)
 
   await gc.stopGroupThread('Room', 't1', MEMBERS)
 
   const events = gc.currentGroupActivity('Room')
-  const stopped = events.find(event => event.kind === 'stopped')
+  const stopped = events.find(event => event.kind === 'stop-unconfirmed')
   assert.ok(stopped, 'stopped event is tagged with the POST-bump epoch, so it survives the epoch filter')
   assert.equal(stopped.member, 'You')
   assert.equal(stopped.thread, 't1')
   // The label comes from the shared GROUP_ACTIVITY_LABELS map (the plugin's
   // label pattern) — and stays plain English, no hardcoded localized text.
-  assert.ok(gc.GROUP_ACTIVITY_LABELS.stopped)
-  assert.ok(gc.GROUP_ACTIVITY_GLYPHS.stopped)
+  assert.ok(gc.GROUP_ACTIVITY_LABELS['stop-unconfirmed'])
+  assert.ok(gc.GROUP_ACTIVITY_GLYPHS['stop-unconfirmed'])
+  const idle = load()
+  seedRoom(idle, { turn: null })
+  assert.equal((await idle.stopGroupThread('Room', 't1', MEMBERS)).status, 'stopped')
+  assert.ok(idle.currentGroupActivity('Room').some(event => event.kind === 'stopped' && event.epoch === 4))
 })
 
 test('stopGroupThread falls back to the durable room roster when called without members', async () => {
@@ -250,7 +260,7 @@ test('poll loop abandons an in-flight turn once a stop bumps the epoch and holds
   let gcRef = null
   const gc = load({
     busyPolls: 50,
-    onResumePoll: polls => {
+    onTurnPoll: polls => {
       // Fire the stop from inside the poll cadence, after the second
       // busy poll — exactly the mid-turn click the Stop button produces.
       if (polls === 2) {
@@ -263,8 +273,8 @@ test('poll loop abandons an in-flight turn once a stop bumps the epoch and holds
   const reply = await gc.runGroupChatMemberTurn('Room', { name: 'helper', title: '' }, 'long task', 't1', [])
 
   assert.equal(reply, null, 'abandoned turn yields no reply')
-  const postStopPolls = gc.calls('session.resume').length
-  assert.ok(postStopPolls <= 6, `poll loop exited promptly after the stop, not at the deadline (${postStopPolls} resumes)`)
+  const postStopPolls = gc.calls('session.turn.poll').length
+  assert.ok(postStopPolls <= 6, `poll loop exited promptly after the stop, not at the deadline (${postStopPolls} polls)`)
   assert.equal(gc.$groupChats.get().Room.running, false)
 })
 
@@ -273,7 +283,7 @@ test('an ordinary newer-send epoch bump WITHOUT a hold does not abandon the poll
   const gc = load({
     reply: 'finished anyway',
     busyPolls: 3,
-    onResumePoll: polls => {
+    onTurnPoll: polls => {
       if (polls === 1) {
         // A newer user send bumps the epoch but holds nobody. The in-flight
         // poll must keep going so the finished reply can still be delivered
@@ -294,8 +304,10 @@ test('an ordinary newer-send epoch bump WITHOUT a hold does not abandon the poll
 
 test('Stop button: workspace renders it while the room is running and wires it to stopGroupThread', () => {
   const workspace = pluginSource.slice(pluginSource.indexOf('function GroupChatWorkspace'))
-  // Visible while a round is running…
-  assert.match(workspace, /room\.running\s*\?\s*jsx\('button'/, 'Stop button is gated on room.running')
+  assert.match(workspace, /groupRoomCanStop\(room, roomClarifies\)\s*\?\s*jsx\('button'/, 'Stop button uses the shared room custody predicate')
+  const predicate = pluginSource.slice(pluginSource.indexOf('function groupRoomCanStop'), pluginSource.indexOf('function captureGroupDrive'))
+  assert.match(predicate, /room\?\.running \|\| clarifies\.length \|\| room\?\.turns\?\.length/, 'running work, question cards and pending turns expose Stop')
+  assert.match(predicate, /Object\.values\(room\?\.stranded \|\| \{\}\)\.some\(marker => groupTurnDeliveryKey\(marker\?\.delivery\)\)/, 'durable accepted custody also exposes Stop')
   // …and wired to the real primitive, not a per-member interrupt spray.
   assert.match(workspace, /stopGroupThread\(/, 'button calls the stopGroupThread primitive')
   assert.doesNotMatch(workspace, /stopAllBots/, 'the #94570 interrupt-only shell was rewired, not kept')

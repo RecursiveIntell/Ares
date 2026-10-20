@@ -48,6 +48,7 @@
     "fix": "npm run lint:fix && npm run fmt",
     "test:ui": "cross-env NODE_ENV=test vitest run --project ui",
     "test:desktop:platforms": "cross-env NODE_ENV=test vitest run --project electron",
+    "test:desktop:native": "cross-env NODE_ENV=test vitest run --project native-security",
     "test": "cross-env NODE_ENV=test vitest run",
     "preview": "node scripts/assert-root-install.mjs && vite preview --host 127.0.0.1 --port 4174",
     "check:test:desktop:platforms": "npm run test:desktop:platforms",
@@ -137,7 +138,8 @@
     "unist-util-visit-parents": "^6.0.2",
     "use-stick-to-bottom": "^1.1.6",
     "vfile": "^6.0.3",
-    "web-haptics": "^0.0.6"
+    "web-haptics": "^0.0.6",
+    "ws": "8.22.0"
   },
   "devDependencies": {
     "@babel/core": "8.0.1",
@@ -157,7 +159,7 @@
     "bippy": "0.5.43",
     "concurrently": "10.0.4",
     "cross-env": "10.1.0",
-    "electron": "41.10.3",
+    "electron": "41.10.6",
     "electron-builder": "^26.8.1",
     "esbuild": "^0.28.1",
     "eslint": "^9.39.4",
@@ -176,7 +178,7 @@
     "wait-on": "^9.0.5"
   },
   "build": {
-    "electronVersion": "41.10.3",
+    "electronVersion": "41.10.6",
     "appId": "com.recursiveintell.ares",
     "productName": "Ares",
     "executableName": "Ares",

@@ -135,6 +135,7 @@ class ProfileSecretScope(Mapping[str, str]):
     generation: str
     source_status: str
     digest: str
+    allow_environment_fallback: bool = True
 
     def __getitem__(self, key: str) -> str:
         return self.data[key]
@@ -204,7 +205,10 @@ def _immutable_scope(
     profile_home: Path | None,
     source_status: str,
     external_generation: int = 0,
+    allow_environment_fallback: bool = True,
 ) -> ProfileSecretScope:
+    if not allow_environment_fallback:
+        source_status += ";ambient:excluded"
     copied = {str(key): str(value) for key, value in values.items()}
     generation, digest = _scope_generation(
         profile_home,
@@ -219,6 +223,7 @@ def _immutable_scope(
         generation=generation,
         source_status=source_status,
         digest=digest,
+        allow_environment_fallback=allow_environment_fallback,
     )
 
 
@@ -352,7 +357,7 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
         val = scope.get(name)
         if val is not None:
             return val
-        if _MULTIPLEX_ACTIVE:
+        if _MULTIPLEX_ACTIVE or not scope.allow_environment_fallback:
             return default
         # Multiplex off: the scope is an overlay over the process environment,
         # not an isolation boundary — there is no other profile to leak from.
@@ -604,6 +609,7 @@ def build_profile_secret_scope(
     hermes_home: Path,
     *,
     fail_closed_external: bool = False,
+    allow_environment_fallback: bool = True,
 ) -> ProfileSecretScope:
     """Build a profile's secret mapping from its ``.env`` and optional ``.op.env``.
 
@@ -656,7 +662,7 @@ def build_profile_secret_scope(
             continue
         secrets[key] = value
 
-    return _immutable_scope(
+    scope = _immutable_scope(
         secrets,
         profile_home=home,
         source_status=(
@@ -664,7 +670,21 @@ def build_profile_secret_scope(
             f"external:{external_snapshot.status}"
         ),
         external_generation=int(external_snapshot.generation),
+        allow_environment_fallback=allow_environment_fallback,
     )
+
+    # A successful capture is an ownership observation, even if its dotenv or
+    # external declarations disappear before the first ownership enumeration.
+    # Include only captured profile authority, preserving admitted root grants
+    # and excluding unrelated shell state and direct process-global settings.
+    # Publish after immutable construction succeeds so a failed capture cannot
+    # partially add grants to the monotonic history.
+    observed_names = {name for name in scope.owned_names if not _is_global_env(name)}
+    if observed_names:
+        history_key = str(scope.profile_home)
+        with _PROFILE_OWNED_NAME_HISTORY_LOCK:
+            _PROFILE_OWNED_NAME_HISTORY.setdefault(history_key, set()).update(observed_names)
+    return scope
 
 
 @dataclass(frozen=True)
@@ -766,8 +786,9 @@ def get_profile_owned_secret_names(
 ) -> frozenset[str]:
     """Return exact secret names owned by one profile, without reading values.
 
-    The profile's dotenv files and the external-source provenance snapshot are
-    the ownership sources. Ordinary shell exports are intentionally excluded:
+    The profile's dotenv files, external-source provenance snapshot and
+    explicitly admitted root underlay are the ownership sources.
+    Ordinary shell exports are intentionally excluded:
     they are user/process state, not profile-owned credentials.
     """
     home = Path(hermes_home)
@@ -789,6 +810,12 @@ def get_profile_owned_secret_names(
             )
     observed_names = set(op_snapshot.data)
     observed_names.update(env_snapshot.data)
+    observed_names.update(
+        _root_profile_fallback_secrets(
+            home,
+            fail_closed_external=fail_closed_external,
+        )
+    )
     observed_names.update(
         _profile_external_secret_values(
             home,

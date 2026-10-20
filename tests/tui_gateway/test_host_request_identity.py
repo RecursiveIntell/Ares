@@ -46,7 +46,7 @@ def test_reused_rpc_id_gets_distinct_host_identity(monkeypatch):
 def supervisor_fixture(tmp_path, monkeypatch):
     supervisor = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
     frames = []
-    monkeypatch.setattr(supervisor, "start", lambda: None)
+    monkeypatch.setattr(supervisor, "is_ready", lambda: True)
     monkeypatch.setattr(supervisor, "_send_frame", lambda frame, **_kwargs: frames.append(frame))
     return supervisor, frames
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import os
+import stat
 from typing import Any
 
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
@@ -13,6 +15,7 @@ from hermes_cli.proxy.server import (
     DEFAULT_HOST,
     DEFAULT_PORT,
     run_server,
+    validate_bind,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,6 +37,27 @@ def cmd_proxy_start(args: Any) -> int:
         _print_aiohttp_missing()
         return 1
 
+    host = getattr(args, "host", None) or DEFAULT_HOST
+    port = getattr(args, "port", None) or DEFAULT_PORT
+    client_token = None
+    try:
+        token_file = getattr(args, "client_token_file", None)
+        if token_file:
+            fd = os.open(token_file, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_size > 4096:
+                    raise ValueError("Client credential file must be private and bounded")
+                if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                    raise ValueError("Client credential file must belong to the current user")
+                client_token = os.read(fd, 4096).decode("utf-8").strip()
+            finally:
+                os.close(fd)
+        validate_bind(host, client_token)
+    except (OSError, ValueError, UnicodeError):
+        print("Proxy bind denied: use loopback or a private --client-token-file with a distinct credential (32+ characters).", file=sys.stderr)
+        return 2
+
     provider = getattr(args, "provider", None) or "nous"
     try:
         adapter = get_adapter(provider)
@@ -50,21 +74,18 @@ def cmd_proxy_start(args: Any) -> int:
         )
         return 2
 
-    host = getattr(args, "host", None) or DEFAULT_HOST
-    port = getattr(args, "port", None) or DEFAULT_PORT
-
     print(
         f"Starting Hermes proxy for {adapter.display_name}\n"
         f"  Listening on:  http://{host}:{port}/v1\n"
         f"  Forwarding to: (resolved per-request from your subscription)\n"
-        f"  Use any bearer token in the client — the proxy attaches your real credential.\n"
+        f"  Client auth: {'distinct bearer required' if client_token else 'loopback native clients only'}.\n"
         f"\n"
         f"Press Ctrl+C to stop.",
         file=sys.stderr,
     )
 
     try:
-        asyncio.run(run_server(adapter, host=host, port=port))
+        asyncio.run(run_server(adapter, host=host, port=port, client_token=client_token))
     except KeyboardInterrupt:
         print("\nproxy: stopped", file=sys.stderr)
     except OSError as exc:

@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 
 import { useI18n } from '@/i18n'
-import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import { modelOptionsQueryKey, requestModelOptions, selectionUnavailable } from '@/lib/model-options'
 import { modelSearchText } from '@/lib/model-search-text'
 import { currentPickerSelection } from '@/lib/model-status-label'
 import { normalize } from '@/lib/text'
@@ -20,12 +20,16 @@ import { HighlightMatches } from './ui/highlight-matches'
 import { Skeleton } from './ui/skeleton'
 
 interface ModelPickerDialogProps {
+  connectionId?: null | string
+  request?: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   open: boolean
   onOpenChange: (open: boolean) => void
   gw?: HermesGateway
   sessionId?: string | null
   currentModel: string
   currentProvider: string
+  /** An owner-qualified receipt can contain a scalar model without a provider. */
+  selectionIsAuthoritative?: boolean
   onSelect: (selection: { provider: string; model: string }) => void
   profile?: string
   /**
@@ -38,12 +42,15 @@ interface ModelPickerDialogProps {
 }
 
 export function ModelPickerDialog({
+  connectionId,
+  request,
   open,
   onOpenChange,
   gw,
   sessionId,
   currentModel,
   currentProvider,
+  selectionIsAuthoritative = false,
   onSelect,
   profile = 'default',
   contentClassName
@@ -58,15 +65,15 @@ export function ModelPickerDialog({
   const [search, setSearch] = useState('')
 
   const modelOptions = useQuery({
-    queryKey: modelOptionsQueryKey(profile, sessionId),
-    queryFn: () => requestModelOptions({ gateway: gw, sessionId }),
+    queryKey: modelOptionsQueryKey(profile, sessionId, connectionId),
+    queryFn: () => requestModelOptions({ connectionId, gateway: gw, profile, request, sessionId }),
     enabled: open
   })
 
   const providers = modelOptions.data?.providers ?? []
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
-    { model: currentModel, provider: currentProvider },
+    { model: currentModel, provider: currentProvider, authoritative: selectionIsAuthoritative },
     modelOptions.data
   )
 
@@ -105,6 +112,17 @@ export function ModelPickerDialog({
             {optionsProvider || currentProvider ? ` · ${optionsProvider || currentProvider}` : ''}
           </DialogDescription>
         </DialogHeader>
+
+        {modelOptions.data && selectionUnavailable(modelOptions.data.providers, optionsProvider, optionsModel) && (
+          <div className="px-4 py-2 text-xs text-(--ui-text-secondary)" role="status">
+            {copy.selectionUnavailable}
+          </div>
+        )}
+        {sessionId && (
+          <div className="px-4 py-2 text-xs text-(--ui-text-secondary)" role="status">
+            {copy.sessionSelection}
+          </div>
+        )}
 
         <Command className="rounded-none bg-card" shouldFilter={false}>
           <CommandInput autoFocus onValueChange={setSearch} placeholder={copy.search} value={search} />

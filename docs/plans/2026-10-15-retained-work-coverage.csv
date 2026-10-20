@@ -1,0 +1,242 @@
+namespace,id,definition,original_owner_task,completion_cards,reconciliation_phases,disposition,result_claim
+inherited_case,A01,source/plan binding,0.1,C00,R0,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A02,workspace shadow/import denial,0.1,C00,R0,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A03,credential-neutral fixture admission,0.1,C00,R0,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A04,units/zero/unknown,0.2,C01;C08,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A05,sibling event ownership,0.2,C01;C08,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A06,cycle/orphan/prerequisite rejection,0.2,C01;C08,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A07,required non-pass/stale receipt cannot activate,0.2,C01;C08,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A08,OpenRouter+TokenRouter,1.1,C08;C09,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A09,opaque case/credentials/API mode,1.1,C08;C09,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A10,aux/direct route preservation,1.1,C08;C09,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A11,mixed grouping/search,1.2,C08;C09;C12,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A12,explicit hide/reorder/migration,1.2,C08;C09;C12,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A13,restart+refresh,1.2,C08;C09;C12,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A14,cold/offline/foreign scope/delist,1.2,C08;C09;C12,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A15,fallback drift,1.2,C08;C09;C12,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A16,malformed/nonmapping/I/O/missing-authority,2.1,C08;C12,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A17,root/named/managed remap and forbidden keys,2.1,C08;C12,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A18,profile/registry epoch race,2.1,C08;C12,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A19,copy/compile scaling and same-fixture behavior,2.1,C08;C12,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A20,UTF8/UTF16/CRLF/BOM/binary/newline,2.2,C08;C12,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A21,large/minified/truncated/count deadline,2.2,C08;C12,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A22,special/path/CWD/redaction guards,2.2,C08;C12,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A23,writer race and remote parity,2.2,C08;C12,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A24,print-before-tool/kill,2.3,C05;C08,R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A25,output/redaction caps,2.3,C05;C08,R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A26,nested serial budget/owned RPC settlement,2.3,C05;C08,R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A27,cold/repeat failure bound,2.4,C08,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A28,root/version recovery,2.4,C08,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A29,syntax and real diagnostics,2.4,C08,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A30,finite/disabled/invalid/nonfinite grammar,3.1,C04;C08,R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A31,child-error vs cutoff order,3.1,C04;C08,R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A32,init/first/schema repair remaining budget,3.1,C04;C08,R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A33,delayed DB write/lease ordering,3.2,C05;C07;C09;C10,R3;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A34,stuck ceiling/age/Stop,3.2,C05;C07;C09;C10,R3;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A35,sibling/parent survival,3.2,C05;C07;C09;C10,R3;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A36,late event/retry/init paths,3.2,C05;C07;C09;C10,R3;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A37,supervisor handoff/restart uncertainty,3.2,C05;C07;C09;C10,R3;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A38,pipe loss at event/result,3.3,C05;C09,R3;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A39,stdin/SIGTERM/drain/atexit,3.3,C05;C09,R3;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A40,process death and unsent receipt,3.3,C05;C09,R3;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A41,parser/unknown/recovery,4.1,C07;C09,R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A42,typed block/gate/budget,4.1,C07;C09,R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A43,legacy/up-backout,4.1,C07;C09,R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A44,resume != approval/partial blockers,4.1,C07;C09,R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A45,authorized independent work,4.1,C07;C09,R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A46,two-consumer claim/consume,4.2,C07;C09,R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A47,pause/clear/Stop dispatch order,4.2,C07;C09,R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A48,notification origin/suppressed budget,4.2,C07;C09,R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A49,block/restart/resume/re-block,4.2,C07;C09,R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A50,consume crash/replay/compression,4.2,C07;C09,R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A51,field propagation/pre-post acceptance,4.3,C02;C03;C07;C09,R1;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A52,rebind/queue/durable failure,4.3,C02;C03;C07;C09,R1;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A53,Stop/re-home/edit/attachments,4.3,C02;C03;C07;C09,R1;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A54,same-ID content conflict and uncertain delivery,4.3,C02;C03;C07;C09,R1;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A55,current vs historic revisions,5.1,C11,R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A56,auth-defer/status truth,5.1,C11,R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A57,Wi-Fi/external vs local IPC,5.1,C11,R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A58,scoped Copilot probe,5.1,C11,R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A59,effective bound ownership,5.2,C04;C05;C10,R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A60,useful long child and true progress,5.2,C04;C05;C10,R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A61,no-cap child error and finite expiry,5.2,C04;C05;C10,R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A62,silent dependency/Stop/stuck ceiling,5.2,C04;C05;C10,R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A63,schema repair real path/policy readback,5.2,C04;C05;C10,R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A64,import/package/source binding,6.1,C08;C09;C13,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A65,seam event/receipt/UI integration,6.1,C08;C09;C13,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A66,shared restart/late-notification/Stop,6.1,C08;C09;C13,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A67,required full-candidate tests,6.1,C08;C09;C13,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A68,source-to-runtime/restart route,6.2,C07;C12,R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A69,old-reader safety/backout,6.2,C07;C12,R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A70,canary/occupied work/rollback,6.2,C07;C12,R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A71,complete issue/evidence coverage,6.3,C01;C13,R0;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A72,required failure/stale/skip cannot ready,6.3,C01;C13,R0;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A73,optional defer wording/owner,6.3,C01;C13,R0;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_case,A74,publication separate,6.3,C01;C13,R0;R6,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B01,exact immutable media bytes/order/MIME/text intent and ID-conflict refusal.,,C02,R1;R5,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B02,custody publish/receipt commit/ACK crash ordering and orphan/ref retention.,,C02,R1;R5,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B03,"upload25MiB vs receipt900k, aggregate/decode quota and duplicate reservation accounting.",,C02,R1;R5,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B04,actual original Desktop epoch with current reauthorization; no legacy origin backfill.,,C02,R1;R5,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B05,blob tamper/symlink/replacement/foreign root-profile isolation.,,C02,R1;R5,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B06,local/image-bytes/file/PDF-derived/voice projection support matrix and manual draft retention.,,C02,R1;R5,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B07,"route/model/detail/transform-qualified budget, no estimate-as-exact promotion.",,C03,R5,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B08,sealed final-wire tools/history/media mutation refusal before effect.,,C03,R5,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B09,compaction/rebase/carrier/old-history attachment projection and rebuild.,,C03,R5,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B10,legacy total600 vs explicit inactivity compatibility across loaders/restart.,,C04;C10,R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B11,heartbeat/retry/no-change cannot mask request/stall deadline.,,C04;C10,R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B12,one optional total deadline across init/run/schema and dual-fire origin.,,C04;C10,R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B13,stuck I/O/parent loss/observer-start uncertainty remains charged/visible.,,C05,R3,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B14,dedicated descendant containment/escape/pipe drain/sibling isolation.,,C05,R3,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B15,local quiescence vs remote effect-unknown; no kill-as-exactly-once.,,C05,R3,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B16,all advisory nodes/root+nested copies reachability and package remediation.,,C06,R6,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B17,process-crash vs power-loss ACK claim and all connections’ effective policy.,,C07,R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B18,old/new reader/backup/media restore/blocked-goal-safe backout.,,C07;C12,R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B19,"exact-source requested-test existence, collection/timeout/teardown and package binding.",,C01;C08,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+supplemental_case,B20,real Electron/backend/host restart/rebind/profile/route/input/goal/Stop integration.,,C09,R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+master_card,C00,Source alignment and admission,,C00,R0,reconcile_existing_carriers_and_qualification,none; planning obligation only
+master_card,C01,Exhaustive evidence and gate admission,,C01,R0;R6,reconcile_existing_carriers_and_qualification,none; planning obligation only
+master_card,C02,Native input/media/origin contract and custody,,C02,R1;R5,reconcile_existing_carriers_and_qualification,none; planning obligation only
+master_card,C03,Final-wire route/media budget and projection,,C03,R5,reconcile_existing_carriers_and_qualification,none; planning obligation only
+master_card,C04,Explicit lifetime compatibility and progress semantics,,C04,R3,reconcile_existing_carriers_and_qualification,none; planning obligation only
+master_card,C05,"Owned containment, settlement and conditional isolation",,C05,R3,reconcile_existing_carriers_and_qualification,none; planning obligation only
+master_card,C06,Dependency reachability and supported remediation,,C06,R6,reconcile_existing_carriers_and_qualification,none; planning obligation only
+master_card,C07,"Reader/backout, backup and crash durability",,C07,R5;R6,reconcile_existing_carriers_and_qualification,none; planning obligation only
+master_card,C08,Pre-canary candidate package and controlled performance,,C08,R2;R6,reconcile_existing_carriers_and_qualification,none; planning obligation only
+master_card,C09,Native multi-process restart/route/recovery integration,,C09,R4;R6,reconcile_existing_carriers_and_qualification,none; planning obligation only
+master_card,C10,Cost-authorized real useful-long-work and Stop/stall canary,,C10,R6,separate_effect_admission_required,none; planning obligation only
+master_card,C11,Operational/auth/environment dispositions,,C11,R6,separate_effect_admission_required,none; planning obligation only
+master_card,C12,Managed activation and exercised backout,,C12,R6,separate_effect_admission_required,none; planning obligation only
+master_card,C13,Final per-case closeout and independent challenge,,C13,R6,reconcile_existing_carriers_and_qualification,none; planning obligation only
+issue,R01,"verified route subtraction, inventory.py",,C01;C08;C09;C13,R0;R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R02,"observed mixed namespace/visibility, inventory + renderer",,C01;C08;C09;C12;C13,R0;R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R03,"observed fallback drift, catalog/models",,C01;C08;C09;C12;C13,R0;R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R04,"observed owner error, historical trigger unknown, prompt owner",,C01;C02;C03;C07;C09;C13,R0;R1;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R05,"verified600 config/progress, delegate/config",,C01;C04;C05;C08;C10;C13,R0;R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R06,"observed late writes/source close hazard, child lifecycle",,C01;C05;C07;C09;C10;C13,R0;R3;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R07,demonstrated convoy; exact historical delta unknown,,C01;C04;C05;C08;C10;C12;C13,R0;R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R08,"observed EPIPE crash, compute host",,C01;C05;C09;C13,R0;R3;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R09,source shutdown/atexit risk; runtime RED required,,C01;C05;C09;C13,R0;R3;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R10,historical revision skew; current operational proof required,,C01;C07;C11;C12;C13,R0;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R11,observed email auth retry; current state gate,,C01;C11;C13,R0;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R12,observed Canva OAuth block; operator-owned,,C01;C11;C13,R0;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R13,observed Wi-Fi churn; causality unknown,,C01;C11;C13,R0;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R14,"differing aggregator meanings, caller-contract audit",,C01;C08;C09;C13,R0;R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R15,degraded Copilot probe; scoped state unknown,,C01;C11;C13,R0;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R16,existing UI normalization; regression/replay gate,,C01;C05;C07;C08;C09;C10;C13,R0;R2;R3;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R17,earlier unscoped probe changed derived cache fingerprint,,C01;C08;C09;C12;C13,R0;R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R18,installed/live docs divergence,,C00;C01;C04;C07;C08;C09;C12;C13,R0;R2;R3;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R19,verified Future classifier counterexample,,C01;C04;C05;C08;C10;C13,R0;R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R20,verified blocked-goal manager/source paths,,C01;C07;C09;C13,R0;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R21,verified repeated config-copy policy work,,C01;C08;C12;C13,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R22,verified units/token projection error,,C01;C08;C13,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R23,observed/source sibling observer gap risk,,C01;C08;C13,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R24,controlled buffered progress-loss mechanism,,C01;C05;C08;C13,R0;R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R25,verified repeated local shell read ops,,C01;C08;C12;C13,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R26,observed nested300s serial RPC budget failure,,C01;C05;C08;C13,R0;R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R27,observed LSP init timeouts; particular write attribution unknown,,C01;C08;C13,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R28,live lock stacks + isolated convoy,,C01;C08;C12;C13,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R29,verified temp malformed-config remap forwarding; config/local policy,,C01;C08;C12;C13,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R30,source schema-repair bypass of original timed Future,,C01;C04;C05;C07;C08;C09;C10;C13,R0;R2;R3;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R31,executed exact-source invalid/nonfinite timeout behavior,,C01;C04;C05;C08;C10;C13,R0;R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R32,"verified prior missing gate-status validation; candidate repair has tests, final qualification still required",,C01;C13,R0;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R33,verified observer failed-start/liveness shutdown defects repaired locally; containment/restart qualification remains,,C05;C09,R3;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R34,observed timeout/teardown vs misleading green runner summaries,,C01;C08,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R35,observed nonexistent requested test silently omitted,,C01;C08,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R36,observed vulnerable dependency graph; distributed exploitability unknown until reachability,,C06;C08,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R37,"verified text-only native/media accounting and missing complete attachment/original-epoch recovery; contract/proof gap, not evidence that all attachments disappear globally",,C02;C03;C07;C09,R1;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R38,verified upstream-doc vs candidate lifetime semantics mismatch,,C04;C10,R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R39,"durability/backout proof gap; K06 source-reported NORMAL limitation, no observed power-loss input incident claimed",,C07;C12,R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+issue,R40,"verified selected profile outputs are only exhausted-quota errors despite artifact verification; independent review unavailable, no provider/billing repair authorized",,C13,R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,0.1,Pin owner and baseline contracts,0.1,C00,R0,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,0.2,Repair measurement semantics and qualification validation,0.2,C01;C08,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,1.1,Remove name-only route suppression,1.1,C08;C09,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,1.2,"Make defaults, refresh and fallback scope-correct",1.2,C08;C09;C12,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,2.1,Typed security-policy read and one launch-local resolution,2.1,C08;C12,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,2.2,Bounded local read operation and golden oracle,2.2,C08;C12,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,2.3,Sandbox progress and owned nested deadline cleanup,2.3,C05;C08,R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,2.4,Bound LSP enrichment without false validation,2.4,C08,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,3.1,Validate budgets and classify every attempt deadline,3.1,C04;C08,R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,3.2,Settle before retire on every child exit path,3.2,C05;C07;C09;C10,R3;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,3.3,Typed pipe death and shutdown with live work,3.3,C05;C09,R3;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,4.1,"Typed blocking, legacy load and completion evidence",4.1,C07;C09,R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,4.2,"Canonical consume, notification provenance and relapse",4.2,C07;C09,R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,4.3,Manual receipt-aware owner-change recovery,4.3,C02;C03;C07;C09,R1;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,5.1,Explicit environmental/auth and revision dispositions,5.1,C11,R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,5.2,Qualify no-cap policy in controlled scope before changing live default,5.2,C04;C05;C10,R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,6.1,Candidate integration and package binding,6.1,C08;C09;C13,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,6.2,Separately authorized canary and rollback exercise,6.2,C07;C12,R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+inherited_task,6.3,Per-issue closure and independent receipt review,6.3,C01;C13,R0;R6,requires_current_evidence_reconciliation,none; planning obligation only
+gate,G0,Aggregate of inherited tasks: 0.1,,C00,R0,requires_current_evidence_reconciliation,none; planning obligation only
+gate,G10,Aggregate of inherited tasks: 0.2,,C01;C08,R0;R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+gate,G1,"Aggregate of inherited tasks: 1.1, 1.2",,C08;C09;C12,R2;R4;R6,requires_current_evidence_reconciliation,none; planning obligation only
+gate,G8,Aggregate of inherited tasks: 2.1,,C08;C12,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+gate,G9,Aggregate of inherited tasks: 2.2,,C08;C12,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+gate,G11,Aggregate of inherited tasks: 2.3,,C05;C08,R2;R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+gate,G12,Aggregate of inherited tasks: 2.4,,C08,R2;R6,requires_current_evidence_reconciliation,none; planning obligation only
+gate,G2,"Aggregate of inherited tasks: 3.1, 3.2, 3.3",,C04;C05;C07;C08;C09;C10,R2;R3;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+gate,G7,"Aggregate of inherited tasks: 4.1, 4.2",,C07;C09,R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+gate,G4,Aggregate of inherited tasks: 4.3,,C02;C03;C07;C09,R1;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+gate,G5,Aggregate of inherited tasks: 5.1,,C11,R6,requires_current_evidence_reconciliation,none; planning obligation only
+gate,G3,Aggregate of inherited tasks: 5.2,,C04;C05;C10,R3;R6,requires_current_evidence_reconciliation,none; planning obligation only
+gate,G6,"Aggregate of inherited tasks: 6.1, 6.2, 6.3",,C01;C07;C08;C09;C12;C13,R0;R2;R4;R5;R6,requires_current_evidence_reconciliation,none; planning obligation only
+context_task,T01,Register the repair slice and obtain the current integration handoff,,,R0,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T02,Freeze and reconcile source without touching a shared index,,,R0,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T03,Bind the copied error to its actual owning session,,,R0,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T04,Take a consistent diagnostic copy and verify preservation,,,R0,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T05,Classify context-admission refusal correctly,,,R3,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T06,Handle raised context refusal with owner-correct goal containment,,,R3,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T07,Balance preflight turn lifecycle and settlement,,,R3,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T08,Reproduce the actual lineage comparison on a copy,,,R0;R5;R6,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T09,Adopt the narrow checkpoint durability correction,,,R0;R5;R6,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T10,Repair review-fork isolation if the native witness confirms the defect,,,R0;R5;R6,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T11,Preserve exact replay restoration and owner wire defaults,,,R0;R5;R6,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T12,Qualify manual compression after resume/cold host,,,R5;R6,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T13,Resolve the fixed-budget third-cycle refusal without weakening the gate,,,R5;R6,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T14,Generation/activation recovery only for their exact typed failures,,,R5;R6,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T15,Run the affected-surface regression union,,,R6,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T16,Exercise copied original session through the real host path,,,R6,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_task,T17,One bounded live original-session canary,,,R6,subordinate_context_work; preserve_or_requalify_landed_repairs,none; planning obligation only
+context_criterion,CR01,"No-progress preflight, estimated over window -> Provider/tool dispatch absent; original authentic input retained",,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR02,No-progress compaction while legitimately under window -> Existing lawful admission behavior preserved,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR03,Same context error formatted/copied twice -> Original failed-event time unchanged; copy time separate,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR04,Context refusal vs transient provider transport error -> No unchanged context retry; transport retry classification preserved,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR05,Raised refusal with active admitted goal -> Expected-state durable pause/checkpoint or explicit uncertainty; no judge/follow-up,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR06,Goal replaced during failed turn -> Replacement goal unchanged,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR07,Operator pause/clear/Stop during failure -> Operator state wins; no resurrection,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR08,Profile/durable owner changed -> No mutation of another profile/session goal,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR09,Authentic queued user input during refusal -> Input/occurrence retained; recovery does not replace it with synthetic goal text,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR10,Background notifications while recovery-required -> Notifications preserved; no repeated blocked provider turn,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR11,Goal pause persistence/CAS failure -> Failure visible; no false durable pause or fallback execution,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR12,"Preflight throws before context object returns -> Balanced owned lifecycle/lease/ticker; retained error, no success",,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR13,Genuine concurrent owner during cleanup -> Old cleanup cannot release/clear newer owner,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR14,Assistant checkpoint + real archive + cold reopen -> Exact authenticated projection equality,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR15,User checkpoint + real archive + cold reopen -> Exact equality and valid roles,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR16,Next normal generation after checkpoint -> Correct authenticated parent; no transient-field drift,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR17,"Three checkpoint cycles, unchanged fixed budget -> Native qualification; failure preserved if floor impossible",,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR18,Review fork compaction using real native store -> Parent rows/tip/receipts unchanged,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR19,Review/foreground overlap under deterministic barriers -> Isolated operation/store ownership,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR20,Unsupported/no-op detach plugin -> Fail closed; finite review policy retained,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR21,Review close/hook/engine re-init -> Cannot rebind or finalize parent's lineage,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR22,Omitted zero epoch / explicit malformed epochs (conditional repair) -> Owner schema default accepted; malformed values rejected,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR23,Empty-tip boolean false vs integer zero -> Exact type checks; no Python false==0 admission,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR24,User trailing newline/spaces + host todo suffix -> Only host-owned delimiter removed; source bytes preserved,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR25,Non-whitespace replay drift / memory-block sanitation / tool drift -> Refusal; no broad authority-restoration normalization,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR26,User-spoofed compressed-summary marker -> Not promoted to owner-authored summary,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR27,"Cold host: resume then manual compress -> Works through canonical snapshot, no synthetic ordinary provider turn",,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR28,Missing/wrong SID/caller-provided snapshot -> Reject or ignore unowned snapshot,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR29,Stale profile/transport/host boot + Stop uncertainty -> Reconstruction/control refused safely,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR30,Manual compression aborted -> Structured aborted result; no green success toast,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR31,Host growth after fitting native candidate -> Original final target still enforced,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR32,Insufficient structural retention floor -> Typed failure; exact persisted state unchanged,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR33,Valid host reserve + bounded measured adjustment -> Converges without target widening,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR34,Lost activate acknowledgement / restart pending -> Same receipt reconciled; no duplicate compaction/effect,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR35,Anti-growth / projection rejection -> Only unusable pending candidate discarded,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR36,Authenticated epoch transition and next generation (conditional) -> Rust-owned tip across 0→1 epoch; exact expansion preserved,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR37,Rough-estimate false positive / real-usage defer -> Qualified admission accuracy without integrity bypass,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR38,Final SDK-body mutation / opaque retained context -> Existing sealed dispatch tests still reject unauthorized change,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR39,"Copied original-thread recovery -> Exact host path, preserved history/receipts, restart/next-generation proof",,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR40,"Live original-thread canary -> Correct session, authorized effect, readback and no autonomous retry loop",,,R0;R3;R5;R6,separate_live_canary_admission,none; planning obligation only
+context_criterion,CR41,Old client/backout reads new error fields -> Compatible/degraded honestly; no hidden authority widening,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR42,"Integration with goal/input/Stop candidate union -> No lost accepted writer behavior, no shared-index/source race",,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR43,Corrupted/missing derived lineage index -> Explicit bounded owner rebuild or typed refusal; signed receipts unchanged,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only
+context_criterion,CR44,Wrong-session/stale/unverified/malformed/ambiguous native tip -> Refused; catalog or compatibility guesses cannot become authority,,,R0;R3;R5;R6,subcriterion_not_independent_acceptance_owner,none; planning obligation only

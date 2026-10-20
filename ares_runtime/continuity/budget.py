@@ -142,20 +142,54 @@ def final_request_upper_bound(*, route_ref: str, payload: dict[str, Any]) -> Inp
         "timeout", "extra_headers", "headers",
     }}
 
-    def check(value, depth=0):
+    # Only recognized tool-definition positions contain JSON Schema data.
+    # A schema-looking object elsewhere remains transport input. The schema
+    # bytes still participate in depth/JSON validation, counting and hashing.
+    schema_roots = set()
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        for index, tool in enumerate(tools):
+            if type(tool) is not dict:
+                continue
+            if tool.get("type") == "function":
+                function = tool.get("function")
+                if (type(function) is dict and isinstance(function.get("name"), str)
+                        and function["name"] and type(function.get("parameters")) is dict):
+                    schema_roots.add(("tools", index, "function", "parameters"))
+                elif (isinstance(tool.get("name"), str) and tool["name"]
+                      and type(tool.get("parameters")) is dict):
+                    schema_roots.add(("tools", index, "parameters"))
+            elif (tool.get("type") in (None, "custom")
+                  and isinstance(tool.get("name"), str) and tool["name"]
+                  and type(tool.get("input_schema")) is dict):
+                schema_roots.add(("tools", index, "input_schema"))
+    tool_config = body.get("toolConfig")
+    if type(tool_config) is dict and isinstance(tool_config.get("tools"), list):
+        for index, tool in enumerate(tool_config["tools"]):
+            spec = tool.get("toolSpec") if type(tool) is dict else None
+            inputs = spec.get("inputSchema") if type(spec) is dict else None
+            if (type(spec) is dict and isinstance(spec.get("name"), str) and spec["name"]
+                    and type(inputs) is dict and type(inputs.get("json")) is dict):
+                schema_roots.add(("toolConfig", "tools", index, "toolSpec", "inputSchema", "json"))
+
+    def check(value, depth=0, path=(), schema=False):
         if depth > 64:
             raise BudgetError("INVALID_FINAL_PAYLOAD")
+        schema = schema or path in schema_roots
         if isinstance(value, dict):
-            if value.get("type") in {
+            kind = value.get("type")
+            if not schema and isinstance(kind, (dict, list)):
+                raise BudgetError("INVALID_FINAL_PAYLOAD")
+            if not schema and ((isinstance(kind, str) and kind in {
                 "image", "image_url", "input_image", "input_file", "file", "audio", "input_audio",
                 "compaction", "computer_screenshot",
-            } or any(key in value for key in ("encrypted_content", "previous_response_id", "conversation")):
+            }) or any(key in value for key in ("encrypted_content", "previous_response_id", "conversation"))):
                 raise BudgetError("FINAL_PAYLOAD_OPAQUE_ACCOUNTING_UNQUALIFIED")
-            for item in value.values():
-                check(item, depth + 1)
+            for key, item in value.items():
+                check(item, depth + 1, path + (key,), schema)
         elif isinstance(value, list):
-            for item in value:
-                check(item, depth + 1)
+            for index, item in enumerate(value):
+                check(item, depth + 1, path + (index,), schema)
 
     check(body)
     try:

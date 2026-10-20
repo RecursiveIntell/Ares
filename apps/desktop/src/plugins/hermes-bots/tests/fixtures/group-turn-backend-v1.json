@@ -1,0 +1,50 @@
+{
+  "submit_ack": {
+    "jsonrpc": "2.0",
+    "id": "reused-rpc",
+    "result": {
+      "status": "streaming",
+      "turn_isolation": true,
+      "accepted_turn": {
+        "request_id": "host-turn-dcd6f02280764cd08e22df1aa6d63005",
+        "session_id": "s",
+        "route": "compute_host",
+        "host_boot_id": "fc9cbf7fbb79433589a80c189a56b8f3"
+      }
+    }
+  },
+  "resume_result": {
+    "info": {},
+    "message_count": 15,
+    "messages": [],
+    "messages_omitted": true,
+    "running": false,
+    "turn_started_at": null,
+    "session_id": "s",
+    "session_key": "compressed-tip",
+    "started_at": 1790913852.2554095,
+    "status": "idle",
+    "turn_outcomes": {
+      "version": 1,
+      "scope": "process_local",
+      "availability": "available",
+      "turns": [
+        {
+          "accepted_turn": {
+            "request_id": "host-turn-dcd6f02280764cd08e22df1aa6d63005",
+            "session_id": "s",
+            "route": "compute_host",
+            "host_boot_id": "fc9cbf7fbb79433589a80c189a56b8f3"
+          },
+          "state": "complete",
+          "finalized": [
+            {
+              "text": "owned new answer",
+              "status": "complete"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

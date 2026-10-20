@@ -21,6 +21,7 @@ TOOL_REQUEST_MIDDLEWARE = "tool_request"
 TOOL_EXECUTION_MIDDLEWARE = "tool_execution"
 LLM_REQUEST_MIDDLEWARE = "llm_request"
 LLM_EXECUTION_MIDDLEWARE = "llm_execution"
+LLM_DISPATCH_MIDDLEWARE = "llm_dispatch"
 
 # Back-compat aliases for older PoC branches that used API terminology.
 API_REQUEST_MIDDLEWARE = LLM_REQUEST_MIDDLEWARE
@@ -31,7 +32,240 @@ VALID_MIDDLEWARE: set[str] = {
     TOOL_EXECUTION_MIDDLEWARE,
     LLM_REQUEST_MIDDLEWARE,
     LLM_EXECUTION_MIDDLEWARE,
+    LLM_DISPATCH_MIDDLEWARE,
 }
+
+
+class EgressDispatchDenied(RuntimeError):
+    """No provider callback began; never classify as a retryable API error."""
+
+    retryable = False
+    provider_attempted = False
+
+    def __init__(self, code: str, message: str = "model dispatch denied") -> None:
+        self.code = code
+        super().__init__(f"{code}: {message}")
+
+
+class EgressOutcomeUnrecorded(RuntimeError):
+    """A provider callback began but settlement is unproven; never resend."""
+
+    retryable = False
+    provider_attempted = True
+
+    def __init__(self, code: str = "DISPATCH_OUTCOME_UNRECORDED",
+                 message: str = "model dispatch outcome could not be recorded") -> None:
+        self.code = code
+        super().__init__(f"{code}: {message}")
+
+
+_LLM_DISPATCH_OUTCOMES = frozenset({
+    "ok", "provider_error", "interrupted", "discarded", "abandoned", "denied_by_peer",
+})
+
+
+def begin_llm_dispatch(payload: Any, **context: Any) -> list[Any]:
+    """Strict governor preflight, independent of generic fail-open middleware.
+
+    This callback-level seam is not proof of a network-attempt boundary. A
+    transport must independently establish that boundary before enforce use.
+    No callback can rewrite the live request through its inspection copy.
+    """
+    context.setdefault("dispatch_phase", "sdk_invocation")
+    tickets: list[Any] = []
+    try:
+        for callback in _get_middleware_callbacks(LLM_DISPATCH_MIDDLEWARE):
+            # The old _safe_copy intentionally shares nested members on failure.
+            # Governance cannot use that permissive request-rewrite fallback.
+            inspection = deepcopy(payload)
+            ticket = callback(payload=inspection, **middleware_payload(**context))
+            if ticket is not None:
+                if not callable(getattr(ticket, "settle", None)):
+                    raise TypeError("dispatch governor returned a malformed ticket")
+                tickets.append(ticket)
+    except BaseException as error:
+        cleanup_errors = []
+        for ticket in tickets:
+            try:
+                ticket.settle(outcome="denied_by_peer", response=None, error=None)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if not isinstance(error, Exception):
+            raise
+        denied = error if isinstance(error, EgressDispatchDenied) else EgressDispatchDenied(
+            "DISPATCH_GOVERNOR_ERROR", "dispatch governor preflight failed"
+        )
+        if cleanup_errors:
+            denied.add_note(f"{len(cleanup_errors)} prior governor settlement(s) unconfirmed; provider not attempted")
+        if denied is error:
+            raise
+        raise denied from error
+    return tickets
+
+
+def settle_llm_dispatch(tickets: list[Any], *, outcome: str,
+                        response: Any = None, error: BaseException | None = None) -> None:
+    """Attempt every ticket's settlement; any failure withholds completion.
+
+    Observe-mode tickets own their explicitly nonblocking degradation behavior.
+    The core never silently turns an enforce settlement error into a response.
+    """
+    if outcome not in _LLM_DISPATCH_OUTCOMES:
+        raise ValueError(f"invalid llm dispatch outcome: {outcome!r}")
+    failures = []
+    for ticket in tickets:
+        try:
+            ticket.settle(outcome=outcome, response=response, error=error)
+        except BaseException as failure:
+            failures.append(failure)
+    if failures:
+        unknown = failures[0] if isinstance(failures[0], EgressOutcomeUnrecorded) else EgressOutcomeUnrecorded()
+        unknown.add_note(f"{len(failures)} governor settlement(s) unconfirmed")
+        if unknown is failures[0]:
+            raise unknown
+        raise unknown from failures[0]
+
+
+def _dispatch_error_outcome(error: BaseException) -> str:
+    import asyncio
+    return "interrupted" if isinstance(error, (InterruptedError, KeyboardInterrupt, asyncio.CancelledError)) else "provider_error"
+
+
+def run_llm_dispatch(payload: Any, callback: Callable, *, stream: bool = False, _dispatch_agent=None, **context: Any) -> Any:
+    """Govern one callback without allowing a governor to rewrite its bytes."""
+    tickets = begin_llm_dispatch(payload, **context)
+    from ares_runtime.physical_dispatch import inference_call_scope, bind_deferred_result
+    try:
+        with inference_call_scope(_dispatch_agent, payload,
+                                  purpose=context.get("purpose", "conversation"),
+                                  route={key: context[key] for key in ("provider", "api_mode") if context.get(key)}) as basis:
+            response = callback(payload)
+            if stream and _get_middleware_callbacks(LLM_DISPATCH_MIDDLEWARE):
+                response = bind_deferred_result(response, basis)
+    except BaseException as error:
+        settle_llm_dispatch(tickets, outcome=_dispatch_error_outcome(error), error=error)
+        raise
+    if tickets and stream:
+        return GovernedStreamProxy(response, tickets)
+    settle_llm_dispatch(tickets, outcome="ok", response=response)
+    return response
+
+
+async def async_run_llm_dispatch(payload: Any, callback: Callable, **context: Any) -> Any:
+    """Keep blocking governance IPC off the event loop; never send on cancel.
+
+    Cancellation during preflight may leave a charged, pending native attempt
+    when its IPC worker returns late. It does not resume the provider callback;
+    native expiry/reconciliation owns that missing outcome, never a fake refund.
+    """
+    import asyncio
+    tickets = await asyncio.to_thread(begin_llm_dispatch, payload, **context)
+    from ares_runtime.physical_dispatch import inference_call_scope, bind_deferred_result
+    try:
+        with inference_call_scope(None, payload, purpose=context.get("purpose", "conversation"),
+                                  route={key: context[key] for key in ("provider", "api_mode") if context.get(key)}) as basis:
+            response = await callback(payload)
+            if _get_middleware_callbacks(LLM_DISPATCH_MIDDLEWARE):
+                response = bind_deferred_result(response, basis)
+    except BaseException as error:
+        await asyncio.to_thread(settle_llm_dispatch, tickets, outcome=_dispatch_error_outcome(error), error=error)
+        raise
+    await asyncio.to_thread(settle_llm_dispatch, tickets, outcome="ok", response=response)
+    return response
+
+
+class GovernedStreamProxy:
+    """Keep one ticket batch pending until explicit stream exhaustion or close.
+
+    Response-body evidence is still owned by the transport, not this wrapper.
+    The provider object itself is never re-requested by this proxy.
+    """
+
+    def __init__(self, stream: Any, tickets: list[Any]) -> None:
+        from threading import RLock
+        self._stream = stream
+        self._manager = stream
+        self._iterator = None
+        self._tickets = tickets
+        self._lock = RLock()
+        self._closed = False
+        self._exit_called = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+    def _settle(self, outcome: str, error: BaseException | None = None) -> None:
+        with self._lock:
+            tickets, self._tickets = self._tickets, None
+        if tickets is not None:
+            settle_llm_dispatch(tickets, outcome=outcome, response=self._stream, error=error)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self._lock:
+            if self._closed or self._tickets is None:
+                raise StopIteration
+        try:
+            if self._iterator is None:
+                self._iterator = iter(self._stream)
+            value = next(self._iterator)
+        except StopIteration:
+            self._settle("ok")
+            raise
+        except BaseException as error:
+            self._settle("interrupted" if isinstance(error, (InterruptedError, KeyboardInterrupt)) else "provider_error", error)
+            raise
+        return value
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            close = getattr(self._stream, "close", None)
+            if close is not None:
+                close()
+        except BaseException as error:
+            self._settle("provider_error", error)
+            raise
+        else:
+            self._settle("abandoned")
+
+    def __del__(self):
+        if not self._closed:
+            self.close()
+
+    def __enter__(self):
+        try:
+            enter = getattr(self._manager, "__enter__", None)
+            if enter is not None:
+                self._stream = enter()
+        except BaseException as error:
+            self._settle("provider_error", error)
+            raise
+        return self
+
+    def __exit__(self, exc_type, error, traceback):
+        with self._lock:
+            if self._exit_called:
+                return False
+            self._exit_called = True
+            self._closed = True
+        try:
+            exit_stream = getattr(self._manager, "__exit__", None)
+            if exit_stream is not None:
+                exit_stream(exc_type, error, traceback)
+        except BaseException as close_error:
+            self._settle("provider_error", close_error)
+            raise
+        finally:
+            self._settle("interrupted" if isinstance(error, (InterruptedError, KeyboardInterrupt)) else
+                         "provider_error" if error is not None else "abandoned", error)
+        # Never swallow a provider or governance exception.
+        return False
 
 
 @dataclass

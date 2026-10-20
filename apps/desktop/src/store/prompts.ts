@@ -312,7 +312,7 @@ export function sessionAwaitingInput(sessionId: string | null) {
   return computed([$clarifyRequests, approval.$all, sudo.$all, secret.$all], (clarify, approvals, sudos, secrets) => {
     const key = keyFor(sessionId)
 
-    return Boolean(clarify[key] || approvals[key] || sudos[key] || secrets[key])
+    return Boolean((clarify[key] && !clarify[key].deliveryOnly) || approvals[key] || sudos[key] || secrets[key])
   })
 }
 

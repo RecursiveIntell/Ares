@@ -36,7 +36,9 @@ vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
       common: { confirm: 'Confirm' },
+      install: { stageStates: { pending: 'Pending' } },
       desktop: { modelSwitchFailed: 'Failed' },
+      modelPicker: { sessionSelection: 'This chat' },
       shell: {
         modelMenu: { refreshModels: 'Refresh' },
         modelOptions: { updateFailed: 'Failed', fastFailed: 'Failed', unconfirmed: 'Model options unconfirmed' }
@@ -110,7 +112,11 @@ it('a primary effort click must update the live SessionView, not only its draft 
   const request = vi.fn(async () => ({ key: 'reasoning', value: 'high' }))
   panel(request)
   await act(async () => fireEvent.click(screen.getByText('Set high')))
-  expect(request).toHaveBeenCalledWith('config.set', { key: 'reasoning', session_id: 'r1', value: 'high' })
+  expect(request).toHaveBeenCalledWith('config.set', {
+    key: 'runtime_options',
+    session_id: 'r1',
+    value: { effort: 'high' }
+  })
   console.log({ draft: $currentReasoningEffort.get(), visible: PRIMARY_SESSION_VIEW.$reasoningEffort.get() })
   expect(PRIMARY_SESSION_VIEW.$reasoningEffort.get()).toBe('high')
   expect($currentReasoningEffort.get()).toBe('high')
@@ -295,14 +301,15 @@ it('a superseded preset cannot send its late Fast write after another Fast choic
   expect($sessionStates.get().r1.fast).toBe(false)
 })
 
-it('a rejected second preset field preserves the acknowledged effort', async () => {
+it('a rejected combined preset rolls back both dimensions without a second write', async () => {
   act(() => publishSessionState('r1', { ...$sessionStates.get().r1, fast: false }))
-  const request = vi.fn().mockResolvedValueOnce({}).mockRejectedValueOnce(new Error('rejected'))
+  const request = vi.fn().mockRejectedValueOnce(new Error('rejected'))
   await applyModelPreset(
     { effort: 'high', fast: true },
     { primary: false, sessionId: 'r1', failMessage: 'Failed', request }
   )
-  expect($sessionStates.get().r1).toMatchObject({ reasoningEffort: 'high', fast: false })
+  expect($sessionStates.get().r1).toMatchObject({ reasoningEffort: 'medium', fast: false })
+  expect(request).toHaveBeenCalledTimes(1)
 })
 
 it('bounds batched option-intent retention instead of accumulating two extra entries per call', () => {
@@ -345,7 +352,8 @@ it('unavailable readback leaves the desired effort visibly unconfirmed', async (
   await act(async () => fireEvent.click(screen.getByText('Set high')))
   expect(request.mock.calls.filter(([method]) => method === 'config.set')).toHaveLength(1)
   expect($sessionStates.get().r1).toMatchObject({ reasoningEffort: 'high', unconfirmedRuntimeOptions: ['effort'] })
-  expect(screen.getByRole('status').textContent).toContain('unconfirmed')
+  const unconfirmedStatus = screen.getAllByRole('status').find(status => status.textContent?.includes('unconfirmed'))
+  expect(unconfirmedStatus).toBeDefined()
 })
 
 it('a late preset recovery cannot recreate an unsaved runtime after close', async () => {
@@ -382,17 +390,19 @@ it('a late preset recovery cannot recreate an unsaved runtime after close', asyn
   expect($sessionStates.get()).toEqual({})
 })
 
-it('an uncertain preset effort reads back but never sends the unattempted Fast write', async () => {
+it('an uncertain combined preset reads both dimensions but never replays the write', async () => {
   const request = vi
     .fn()
     .mockRejectedValueOnce(new Error('request timed out after 30s: config.set'))
     .mockResolvedValueOnce({ owner: 'compute_host', session_id: 'r1', host_boot_id: 'owner-boot', value: 'xhigh' })
+    .mockResolvedValueOnce({ owner: 'compute_host', session_id: 'r1', host_boot_id: 'owner-boot', value: 'normal' })
 
   await applyModelPreset(
     { effort: 'high', fast: true },
     { primary: false, sessionId: 'r1', failMessage: 'Failed', request }
   )
-  expect(request).toHaveBeenCalledTimes(2)
-  expect(request).toHaveBeenLastCalledWith('config.get', { key: 'reasoning', session_id: 'r1' })
+  expect(request).toHaveBeenCalledTimes(3)
+  expect(request).toHaveBeenNthCalledWith(2, 'config.get', { key: 'reasoning', session_id: 'r1' })
+  expect(request).toHaveBeenLastCalledWith('config.get', { key: 'fast', session_id: 'r1' })
   expect($sessionStates.get().r1).toMatchObject({ reasoningEffort: 'xhigh', fast: false })
 })

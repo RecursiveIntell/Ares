@@ -24,6 +24,8 @@ import nodePath from 'node:path'
 export const MOCK_REPLY = 'Hello from the mock inference server! The full boot chain is working.'
 
 export interface MockServerOptions {
+  /** Explicit synthetic discovery catalog for selector E2E fixtures. */
+  models?: readonly string[]
   /** Pause the matching stream after its first token for session-switch E2E coverage. */
   holdFirstStreamForPrompt?: string
 /** Pause the first completion whose request JSON contains this text. */
@@ -44,6 +46,8 @@ export interface MockServer {
   port: number
   url: string
   receivedPrompts: string[]
+  /** Exact JSON request bodies received from the real backend (synthetic fixtures only). */
+  receivedRequests: Record<string, unknown>[]
   waitForHeldStream: () => Promise<void>
   waitForHeldCompletion: () => Promise<void>
   releaseHeldStream: () => void
@@ -397,6 +401,7 @@ function includesBlockingClarifyTrigger(value: unknown): boolean {
 export function startMockServer(options: MockServerOptions = {}): Promise<MockServer> {
   return new Promise((resolve, reject) => {
     const receivedPrompts: string[] = []
+    const receivedRequests: Record<string, unknown>[] = []
     let resolveHeldStreamStarted: (() => void) | null = null
     let releaseHeldStream: (() => void) | null = null
     let heldCompletionCount = 0
@@ -425,14 +430,14 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
         res.end(
           JSON.stringify({
             object: 'list',
-            data: [
+            data: (options.models ?? ['mock-model']).map(id => (
               {
-                id: 'mock-model',
+                id,
                 object: 'model',
                 created: 0,
                 owned_by: 'mock',
-              },
-            ],
+              }
+            )),
           }),
         )
         return
@@ -451,6 +456,7 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
 
           try {
             parsed = JSON.parse(body)
+            receivedRequests.push(structuredClone(parsed))
           } catch {
             // malformed JSON — treat as non-streaming with defaults
           }
@@ -666,6 +672,7 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
         port,
         url,
         receivedPrompts,
+        receivedRequests,
         waitForHeldStream: () => heldStreamStarted,
         waitForHeldCompletion: () => heldStreamStarted,
         releaseHeldStream: () => releaseHeldStream?.(),

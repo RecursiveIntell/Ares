@@ -44,6 +44,7 @@ class CLIAgentSetupMixin:
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                target_model=self.model,
             )
         except Exception as exc:
             _primary_exc = exc
@@ -432,7 +433,7 @@ class CLIAgentSetupMixin:
                     )
                 return False
             restored = self._session_db.get_messages_as_conversation(
-                self.session_id, repair_alternation=True
+                self.session_id, repair_alternation=True, include_summary_markers=True
             )
             if restored:
                 restored = [m for m in restored if m.get("role") != "session_meta"]

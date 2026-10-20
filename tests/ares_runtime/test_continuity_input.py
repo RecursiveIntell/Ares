@@ -186,6 +186,7 @@ def test_tui_busy_ack_is_durable_and_preserves_distinct_occurrences(db, monkeypa
     session = _session(agent=SimpleNamespace(_session_db=db, session_id="s", platform="cli",
         context_rebase_enabled=True), session_key="s", running=True)
     session["inflight_turn"] = {"user": "Identical words"}
+    monkeypatch.setitem(server._sessions, "s", session)
     monkeypatch.setattr(server, "_sess_nowait", lambda *a: (session, None))
     monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a: None)
     monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
@@ -229,6 +230,7 @@ def test_tui_rejected_submit_never_enters_durable_inbox(db, monkeypatch, refusal
     session = _session(agent=SimpleNamespace(_session_db=db, session_id="s", platform="cli",
         context_rebase_enabled=True), session_key="s", running=refusal == "busy_confirm")
     session["lazy"] = refusal == "watch"
+    monkeypatch.setitem(server._sessions, "s", session)
     monkeypatch.setattr(server, "_sess_nowait", lambda *a: (session, None))
     monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a: None)
     monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})

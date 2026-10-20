@@ -691,6 +691,18 @@ def run_codex_app_server_turn(
     Called from run_conversation() when agent.api_mode == "codex_app_server".
     Returns the same dict shape as the chat_completions path.
     """
+    from ares_runtime.continuity.runtime import ContextDispatchError, context_dispatch_required
+
+    subscription_only_trial = context_dispatch_required(agent)
+    if subscription_only_trial:
+        # The child owns its HTTP body, physical attempts, token spending and
+        # tool effects. Local RPC framing/auth checks cannot qualify those
+        # boundaries. Keep the existing continuity authority fail-closed.
+        existing = getattr(agent, "_codex_session", None)
+        if existing is not None:
+            existing.close()
+            agent._codex_session = None
+        raise ContextDispatchError("PROVIDER_CONTEXT_RESET_UNQUALIFIED")
     # Defense in depth for compression.checkpoint_required: agent init
     # already refuses this combination, but api_mode is a plain attribute a
     # future code path could mutate on a live agent. Fail closed before the
@@ -709,6 +721,24 @@ def run_codex_app_server_turn(
         CodexAppServerSession,
         _ServerRequestRouting,
     )
+
+    existing = getattr(agent, "_codex_session", None)
+    if existing is not None and not existing.matches_route(
+        model=getattr(agent, "model", None), provider=getattr(agent, "provider", None),
+        subscription_only_trial=subscription_only_trial,
+    ):
+        if not existing.update_model(
+            model=getattr(agent, "model", None), provider=getattr(agent, "provider", None),
+            subscription_only_trial=subscription_only_trial,
+        ):
+            error = (
+                "Codex native route change cannot preserve this thread. "
+                "Reset the conversation explicitly before changing provider or runtime mode."
+            )
+            return {
+                "final_response": error, "messages": messages, "api_calls": 0,
+                "completed": False, "partial": True, "error": error,
+            }
 
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
@@ -756,6 +786,9 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            model=getattr(agent, "model", None),
+            provider=getattr(agent, "provider", None),
+            subscription_only_trial=subscription_only_trial,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -810,6 +843,12 @@ def run_codex_app_server_turn(
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
     # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a
     # message-bearing compatibility interrupt can still be replayed by callers.
+    completed = bool(getattr(turn, "completed", False)) and not turn.interrupted and turn.error is None
+    final_response = turn.final_text if completed else ""
+    partial_response = (
+        getattr(turn, "partial_text", "") or turn.final_text
+    ) if not completed else ""
+    error = turn.error if completed or turn.error else "Codex turn did not report a matching completed terminal"
     _user_interrupted = bool(
         turn.interrupted and getattr(agent, "_interrupt_requested", False)
     )
@@ -908,7 +947,7 @@ def run_codex_app_server_turn(
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
+    if completed:
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,
@@ -923,8 +962,8 @@ def run_codex_app_server_turn(
     # path (line ~15449). Only fires when a trigger actually tripped AND
     # we have a real final response.
     if (
-        turn.final_text
-        and not turn.interrupted
+        final_response
+        and completed
         and (should_review_memory or should_review_skills)
     ):
         try:
@@ -937,18 +976,19 @@ def run_codex_app_server_turn(
             logger.debug("background review spawn raised", exc_info=True)
 
     return {
-        "final_response": turn.final_text,
+        "final_response": final_response,
+        "partial_response": partial_response,
         "messages": messages,
         "api_calls": api_calls,
-        "completed": not turn.interrupted and turn.error is None,
-        "partial": turn.interrupted or turn.error is not None,
+        "completed": completed,
+        "partial": not completed,
         "interrupted": _user_interrupted,
         **(
             {"interrupt_message": _interrupt_message}
             if _interrupt_message
             else {}
         ),
-        "error": turn.error,
+        "error": error,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after
@@ -1072,8 +1112,11 @@ def _consume_codex_event_stream(
       if no message item was emitted directly.
     * ``output_text``: assembled text from ``response.output_text.delta`` deltas.
     * ``usage``: copied from the terminal event's ``response.usage`` (when present).
-    * ``status``: ``completed`` / ``incomplete`` / ``failed`` (or ``completed`` if
-      the stream ended without a terminal frame but produced content).
+    * ``status``: ``completed`` / ``incomplete`` / ``failed`` (or the
+      compatibility value ``completed`` if the stream ended without a terminal
+      frame but produced content).
+    * ``terminal_observed``: ``True`` only when an actual ``response.completed``
+      event was observed; EOF must not become summary-completion evidence.
     * ``id``: ``response.id`` when present.
     * ``incomplete_details``: passed through for ``response.incomplete`` frames.
     * ``error``: passed through for ``response.failed`` frames.
@@ -1123,7 +1166,7 @@ def _consume_codex_event_stream(
     # parts by this index and gives each part no separator of its own, so a
     # change of index is where the blank line belongs.
     active_summary_index: Any = None
-    terminal_status: str = "completed"
+    terminal_status: str | None = None
     terminal_usage: Any = None
     terminal_response_id: str = None
     terminal_incomplete_details: Any = None
@@ -1446,7 +1489,8 @@ def _consume_codex_event_stream(
         output=output,
         output_text=assembled_text,
         usage=terminal_usage,
-        status=terminal_status,
+        status=terminal_status or "completed",
+        terminal_observed=saw_response_completed,
         id=terminal_response_id,
         model=model,
         incomplete_details=terminal_incomplete_details,
@@ -1598,7 +1642,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     from agent import relay_llm
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
-    from ares_runtime.continuity.runtime import context_dispatch_required
+    from ares_runtime.continuity.runtime import (
+        context_dispatch_required, context_dispatch_physical_call,
+        validate_context_dispatch_source,
+    )
 
     max_stream_retries = 0 if context_dispatch_required(agent) else 1
     # Accumulate streamed text so callers / compat shims can read it.
@@ -1627,13 +1674,17 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         writer_token = {"value": None}
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+            validate_context_dispatch_source(agent, next_api_kwargs)
             stream_kwargs = _sanitize_consumer_codex_request(
                 agent,
                 next_api_kwargs,
             )
             stream_kwargs["stream"] = True
             stream_kwargs = _bypass_sdk_request_transform(stream_kwargs)
-            return active_client.responses.create(**stream_kwargs)
+            return context_dispatch_physical_call(
+                agent, stream_kwargs, lambda final: active_client.responses.create(**final),
+                source_payload=next_api_kwargs, transport_kind="codex_stream",
+            )
 
         def _codex_stream_created(_raw_stream: Any) -> None:
             # Claim the delta sink for THIS physical attempt. A newer attempt

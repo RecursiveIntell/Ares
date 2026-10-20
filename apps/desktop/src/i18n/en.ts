@@ -2791,6 +2791,9 @@ export const en: Translations = {
   },
 
   modelPicker: {
+    selectionUnavailable:
+      'The selected provider or model is unavailable in this profile. Configure it here or choose another model. Your selection is preserved.',
+    sessionSelection: 'This session keeps its own model selection. Profile-default changes apply to new sessions.',
     title: 'Switch model',
     current: 'current:',
     unknown: '(unknown)',
@@ -3255,6 +3258,7 @@ export const en: Translations = {
         'Request expired. Your response may have reached the agent; check the conversation before sending it again.',
       responseUncertain:
         'Your response may have reached the agent, but confirmation was lost. Check the conversation before sending it again.',
+      responseAccepted: 'Answer received',
       responseRejected: 'Response was not accepted; your answer remains selected.',
       loadingQuestion: 'Loading question…',
       other: 'Other (type your answer)',
@@ -3414,6 +3418,9 @@ export const en: Translations = {
     setProfileFailed: 'Failed to set profile',
     sttDisabled: 'Speech-to-text is disabled in settings.',
     stopFailed: 'Stop failed',
+    stopNotSent: 'Stop was not sent — nothing was cancelled.',
+    stopAlreadySettled: 'That turn is no longer active — nothing was cancelled.',
+    stopUnconfirmed: 'Stop could not be confirmed — the turn may still be running.',
     regenerateFailed: 'Regenerate failed',
     editFailed: 'Edit failed',
     editTurnUnavailable: 'This turn is no longer in server history (it may have been compressed away).',

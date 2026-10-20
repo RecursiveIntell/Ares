@@ -44,7 +44,7 @@ import { type FastControl, ModelEditSubmenu, resolveFastControl } from './model-
  *  providers report the canonical `custom:<key>` identity from `model.options`
  *  while the row's slug is the bare config key, so exact slug equality never
  *  matches — check the row's alias set too (#87035). */
-function isCurrentProvider(provider: ModelOptionProvider, currentProvider: string): boolean {
+export function isCurrentProvider(provider: ModelOptionProvider, currentProvider: string): boolean {
   return provider.slug === currentProvider || (provider.aliases?.includes(currentProvider) ?? false)
 }
 
@@ -72,6 +72,8 @@ export interface ModelChoice {
  * Returning `{}` is fine — the row then shows Hermes' defaults.
  */
 export interface ModelMenuController {
+  /** Live chats preserve explicit options; preset application is deliberate. */
+  preserveOptionsOnSelect?: boolean
   /** Restore a model's remembered settings after it is selected. Separate from
    *  `setOptions` because it is one atomic "apply this model's preset" write,
    *  not a user editing one control — surfaces that write through to a session
@@ -89,6 +91,7 @@ export interface ModelMenuController {
 }
 
 interface ModelCatalogMenuProps {
+  connectionId?: null | string
   controller: ModelMenuController
   /** Rows appended under the catalog (Refresh Models, Edit Models, …). */
   footer?: ReactNode
@@ -122,6 +125,7 @@ const EMPTY_CATALOG_RETRY_DELAYS_MS = [250, 1_000, 3_000] as const
  * can never drift apart.
  */
 export function ModelCatalogMenu({
+  connectionId,
   controller,
   footer,
   gateway,
@@ -143,18 +147,15 @@ export function ModelCatalogMenu({
   const visibleModels = useStore($visibleModels)
 
   const modelOptions = useQuery({
-    queryKey: modelOptionsQueryKey(profile, sessionId),
+    queryKey: modelOptionsQueryKey(profile, sessionId, connectionId),
     // Gateway-first even with no session: a connected (possibly remote)
     // gateway owns the model catalog, including virtual providers the local
     // REST fallback can't know about (#53817).
-    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ gateway, profile, request, sessionId })
+    queryFn: (): Promise<ModelOptionsResponse> =>
+      requestModelOptions({ connectionId, gateway, profile, request, sessionId })
   })
 
-  const {
-    data: modelOptionsData,
-    isFetching: modelOptionsFetching,
-    refetch: refetchModelOptions
-  } = modelOptions
+  const { data: modelOptionsData, isFetching: modelOptionsFetching, refetch: refetchModelOptions } = modelOptions
 
   const [emptyCatalogRetryAttempt, setEmptyCatalogRetryAttempt] = useState(0)
 
@@ -242,9 +243,30 @@ export function ModelCatalogMenu({
     // id, so honor the remembered preset by selecting that sibling. Param-fast
     // is applied through setOptions below instead.
     const variantFast = !(caps?.fast ?? false) && !!family.fastId
-    const targetId = variantFast && preset.fast === true ? family.fastId! : family.id
+    const currentProvider = pickerProviders.find(row => isCurrentProvider(row, current.provider))
+
+    const currentFamily =
+      currentProvider &&
+      collapseModelFamilies(currentProvider.models ?? []).find(
+        row => row.id === current.model || row.fastId === current.model
+      )
+
+    const currentFast = resolveFastControl(
+      current.model,
+      currentProvider?.models ?? [],
+      currentProvider?.capabilities?.[currentFamily?.id ?? current.model]?.fast ?? false,
+      current.fast
+    )
+
+    const preservedFast = currentFast.kind === 'none' ? current.fast : currentFast.on
+    const fast = controller.preserveOptionsOnSelect ? preservedFast : preset.fast
+    const targetId = variantFast && fast === true ? family.fastId! : family.id
 
     if ((await controller.select(targetId, provider.slug)) === false) {
+      return
+    }
+
+    if (controller.preserveOptionsOnSelect) {
       return
     }
 
@@ -507,6 +529,20 @@ export function ModelCatalogMenu({
                           fastControl={fastControl}
                           isActive={isCurrent}
                           model={family.id}
+                          onApplyPreset={
+                            controller.preserveOptionsOnSelect &&
+                            isCurrent &&
+                            (preset.effort !== undefined || preset.fast !== undefined)
+                              ? () =>
+                                  controller.applyPreset(
+                                    {
+                                      effort: (caps?.reasoning ?? true) ? preset.effort : undefined,
+                                      fast: (caps?.fast ?? false) ? preset.fast : undefined
+                                    },
+                                    { model: family.id, provider: group.provider.slug }
+                                  )
+                              : undefined
+                          }
                           onSelectModel={nextModel => controller.select(nextModel, group.provider.slug)}
                           onSetOptions={patch =>
                             controller.setOptions(patch, {

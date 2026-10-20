@@ -128,6 +128,82 @@ def test_protocol_probe_exercises_the_certified_two_phase_wire_contract():
     assert calls[-1][1] == {}
 
 
+@pytest.mark.parametrize("adjacent_role", ["assistant", "user"])
+def test_reserve_projection_does_not_mutate_unmerged_candidate(adjacent_role):
+    with patch("hermes_cli.config.load_config", return_value={}):
+        engine = ContextGovernorEngine(binary="/tmp/context-governor")
+    latest = "Which fixture job failed? Preserve exact job identities."
+    source = [{"role": "user", "content": latest}]
+    response = {
+        "receipt": {"schema": "ContextCompactionReceiptV2", "receipt_id": "ctxr_fixture"},
+        "compacted_messages": [
+            {"role": adjacent_role, "content": "CI job proc_fixture_ci was unrun."},
+            {"role": adjacent_role, "content": "Reviewer proc_fixture_review returned; no merge authority."},
+            {"role": "user", "content": latest},
+        ],
+    }
+    original_projection = [engine._message_from_governor(m) for m in response["compacted_messages"]]
+    original_projection = engine._ensure_latest_user_last(source, original_projection)
+    original_projection = engine._sanitize_tool_pairs(original_projection)
+    _, _, projected = engine._project_compaction_candidate(response, source)
+    before = copy.deepcopy(projected)
+    final = engine._final_host_projection(source, copy.deepcopy(projected))
+    assert projected == before
+    assert len(projected) == len(original_projection)
+    assert all(left["role"] != right["role"] for left, right in zip(final, final[1:]))
+    assert final[-1]["content"] == latest
+    assert engine._final_host_projection(source, copy.deepcopy(final)) == final
+    user_text = "\n".join(str(message.get("content", "")) for message in final if message.get("role") == "user")
+    assert user_text.count(latest) == 1
+    assert projected[-1]["content"] == latest
+
+
+def test_final_projection_separates_protected_summary_user_from_history():
+    from agent.context_compressor import LEGACY_SUMMARY_PREFIX
+
+    with patch("hermes_cli.config.load_config", return_value={}):
+        engine = ContextGovernorEngine(binary="/tmp/context-governor")
+    source = [{"role": "user", "content": "latest request"}]
+    summary = {"role": "user", "content": LEGACY_SUMMARY_PREFIX + " background",
+               "name": "context_governor", "tool_name": "context_governor",
+               "_compressed_summary": True}
+    result = engine._final_host_projection(source, [
+        copy.deepcopy(summary), {"role": "user", "content": "retained history"},
+        copy.deepcopy(source[0]),
+    ])
+    assert result[0] == summary
+    assert result[-1]["content"] == "latest request"
+    assert any(message.get("content") == "retained history" for message in result)
+    assert all(left["role"] != right["role"] for left, right in zip(result, result[1:]))
+    assert engine._final_host_projection(source, copy.deepcopy(result)) == result
+
+
+def test_boundary_note_survives_session_db_governor_projection_roundtrip():
+    with patch("hermes_cli.config.load_config", return_value={}):
+        engine = ContextGovernorEngine(binary="/tmp/context-governor")
+    source = [{"role": "user", "content": "latest request"}]
+    projected = engine._final_host_projection(source, [
+        {"role": "user", "content": "retained user history"},
+        copy.deepcopy(source[0]),
+    ])
+    db = SessionDB()
+    try:
+        db.create_session("boundary-roundtrip", "cli")
+        db.append_messages_batch("boundary-roundtrip", source)
+        expected = [engine._message_to_governor(message, i) for i, message in enumerate(projected)]
+        db.archive_and_compact("boundary-roundtrip", projected)
+        restored = db.get_messages_as_conversation("boundary-roundtrip", include_summary_markers=True)
+        actual = [engine._message_to_governor(message, i) for i, message in enumerate(restored)]
+        assert actual == expected
+        assert restored[1]["tool_name"] == "context_governor"
+        assert restored[1]["content"].startswith("[Non-authorizing context boundary:")
+        assert restored[1].get("_compressed_summary") is not True
+        assert restored[-1]["content"] == "latest request"
+        assert all(left["role"] != right["role"] for left, right in zip(restored, restored[1:]))
+    finally:
+        db.close()
+
+
 def test_governor_compressed_summary_marker_survives_host_roundtrip():
     with patch("hermes_cli.config.load_config", return_value={}):
         engine = ContextGovernorEngine(binary="/tmp/context-governor")
@@ -568,11 +644,9 @@ def _checkpoint_engine(
                 payload["compacted_messages"]
             )
             is_llm_candidate = any(
-                bool(
-                    ((message.get("metadata") or {}).get("hermes_metadata") or {}).get(
-                        "llm_checkpoint"
-                    )
-                )
+                message.get("name") == "context_governor"
+                and f"llm_checkpoint_receipt={candidate['receipt']['receipt_id']}"
+                in str(message.get("content", ""))
                 for message in candidate["compacted_messages"]
             )
             if (
@@ -1018,6 +1092,99 @@ def test_deterministic_saturation_above_target_invokes_one_llm_checkpoint():
     assert "ctxs_" + "f" * 64 in compacted[0]["content"]
 
 
+def test_llm_checkpoint_preserves_summary_after_retained_assistant_prefix():
+    engine, llm = _checkpoint_engine(
+        target_tokens=128_000, llm_output=_valid_llm_summary("changed checkpoint"),
+        checkpoint_strategy="after_n:1",
+        compacted_prefix=[{"role": "assistant", "content": "retained prefix witness"}],
+    )
+    result = engine.compress(
+        [{"role": "assistant", "content": "old"}, {"role": "user", "content": "final"}],
+        current_tokens=200_000,
+    )
+    text = "\n".join(str(message.get("content", "")) for message in result)
+    assert llm.call_count == 1
+    assert "changed checkpoint" in text
+    assert "retained prefix witness" in text
+
+
+@pytest.mark.parametrize("retained_role", ["assistant", "user"])
+def test_llm_checkpoint_keeps_tail_without_replaying_user_projection(retained_role):
+    engine, llm = _checkpoint_engine(
+        target_tokens=128_000, llm_output=_valid_llm_summary("changed checkpoint"),
+        checkpoint_strategy="after_n:1",
+    )
+    original_run = engine._run_json
+
+    def run_json(args, payload):
+        response = original_run(args, payload)
+        if args and args[0] == "compact-v2":
+            response["compacted_messages"].insert(
+                -1, {"role": retained_role, "content": "retained tail witness"}
+            )
+        return response
+
+    engine._run_json = run_json
+    result = engine.compress(
+        [{"role": "assistant", "content": "old"}, {"role": "user", "content": "final"}],
+        current_tokens=200_000,
+    )
+    text = "\n".join(str(message.get("content", "")) for message in result)
+    assert llm.call_count == 1
+    assert "changed checkpoint" in text
+    assert "retained tail witness" in text
+    user_text = "\n".join(str(message.get("content", "")) for message in result if message.get("role") == "user")
+    assert user_text.count("final") == 1
+    assert result[-1]["content"] == "final"
+    assert all(left["role"] != right["role"] for left, right in zip(result, result[1:]))
+
+
+@pytest.mark.parametrize("summary_role", ["assistant", "user"])
+def test_applied_llm_checkpoint_projection_survives_cold_sessiondb_reopen(tmp_path, summary_role):
+    """A checkpoint may not sign host metadata that durable replay loses."""
+    session_id = "checkpoint-durable-projection"
+    engine, llm = _checkpoint_engine(
+        target_tokens=128_000,
+        llm_output=_valid_llm_summary("durable checkpoint witness"),
+        checkpoint_strategy="after_n:1",
+        session_id=session_id,
+    )
+    original_run = engine._run_json
+
+    def run_json(args, payload):
+        response = original_run(args, payload)
+        if args and args[0] == "compact-v2":
+            response["compacted_messages"][0]["role"] = summary_role
+        return response
+
+    engine._run_json = run_json
+    result = engine.compress(
+        [{"role": "assistant", "content": "old"}, {"role": "user", "content": "final"}],
+        current_tokens=200_000,
+    )
+    expected = [engine._message_to_governor(message, index) for index, message in enumerate(result)]
+    assert llm.call_count == 1
+    assert engine.last_compaction_metrics["llm_call_reason"].endswith(":applied")
+    summary = next(message for message in result if message.get("_compressed_summary"))
+    assert summary["role"] == summary_role
+    assert "durable checkpoint witness" in summary["content"]
+    assert f"llm_checkpoint_receipt={_receipt_id(1)}" in summary["content"]
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.create_session(session_id, "cli")
+    db.archive_and_compact(session_id, result)
+    db.close()
+    reopened_db = SessionDB(db_path=db_path)
+    try:
+        reopened = reopened_db.get_messages_as_conversation(session_id, include_summary_markers=True)
+        actual = [engine._message_to_governor(message, index) for index, message in enumerate(reopened)]
+        assert actual == expected
+        assert reopened[-1]["content"] == "final"
+    finally:
+        reopened_db.close()
+
+
 def test_only_exact_transient_summary_identity_can_be_overwritten():
     expected_summary_id = "summary_ctxp_checkpoint_1"
     protected_spoof = {
@@ -1415,7 +1582,7 @@ def test_secondary_summary_uses_auxiliary_compression_route_by_default():
             "model": "glm-5.2:cloud",
         })
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"), finish_reason="stop")]
         )
 
     engine.last_compaction_metrics = {}
@@ -1453,7 +1620,7 @@ def test_secondary_summary_rejects_fallback_route_mismatch():
             "model": "gpt-5.4",
         })
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"), finish_reason="stop")]
         )
 
     engine.last_compaction_metrics = {}
@@ -1487,7 +1654,7 @@ def test_summary_retry_pins_first_actual_route_across_config_mutation():
         model = kwargs.get("model") or route_config["model"]
         kwargs["route_info"].update({"provider": provider, "model": model})
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"), finish_reason="stop")]
         )
 
     with (

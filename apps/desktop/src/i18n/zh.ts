@@ -2955,6 +2955,8 @@ export const zh: Translations = {
   },
 
   modelPicker: {
+    selectionUnavailable: '所选提供商或模型在此配置文件中不可用。请在此配置或选择其他模型。当前选择已保留。',
+    sessionSelection: '此会话保留自己的模型选择。配置文件默认值的更改适用于新会话。',
     title: '切换模型',
     current: '当前：',
     unknown: '(未知)',
@@ -3407,6 +3409,7 @@ export const zh: Translations = {
       notReady: '澄清请求尚未就绪',
       gatewayDisconnected: 'Hermes 网关未连接',
       sendFailed: '无法发送澄清响应',
+      responseAccepted: '已收到答案',
       responseExpired: '请求已过期。回应可能已送达智能体；重新发送前请检查对话。',
       responseRejected: '回应未被接受，所选答案已保留。',
       responseUncertain: '回应可能已送达智能体，但确认已丢失。重新发送前请检查对话。',
@@ -3555,6 +3558,9 @@ export const zh: Translations = {
     setProfileFailed: '设置配置档案失败',
     sttDisabled: '设置中已禁用语音转文字。',
     stopFailed: '停止失败',
+    stopNotSent: '停止请求未发送，未取消任何内容。',
+    stopAlreadySettled: '该回合已不再活动，未取消任何内容。',
+    stopUnconfirmed: '无法确认停止结果，该回合可能仍在运行。',
     regenerateFailed: '重新生成失败',
     editFailed: '编辑失败',
     editTurnUnavailable: '此回合已不在服务器历史中（可能已被压缩移除）。',
