@@ -1866,7 +1866,33 @@ class GoalManager:
             return f"✓ Goal done ({meta}): {s.goal}"
         return f"Goal ({s.status}, {meta}): {s.goal}"
 
-    # --- mutation -----------------------------------------------------
+    def status_payload(self) -> Optional[Dict[str, Any]]:
+        """Structured status for clients that must not parse prose.
+
+        Mirrors ``status_line()`` without its side effects — it never clears a
+        satisfied barrier, so an event emitter may call it safely. The text line
+        stays canonical for humans and older clients; this object carries the
+        same state addressed by name.
+        """
+        s = self._state
+        if s is None:
+            return None
+        waiting = bool(
+            s.waiting_on_session
+            or s.waiting_on_pid
+            or (s.waiting_until and time.time() < s.waiting_until)
+        )
+        return {
+            "status": s.status,
+            "outcome": s.outcome,
+            "title": s.goal,
+            "turns_used": int(s.turns_used or 0),
+            "max_turns": int(s.max_turns or 0),
+            "waiting": waiting,
+            "continuation_pending": bool(s.continuation_pending),
+        }
+
+    # --- mutation ---------------------------------------------------------
 
     def migrate_legacy_state(self) -> Dict[str, Any]:
         """Upgrade one pre-lifecycle row without inventing task completion.
@@ -3012,6 +3038,24 @@ class GoalManager:
                 "message": (
                     f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used. "
                     "Use /goal resume to keep going, or /goal clear to stop."
+                ),
+            }
+
+        if transport_failed or parse_failed:
+            # Neither is a verdict. Firing a continuation from an unreachable
+            # or unparseable judge spends turns blind and counts them against
+            # the budget as if the goal had been evaluated. The counters above
+            # still auto-pause a persistently broken judge.
+            return {
+                "status": "active",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "skipped",
+                "reason": reason,
+                "message": (
+                    f"⏸ Goal judge unavailable ({reason}) — not continuing."
+                    if transport_failed
+                    else f"⏸ Goal judge returned an unusable verdict ({reason}) — not continuing."
                 ),
             }
 

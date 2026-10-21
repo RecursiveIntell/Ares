@@ -20,6 +20,7 @@ import {
   terminalContextBlocksFromDraft
 } from '@/store/composer'
 import { markQueuedPromptDeliveryUnknown, parkQueuedPrompts } from '@/store/composer-queue'
+import { recordUnadmittedSend } from '@/store/unadmitted-send'
 import { $hudMode } from '@/store/hud'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { consumePendingCredentialWarning, requestDesktopOnboarding } from '@/store/onboarding'
@@ -786,7 +787,18 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           await withSessionNotFoundResume(
             sessionId,
             recoverStoredSessionId,
-            liveId => requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS),
+            liveId => {
+              // Remember exactly what was sent so an admission refusal can
+              // restore it instead of leaving an unrun bubble in the transcript.
+              recordUnadmittedSend(liveId, {
+                optimisticId,
+                queueKey: resolveComposerSessionKey(targetStoredSessionId ?? liveId, $sessions.get()),
+                text: typeof text === 'string' ? text : visibleText,
+                attachments
+              })
+
+              return requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+            },
             {
               requestGateway,
               driftReason: sessionDriftReason,

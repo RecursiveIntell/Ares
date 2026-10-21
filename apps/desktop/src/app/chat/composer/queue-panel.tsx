@@ -152,6 +152,7 @@ export function QueuePanel({
                   automatically.
                 </p>
               )}
+              {entry.note && <p className="text-[0.64rem] text-muted-foreground">{entry.note}</p>}
               {(attachmentsCount > 0 || isEditing) && (
                 <div className="mt-0.5 flex items-center gap-1.5 text-[0.64rem] text-muted-foreground/75">
                   {attachmentsCount > 0 && <span>{c.attachments(attachmentsCount)}</span>}
