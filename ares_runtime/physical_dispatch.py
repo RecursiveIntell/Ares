@@ -281,7 +281,7 @@ def _begin_buffered(request):
     observation = {
         "schema": "ares.physical-send/v1",
         "dispatch_intent_ref": "ares-dispatch-intent:" + uuid.uuid4().hex,
-        "execution_id": None if basis is None else basis["execution_id"],
+        "execution_id": None if basis is None else basis.get("execution_id"),
         "materialization": None if basis is None else basis["materialization"],
         "qualification_error": body_error or (
             "MATERIALIZATION_UNAVAILABLE" if basis is None else basis["qualification_error"]
