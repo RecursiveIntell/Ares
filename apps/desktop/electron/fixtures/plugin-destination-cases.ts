@@ -425,7 +425,12 @@ export async function exerciseDestinationCase(
   const oldBefore = tryDigest(oldFile)!
   const stagingBefore = stages(realRoot)
   const log = path.join(base, 'clone-calls.jsonl')
-  const git = path.join(base, 'fake-git')
+  // '.cjs' is load-bearing: the fixture tmpdir sits under the user's home,
+  // and a package.json with "type": "module" up that tree makes Node parse
+  // an extension-less clone script as ESM, where `require` throws
+  // (goal-wait-effort-clobber-20261020 full-suite finding). .cjs is always
+  // CommonJS regardless of an ancestor package type.
+  const git = path.join(base, 'fake-git.cjs')
 
   const cloneScript = `#!${fixtureNodeExecutable}
 const fs = require('node:fs'); const path = require('node:path');

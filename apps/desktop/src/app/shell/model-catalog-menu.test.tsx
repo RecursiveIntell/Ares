@@ -186,4 +186,42 @@ describe('the catalog owns model curation', () => {
 
     expect($modelVisibilityOpen.get()).toBe(true)
   })
+
+  // ── Task 3.2 (goal-wait-effort-clobber-20261020) ───────────────────────
+  // While a deferred switch is mid-flight, the active row's meta label shows
+  // the PENDING effort choice, not the last confirmed one.
+
+  it('the active row shows the pending effort while a switch is mid-flight', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          models: ['claude-sonnet-4.6'],
+          name: 'Anthropic',
+          slug: 'anthropic',
+          capabilities: { 'claude-sonnet-4.6': { reasoning: true } }
+        }
+      ]
+    })
+
+    renderMenu({
+      current: {
+        effort: 'high',
+        effortPending: 'low',
+        fast: false,
+        model: 'claude-sonnet-4.6',
+        provider: 'anthropic'
+      }
+    })
+
+    // The exec-name prettifier drops the `claude-` vendor prefix
+    // (modelDisplayParts → "Sonnet 4.6"), so match what actually renders.
+    const row = await screen.findByText(/Sonnet 4\.6/i)
+    // The row label carries the pending value next to the name.
+    await vi.waitFor(() => {
+      const label = row.closest('[role="menuitem"], [data-radix-collection-item]') ?? row.parentElement
+      // The effort label is Title-cased by reasoningEffortLabel.
+      expect(label?.textContent?.toLowerCase()).toContain('low')
+      expect(label?.textContent?.toLowerCase()).not.toContain('high')
+    })
+  })
 })
