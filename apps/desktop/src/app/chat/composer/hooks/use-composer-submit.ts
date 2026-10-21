@@ -1,7 +1,7 @@
 import { type RefObject, useLayoutEffect, useRef, useState } from 'react'
 
-import { translateNow } from '@/i18n'
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
+import { translateNow } from '@/i18n'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
 import { hasClarifyRequest, skipClarifyRequest } from '@/store/clarify'

@@ -40,16 +40,20 @@ def test_transport_failure_parks_instead_of_continuing(monkeypatch):
     assert "Goal judge unavailable" in decision["message"]
 
 
-def test_parse_failure_parks_instead_of_continuing(monkeypatch):
+def test_parse_failure_keeps_its_existing_contract(monkeypatch):
+    # Deliberate distinction: parse failures tolerate two and auto-pause on the
+    # third (tests/hermes_cli/test_goals.py). Only an unreachable judge parks
+    # immediately, because no verdict was ever produced.
     monkeypatch.setattr(
         goals,
         "judge_goal",
         lambda *a, **k: ("continue", "unparseable verdict", True, None, False),
     )
     mgr = _manager()
+    mgr._checkpoint = lambda *a, **k: True
+    mgr.next_continuation_prompt = lambda: "next step"
 
     decision = mgr.evaluate_after_turn("some work")
 
-    assert decision["should_continue"] is False
-    assert decision["continuation_prompt"] is None
-    assert "unusable verdict" in decision["message"]
+    assert decision["should_continue"] is True
+    assert "Continuing toward goal" in decision["message"]

@@ -3041,22 +3041,18 @@ class GoalManager:
                 ),
             }
 
-        if transport_failed or parse_failed:
-            # Neither is a verdict. Firing a continuation from an unreachable
-            # or unparseable judge spends turns blind and counts them against
-            # the budget as if the goal had been evaluated. The counters above
-            # still auto-pause a persistently broken judge.
+        if transport_failed:
+            # An unreachable judge is not a verdict: firing the next turn would
+            # spend it blind and charge it to the budget as if the goal had been
+            # evaluated. Parse failures keep their existing contract above
+            # (tolerate two, then auto-pause) — that counter is deliberate.
             return {
                 "status": "active",
                 "should_continue": False,
                 "continuation_prompt": None,
                 "verdict": "skipped",
                 "reason": reason,
-                "message": (
-                    f"⏸ Goal judge unavailable ({reason}) — not continuing."
-                    if transport_failed
-                    else f"⏸ Goal judge returned an unusable verdict ({reason}) — not continuing."
-                ),
+                "message": f"⏸ Goal judge unavailable ({reason}) — not continuing.",
             }
 
         if not self._checkpoint(

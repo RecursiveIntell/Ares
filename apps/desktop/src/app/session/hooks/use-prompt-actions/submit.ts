@@ -20,7 +20,6 @@ import {
   terminalContextBlocksFromDraft
 } from '@/store/composer'
 import { markQueuedPromptDeliveryUnknown, parkQueuedPrompts } from '@/store/composer-queue'
-import { recordUnadmittedSend } from '@/store/unadmitted-send'
 import { $hudMode } from '@/store/hud'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { consumePendingCredentialWarning, requestDesktopOnboarding } from '@/store/onboarding'
@@ -35,6 +34,7 @@ import {
   touchSessionActivity
 } from '@/store/session'
 import { $sessionStates } from '@/store/session-states'
+import { recordUnadmittedSend } from '@/store/unadmitted-send'
 
 import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'

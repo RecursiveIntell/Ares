@@ -1005,13 +1005,13 @@ export function ChatBar({
       hasComposerPayload={hasComposerPayload}
       interruptPending={interruptPending}
       minimal={minimal}
-      stopUnsettled={stopUnsettled}
       onDictate={dictate}
       onQueue={queueDraft}
       onStop={haltRun}
       onToggleAutoSpeak={handleToggleAutoSpeak}
       state={state}
       steeringPending={steeringPending}
+      stopUnsettled={stopUnsettled}
       voiceStatus={voiceStatus}
     />
   )

@@ -21,9 +21,9 @@ vi.mock('@/store/prompts', () => ({ clearAllPrompts }))
 vi.mock('@/store/clarify', () => ({ clearClarifyRequest }))
 vi.mock('@/i18n', () => ({ translateNow: (key: string) => key }))
 
-const { handleStatusEvent } = await import('./status')
 const { $queuedPromptsBySession } = await import('@/store/composer-queue')
 const { $unadmittedSendBySession, recordUnadmittedSend } = await import('@/store/unadmitted-send')
+const { handleStatusEvent } = await import('./status')
 
 type Ctx = Parameters<typeof handleStatusEvent>[0]
 
@@ -119,6 +119,7 @@ describe('session-busy admission refusal', () => {
 
     const update = ctx.deps.updateSessionState as unknown as ReturnType<typeof vi.fn>
     const [, updater] = update.mock.calls[0]
+
     const settled = updater({
       awaitingResponse: true,
       busy: true,

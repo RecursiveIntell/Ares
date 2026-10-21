@@ -174,7 +174,8 @@ export const ResponseLoadingIndicator: FC = () => {
   const { activity, compacting, drafting, providerWait, turnStartedAt } = useThreadSessionStatus()
   const elapsed = useElapsedSeconds(true, undefined, turnStartedAt)
   const activityLabel = useActivityLabel(activity)
-  const hint = activityLabel || useStatusHint(compacting, drafting, providerWait)
+  const statusHint = useStatusHint(compacting, drafting, providerWait)
+  const hint = activityLabel || statusHint
 
   return (
     <StatusRow data-slot="aui_response-loading" label={hint || t.assistant.thread.loadingResponse}>
