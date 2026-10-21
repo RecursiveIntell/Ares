@@ -80,6 +80,12 @@ REMOTE_PROVIDERS = frozenset(
     }
 )
 
+ARCHIVE_PROCESS_ENV_KEYS = frozenset({
+    "HOME", "HERMES_REAL_HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "SYSTEMROOT", "WINDIR", "TEMP", "TMP",
+    "TMPDIR", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "PYTHONUTF8",
+    "PYTHONDONTWRITEBYTECODE",
+})
 DAEMON_POOL_BLOCK_MARKERS = (
     b"every inspection tool failed",
     b"all execution and file-inspection tools failed",
@@ -218,6 +224,19 @@ def profile_resource_plan(profile_home: Path) -> dict[str, Any]:
     config_path = profile_home / "config.yaml"
     try:
         config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        return {
+            "weight": 1,
+            "policy": "minimal_fallback_no_config_v1",
+            "provider": "unknown",
+            "enabled_mcp_count": 0,
+            "enabled_plugin_count": 0,
+            "timeout_floor_seconds": None,
+            "reasons": ["profile_config_absent"],
+            "config_path": str(config_path),
+            "config_sha256": "unavailable",
+            "reasoning_effort": DEFAULT_PROFILE_REASONING_EFFORT,
+        }
     except (OSError, yaml.YAMLError) as exc:
         raise RuntimeError(f"cannot classify profile resource cost: {config_path}: {type(exc).__name__}") from exc
     if not isinstance(config, dict):
@@ -320,19 +339,37 @@ def effective_profile_timeout(requested_timeout: float, resource_plan: dict[str,
     return max(requested_timeout, float(floor)) if floor is not None else requested_timeout
 
 
-def panel_child_environment() -> dict[str, str]:
-    """Build a non-secret host base before binding one target profile.
+def panel_child_environment(
+    *, profile_home: Path | None = None, inherit_credentials: bool = True,
+) -> dict[str, str]:
+    """Build the child environment through the runtime's canonical profile boundary.
 
-    The panel must not turn the controller's ambient profile credentials,
-    routing hints, or stale provider state into child authority. Hermes resolves
-    the selected profile's explicit configuration and credential boundary after
-    this function installs its target ``HERMES_HOME``.
+    When a target ``profile_home`` is supplied, delegate to
+    ``agent.secret_scope.build_profile_env_boundary`` so source credentials are
+    stripped and explicit target/root grants are preserved exactly as the
+    runtime defines them. Fall back to the historical host allowlist when the
+    runtime package is unavailable, so the runner still boots in isolation.
     """
-    return {
+    base = {
         name: value
         for name in PANEL_CHILD_ENVIRONMENT_ALLOWLIST
         if isinstance((value := os.environ.get(name)), str) and value
     }
+    if profile_home is None:
+        return base
+    try:
+        from agent.secret_scope import build_profile_env_boundary
+        from hermes_constants import get_process_hermes_home
+        from tools.environments.local import hermes_subprocess_env
+
+        boundary = build_profile_env_boundary(
+            source_home=get_process_hermes_home(), target_home=profile_home,
+        )
+        return hermes_subprocess_env(
+            inherit_credentials=inherit_credentials, profile_boundary=boundary,
+        )
+    except ImportError:
+        return base
 
 
 READONLY_REVIEW_POLICY = "linux_bwrap_root_ro_profile_state_v1"
@@ -716,7 +753,19 @@ def archive_automation_session(
         "finally:\n"
         "    db.close()\n"
     )
-    environment = os.environ.copy()
+    try:
+        boundary_environment = panel_child_environment(
+            profile_home=profile_home, inherit_credentials=False,
+        )
+    except Exception as exc:
+        return {"outcome": "failed", "detail": type(exc).__name__}
+    # The archive helper is a pure session-store projection: strip the
+    # boundary env to process-safe keys so no provider or controller
+    # credential — source OR target — crosses into it.
+    environment = {
+        name: value for name, value in boundary_environment.items()
+        if name.upper() in ARCHIVE_PROCESS_ENV_KEYS
+    }
     environment.update(
         {
             "HERMES_HOME": str(profile_home),
@@ -828,14 +877,14 @@ def panel_session_id_exists(profile_home: Path, session_id: str) -> bool:
 def run_one(
     *,
     profile: str,
-    run_id: str,
     brief: str,
     runtime: Path,
     workspace: Path,
     receipt_dir: Path,
     timeout: float,
-    admission_pool: GlobalAdmissionPool,
-    resource_plan: dict[str, Any],
+    run_id: str | None = None,
+    admission_pool: GlobalAdmissionPool | None = None,
+    resource_plan: dict[str, Any] | None = None,
     registry: ProcessRegistry | None = None,
     panel_cancelled: threading.Event | None = None,
     read_only_review: bool = False,
@@ -843,6 +892,23 @@ def run_one(
     lane_toolsets: str | None = None,
 ) -> dict[str, Any]:
     profile_home = Path.home() / ".ares" / "profiles" / profile
+    if resource_plan is None:
+            resource_plan = {
+                "weight": 1,
+                "policy": "minimal_fallback_no_config_v1",
+                "provider": "unknown",
+                "enabled_mcp_count": 0,
+                "enabled_plugin_count": 0,
+                "timeout_floor_seconds": None,
+                "reasons": ["resource_plan_not_supplied"],
+                "reasoning_effort": DEFAULT_PROFILE_REASONING_EFFORT,
+                "config_path": str(profile_home / "config.yaml"),
+                "config_sha256": "unavailable",
+            }
+    if run_id is None:
+        run_id = receipt_dir.name
+    if admission_pool is None:
+        admission_pool = GlobalAdmissionPool()
     session_id = panel_session_id(run_id, profile)
     if panel_session_id_exists(profile_home, session_id):
         raise RuntimeError(f"ONESHOT_SESSION_ID_COLLISION:{profile}")
@@ -874,7 +940,8 @@ def run_one(
     if lane_toolsets:
         command += ["--toolsets", lane_toolsets]
     command += ["-z", effective_brief]
-    environment = panel_child_environment()
+    environment = panel_child_environment(profile_home=profile_home)
+    environment.pop("HERMES_TUI", None)
     # A panel child receives only an explicit target home and panel-owned
     # runtime identity. It must not inherit another profile's ambient provider
     # variables, renderer routing, or secret scope from the controller.
@@ -891,6 +958,7 @@ def run_one(
             "ARES_MANAGED_RUNTIME": "1",
             "ARES_PANEL_PROFILE": profile,
             "ARES_PANEL_WORKSPACE": str(workspace),
+            "TERMINAL_CWD": str(workspace),
             "ARES_PANEL_TIMEOUT_SECONDS": str(timeout),
             "ARES_PANEL_REASONING_EFFORT": reasoning_effort,
             "ARES_PANEL_REPORT_RESERVE_SECONDS": str(min(30.0, max(5.0, timeout * 0.1))),
@@ -966,7 +1034,8 @@ def run_one(
     input_manifest_sha256 = hashlib.sha256(input_manifest_bytes).hexdigest()
     secret_values = secret_environment_values(environment)
     config_path = Path(resource_plan["config_path"])
-    if sha256_file(config_path) != resource_plan["config_sha256"]:
+    planned_config_sha256 = resource_plan["config_sha256"]
+    if planned_config_sha256 != "unavailable" and sha256_file(config_path) != planned_config_sha256:
         raise RuntimeError(f"profile config changed after resource planning: {profile}")
     if panel_cancelled is not None and panel_cancelled.is_set():
         raise concurrent.futures.CancelledError("panel deadline reached before profile start")
@@ -1024,14 +1093,19 @@ def run_one(
                             except subprocess.TimeoutExpired:
                                 pass
         finally:
-            if process_group_exists(process.pid):
+            process_pid = getattr(process, "pid", None)
+            if process_pid is not None and process_group_exists(process_pid):
                 cleanup_status = terminate_process_group(process)
             if registry is not None:
                 registry.discard(profile, process)
     finally:
         lease.release()
-    return_code = process.returncode
-    if not process_group_exists(process.pid):
+    return_code = process.returncode if hasattr(process, "returncode") else 0
+    process_pid = getattr(process, "pid", None)
+    if process_pid is None:
+        cleanup_status["leader_reaped"] = True
+        cleanup_status["group_gone"] = True
+    elif not process_group_exists(process_pid):
         cleanup_status["leader_reaped"] = return_code is not None
         cleanup_status["group_gone"] = True
     cleanup_state = (
@@ -1084,7 +1158,7 @@ def run_one(
         "profile": profile,
         "profile_home": str(profile_home),
         "containment": containment,
-        "process_id": process.pid,
+        "process_id": getattr(process, "pid", None),
         "session_id": session_id,
         "session_archive_requested": True,
         "session_archive_outcome": archive["outcome"],
@@ -1244,7 +1318,8 @@ def main() -> int:
     if not workspace.is_dir():
         raise SystemExit(f"workspace does not exist: {workspace}")
     runtime_status = runtime_worktree_status(runtime)
-    if args.read_only_review and runtime_status is None:
+    read_only_review = getattr(args, "read_only_review", False)
+    if read_only_review and runtime_status is None:
         raise SystemExit("contained review requires a positively verified runtime worktree")
     if runtime_status:
         raise SystemExit(
@@ -1259,21 +1334,22 @@ def main() -> int:
     if args.max_workers < 1 or args.max_workers > SESSION_WORKER_LIMIT:
         raise SystemExit(f"max-workers must be between 1 and {SESSION_WORKER_LIMIT}")
     worker_count = min(args.max_workers, len(profiles))
-    review_mode = args.review_mode
+    review_mode = getattr(args, "review_mode", "standard")
     lane_toolsets = (
-        args.lane_toolsets.strip() if args.lane_toolsets and args.lane_toolsets.strip() else None
+        (getattr(args, "lane_toolsets", None) or "").strip() or None
     )
-    if args.lane_toolsets == LANE_TOOLSETS_FULL and review_mode == "text_only":
+    if (getattr(args, "lane_toolsets", None) or None) == LANE_TOOLSETS_FULL and review_mode == "text_only":
         # Default toolsets would override the text-only lane contract; leave
         # lane_toolsets=None so run_one picks the narrower review set.
         lane_toolsets = None
     workspace_size = -1
-    if args.workspace_gate_bytes > 0:
+    gate_bytes = getattr(args, "workspace_gate_bytes", DEFAULT_WORKSPACE_GATE_BYTES)
+    if gate_bytes > 0:
         workspace_size = workspace_size_bytes(workspace)
-        if workspace_size >= 0 and workspace_size > args.workspace_gate_bytes:
+        if workspace_size >= 0 and workspace_size > gate_bytes:
             raise SystemExit(
                 f"workspace gate failed: {workspace} is {workspace_size / (1024**3):.2f} GiB, "
-                f"above the {args.workspace_gate_bytes / (1024**3):.2f} GiB lane budget "
+                f"above the {gate_bytes / (1024**3):.2f} GiB lane budget "
                 "(re-run with --workspace-gate-bytes 0 to override explicitly, or scope "
                 "the lane to a smaller workspace)"
             )
@@ -1361,7 +1437,7 @@ def main() -> int:
         "requested_panel_timeout_seconds": args.panel_timeout,
         "panel_timeout_seconds": effective_panel_timeout,
         "scope": "read-only profile consultation; no profile mutation authorized",
-        "read_only_review": args.read_only_review,
+        "read_only_review": read_only_review,
         "review_mode": review_mode,
         "lane_toolsets": lane_toolsets,
         "workspace_size_bytes": workspace_size,
@@ -1444,7 +1520,7 @@ def main() -> int:
             resource_plan=resource_plans[profile],
             registry=registry,
             panel_cancelled=panel_cancelled,
-            read_only_review=args.read_only_review,
+            read_only_review=read_only_review,
             review_mode=review_mode,
             lane_toolsets=lane_toolsets,
         ): profile

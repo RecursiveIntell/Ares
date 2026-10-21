@@ -9,7 +9,6 @@ metadata:
   hermes:
     tags: [profiles, collaboration, evidence, publication, routing]
     category: productivity
-    related_skills: [ares-agent-skill-authoring, governed-work-closeout]
 ---
 
 # Profile-Separated Ares Collaboration
