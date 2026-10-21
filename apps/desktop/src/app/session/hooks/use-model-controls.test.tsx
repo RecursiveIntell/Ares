@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { setApiRequestConnection, setApiRequestProfile } from '@/api/client'
 import { getGlobalModelInfo } from '@/hermes'
 import { modelOptionsQueryKey } from '@/lib/model-options'
+import { $modelPresets, getModelPreset } from '@/store/model-presets'
 import { $newChatProfile, $newChatRoute } from '@/store/profile'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
@@ -71,6 +72,9 @@ vi.mock('@/store/notifications', () => ({
 
 type Controls = ReturnType<typeof useModelControls>
 
+// Module-level so record-back tests can call the hook's selectModel directly.
+let controlsRef: Controls | null = null
+
 function Harness({
   onReady,
   requestGateway
@@ -83,6 +87,7 @@ function Harness({
     requestGateway
   })
 
+  controlsRef = controls
   onReady(controls)
 
   return null
@@ -773,5 +778,47 @@ describe('useModelControls', () => {
       provider: 'anthropic'
     })
     expect(queryClient.getQueryData(modelOptionsQueryKey('default', 'tile-runtime'))).toBeUndefined()
+  })
+
+  // ── Task 3.1 (goal-wait-effort-clobber-20261020): record-back ──────────
+  // After a NON-deferred switch, the model's remembered preset must reflect
+  // the effort the session ACTUALLY ends with (server-confirmed), not the
+  // previous model's stale effort. This is what makes the NEXT selection of
+  // that model open at the effort the user experienced, closing the reported
+  // "switch leaves the old model's effort" loop.
+
+  it('records the confirmed effort into the target model preset after a non-deferred switch', async () => {
+    $modelPresets.set({})
+    $activeSessionId.set('session-1')
+    setCurrentModel('old-model')
+    setCurrentProvider('openai')
+
+    const requestGateway = vi.fn(async () => ({
+      key: 'model',
+      value: 'claude-sonnet-4.6',
+      selector_info: { model: 'claude-sonnet-4.6', provider: 'anthropic', reasoning_effort: 'medium' }
+    }) as never)
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    await act(async () => {
+      await result.current.selectModel({ model: 'claude-sonnet-4.6', provider: 'anthropic' })
+    })
+
+    expect(getModelPreset('anthropic', 'claude-sonnet-4.6')).toEqual({ effort: 'medium' })
+  })
+
+  it('does not stamp a preset when the switch is deferred (intent not yet confirmed)', async () => {
+    $modelPresets.set({})
+    $activeSessionId.set('session-1')
+
+    const requestGateway = vi.fn(async () => ({ key: 'model', value: 'claude-sonnet-4.6', deferred: true }) as never)
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    await act(async () => {
+      await result.current.selectModel({ model: 'claude-sonnet-4.6', provider: 'anthropic' })
+    })
+
+    expect(getModelPreset('anthropic', 'claude-sonnet-4.6')).toEqual({})
   })
 })

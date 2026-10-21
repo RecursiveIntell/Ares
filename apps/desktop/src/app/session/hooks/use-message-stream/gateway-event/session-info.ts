@@ -11,8 +11,11 @@ import {
   $currentCwd,
   $currentModel,
   $currentProvider,
+  $currentReasoningEffort,
   $selectedStoredSessionId,
   $sessions,
+  clearComposerOptionIntent,
+  hasComposerOptionIntent,
   sessionMatchesStoredId,
   setActiveSessionId,
   setCurrentBranch,
@@ -235,21 +238,41 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
 
       if (
         selectorPatch.reasoningEffort !== undefined &&
-        (pendingOptions?.effort === undefined || selectorPatch.reasoningEffort === pendingOptions.effort)
+        // Server truth CATCHING UP (readback carries the picked value) retires
+        // the client-pick intent — later genuine backend changes are the
+        // authority again. A readback with the OLD value never clears it.
+        hasComposerOptionIntent('effort') && selectorPatch.reasoningEffort === $currentReasoningEffort.get() &&
+        clearComposerOptionIntent(['effort'])
+      ) {
+        // (readback settled; no repaint needed)
+      }
+
+      if (
+        selectorPatch.reasoningEffort !== undefined &&
+        (pendingOptions?.effort === undefined || selectorPatch.reasoningEffort === pendingOptions.effort) &&
+        // A client-originated composer pick still in flight (intent newer than
+        // its config.set round-trip) owns the draft surface: a heartbeat
+        // stamped before that write landed must not repaint the pick
+        // (goal-wait-effort-clobber-20261020 case 2). The readback that
+        // CARRIES the picked value cleared the intent above; a genuine
+        // backend change after the TTL passes is never masked.
+        !hasComposerOptionIntent('effort')
       ) {
         setCurrentReasoningEffort(selectorPatch.reasoningEffort, false)
       }
 
       if (
         selectorPatch.serviceTier !== undefined &&
-        (pendingOptions?.fast === undefined || selectorPatch.fast === pendingOptions.fast)
+        (pendingOptions?.fast === undefined || selectorPatch.fast === pendingOptions.fast) &&
+        !hasComposerOptionIntent('fast')
       ) {
         setCurrentServiceTier(selectorPatch.serviceTier)
       }
 
       if (
         selectorPatch.fast !== undefined &&
-        (pendingOptions?.fast === undefined || selectorPatch.fast === pendingOptions.fast)
+        (pendingOptions?.fast === undefined || selectorPatch.fast === pendingOptions.fast) &&
+        !hasComposerOptionIntent('fast')
       ) {
         setCurrentFastMode(selectorPatch.fast, false)
       }

@@ -8,6 +8,7 @@ import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
 import { modelOptionsQueryKey } from '@/lib/model-options'
+import { setModelPreset } from '@/store/model-presets'
 import { reconcileSelectorInfo } from '@/lib/selector-observation'
 import { activeGatewayConnectionId } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
@@ -645,7 +646,26 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         // model still running and repaint the old name over the user's choice —
         // the switch publishes session.info when it lands, and that is what
         // re-syncs every surface.
+        //
+        // Record-back (goal-wait-effort-clobber-20261020 Task 3.1): a
+        // non-deferred switch carries the server-confirmed selector state —
+        // including the effort the session ACTUALLY ends with (the backend
+        // resolves the target model's default when the pick is silent). Stamp
+        // the target model's preset from that truth, so the NEXT selection of
+        // this model opens at the effort the user actually experienced
+        // instead of a stale remembered value. Deferred switches confirm
+        // later (session.info); stamping nothing here is exactly right.
         if (!result?.deferred) {
+          const confirmedEffort = result?.selector_info?.reasoning_effort
+
+          if (
+            typeof confirmedEffort === 'string' &&
+            confirmedEffort &&
+            (result?.selector_info?.model ?? result?.value) === selection.model
+          ) {
+            setModelPreset(selection.provider, selection.model, { effort: confirmedEffort })
+          }
+
           if (liveSessionId && owns('model')) {
             const ackModel = result?.selector_info?.model ?? result?.value
             const ackProvider = result?.selector_info?.provider

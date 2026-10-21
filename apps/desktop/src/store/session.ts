@@ -1160,6 +1160,66 @@ export function ownsRuntimeOptionIntent(target: string, dimension: string, token
   return runtimeOptionIntents.get(JSON.stringify([target, dimension])) === token
 }
 
+// Composer-draft runtime-option intents (goal-wait-effort-clobber-20261020):
+// an effort/fast pick made on the composer enters optimistic LOCAL state
+// before its config.set round-trip lands. A session.info heartbeat stamped
+// BEFORE that write arrives on the socket moments later and — unguarded —
+// repaints the pill with the pre-pick value the user just changed. This is the
+// observed effort-clobber. Model picks are protected by their own
+// ticket/generation machinery; option dimensions need the same class of
+// intent, scoped to the shared draft surface rather than one runtime slice.
+// One token per dimension; a newer pick supersedes it; every writer self-clears
+// on server readback, and a bounded sequence clears abandoned picks so the
+// guard cannot mask genuine backend changes indefinitely.
+let composerOptionIntentSequence = 0
+const composerOptionIntents = new Map<string, { token: number; at: number }>()
+const COMPOSER_OPTION_INTENT_TTL_MS = 10_000
+
+/** Stamp a client-originated draft pick for one or both option dimensions.
+ *  Called by the optimistic write paths right after the atom update. */
+export function markComposerOptionIntent(dimensions: readonly ('effort' | 'fast')[]): void {
+  const now = Date.now()
+
+  for (const dimension of dimensions) {
+    composerOptionIntents.set(dimension, { token: ++composerOptionIntentSequence, at: now })
+  }
+
+  while (composerOptionIntents.size > 8) {
+    const oldest = [...composerOptionIntents.entries()].sort((a, b) => a[1].at - b[1].at)[0]
+
+    if (oldest) {
+      composerOptionIntents.delete(oldest[0])
+    }
+  }
+}
+
+/** True when a pick newer than the TTL is still unsettled — callers must not
+ *  repaint that dimension from server truth yet. Expired entries self-clear. */
+export function hasComposerOptionIntent(dimension: 'effort' | 'fast'): boolean {
+  const entry = composerOptionIntents.get(dimension)
+
+  if (!entry) {
+    return false
+  }
+
+  if (Date.now() - entry.at >= COMPOSER_OPTION_INTENT_TTL_MS) {
+    composerOptionIntents.delete(dimension)
+
+    return false
+  }
+
+  return true
+}
+
+/** Clear the intent once the server's own value has caught up (readback
+ *  settled) or the pick failed/cancelled — server truth is authoritative
+ *  again from that point. */
+export function clearComposerOptionIntent(dimensions: readonly ('effort' | 'fast')[]): void {
+  for (const dimension of dimensions) {
+    composerOptionIntents.delete(dimension)
+  }
+}
+
 export const getComposerSelectionGeneration = (): number => composerSelectionGeneration
 
 export const markComposerSelectionManual = (): void => {
@@ -1343,6 +1403,11 @@ export const setCurrentReasoningEffort = (next: Updater<string>, persist = true)
   updateAtom($currentReasoningEffort, next)
 
   if (persist) {
+    // A persisted write is a client-originated pick (draft preference), not a
+    // server-truth repaint — those always pass persist=false. Stamp the
+    // composer intent so a stale in-flight session.info readback cannot
+    // repaint the pre-pick value (goal-wait-effort-clobber-20261020).
+    markComposerOptionIntent(['effort'])
     persistString(COMPOSER_EFFORT_KEY, $currentReasoningEffort.get() || null)
   }
 }
@@ -1369,6 +1434,8 @@ export const setCurrentFastMode = (next: Updater<boolean>, persist = true) => {
   updateAtom($currentFastMode, next)
 
   if (persist) {
+    // Same client-pick intent stamp as effort (see setCurrentReasoningEffort).
+    markComposerOptionIntent(['fast'])
     persistBoolean(COMPOSER_FAST_KEY, $currentFastMode.get())
   }
 }

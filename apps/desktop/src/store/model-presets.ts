@@ -14,6 +14,7 @@ import {
   $currentReasoningEffort,
   $selectedStoredSessionId,
   beginRuntimeOptionIntent,
+  clearComposerOptionIntent,
   ownsRuntimeOptionIntent,
   setCurrentFastMode,
   setCurrentReasoningEffort
@@ -93,6 +94,9 @@ export async function applyModelPreset(
   }
 
   if (!ctx.sessionId) {
+    // The composer setters stamp their own client-pick intent on persisted
+    // writes (store/session.ts), so a stale in-flight session.info readback
+    // cannot repaint the pre-pick value; cleared on TTL or at readback settle.
     if (effort !== undefined) {
       setCurrentReasoningEffort(effort)
     }
@@ -173,6 +177,13 @@ export async function applyModelPreset(
     if ((effort === undefined || !owns('effort')) && (fast === undefined || !owns('fast'))) {
       return
     }
+
+    // The write settled (or its failure is handled below): server truth is
+    // authoritative again for the picked dimensions.
+    clearComposerOptionIntent([
+      ...(effort !== undefined && owns('effort') ? (['effort' as const] as const) : []),
+      ...(fast !== undefined && owns('fast') ? (['fast' as const] as const) : [])
+    ])
 
     sessionTileDelegate()?.updateSession(runtimeId, current => {
       const pending = { ...current.pendingRuntimeOptions }

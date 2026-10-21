@@ -71,11 +71,44 @@ function nextGoalFromText(text: string, previous?: SessionGoal): SessionGoal | n
 
   const now = Date.now()
   const fromSet = goalTitleFromLine(line, /^⊙ Goal set(?:\s*\([^)]*\))?:\s*(.+)$/)
-  const fromActive = goalTitleFromLine(line, /^⊙ Goal\s*\([^)]*active[^)]*\):\s*(.+)$/)
   const fromResume = goalTitleFromLine(line, /^▶ Goal resumed:\s*(.+)$/)
 
-  if (fromSet || fromActive || fromResume) {
-    return { status: 'active', title: fromSet || fromActive || fromResume, updatedAt: now }
+  if (fromSet || fromResume) {
+    return { status: 'active', title: fromSet || fromResume, updatedAt: now }
+  }
+
+  // Full status_line() grammar (Task 1.3, audit M2): every active-status line
+  // the runtime emits is `<emoji> Goal active · <clause> (…): goal` — the
+  // paren sits AFTER the clause, so the old `Goal (…active…):` shape doesn't
+  // match them and the pill went stale. One table owns the whole family.
+  // The title is everything after the LAST `): ` or `: ` separating meta —
+  // status_line() always ends with `: {goal}` / `): {goal}` / `…({meta}): {goal}`.
+  const ACTIVE_CLAUSE_STATUS: Array<[RegExp, GoalStatus]> = [
+    [/^⏳ Goal active · waiting\b/, 'waiting'],
+    [/^⊙ Goal active · waiting\b/, 'waiting'],
+    [/^⊙ Goal active · awaiting your confirmation\b/, 'active'],
+    [/^⊙ Goal active · blocked\b/, 'active'],
+    [/^⊙ Goal active · checkpointed\b/, 'active'],
+    [/^⊙ Goal active · running\b/, 'active']
+  ]
+
+  for (const [pattern, status] of ACTIVE_CLAUSE_STATUS) {
+    if (pattern.test(line)) {
+      // Title rides after the final `: ` that follows the meta paren (or
+      // directly after the clause when no paren is present). One or zero
+      // parens may precede it; the goal text itself may contain colons.
+      const title = (line.match(/^[^:]+(?:\([^)]*\))?[^:]*:\s*(.+)$/) ?? line.match(/^[^:]*:\s*(.+)$/))?.[1]?.trim()
+
+      if (title) {
+        return { status, title, updatedAt: now }
+      }
+    }
+  }
+
+  const fromActive = goalTitleFromLine(line, /^⊙ Goal\s*\([^)]*active[^)]*\):\s*(.+)$/)
+
+  if (fromActive) {
+    return { status: 'active', title: fromActive, updatedAt: now }
   }
 
   const fromWaiting = goalTitleFromLine(line, /^⏳ Goal\s*\([^)]*(?:parked|active)[^)]*\):\s*(.+)$/)

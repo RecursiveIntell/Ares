@@ -126,4 +126,80 @@ describe('goal store', () => {
 
     expect($goalsBySession.get().s2).toMatchObject({ status: 'paused', title: 'other work' })
   })
+
+  // ── Full status_line() grammar (Task 1.3, audit M2) ────────────────────
+  // The runtime emits these exactly (hermes_cli/goals.py status_line()); each
+  // must parse to the right status — never leave the previous label stale.
+
+  it('parses the plain running line', () => {
+    applyGoalStatusText('s1', '⊙ Goal set: ship the feature')
+    applyGoalStatusText('s1', '⊙ Goal active · running (6/50 turns): ship the feature')
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'active', title: 'ship the feature' })
+  })
+
+  it('parses the awaiting-confirmation line as active', () => {
+    applyGoalStatusText('s1', '⊙ Goal set: finish phases')
+    applyGoalStatusText(
+      's1',
+      '⊙ Goal active · awaiting your confirmation (verify with /goal complete, 6/50 turns): finish phases'
+    )
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'active', title: 'finish phases' })
+  })
+
+  it('parses the waiting-for-authority line as waiting', () => {
+    applyGoalStatusText('s1', '⊙ Goal set: ci merge train')
+    applyGoalStatusText('s1', '⊙ Goal active · waiting for authority (7/50 turns): ci merge train')
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'waiting', title: 'ci merge train' })
+  })
+
+  it('parses the blocked line as active-looking', () => {
+    applyGoalStatusText('s1', '⊙ Goal set: x')
+    applyGoalStatusText('s1', '⊙ Goal active · blocked (6/50 turns): x')
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'active', title: 'x' })
+  })
+
+  it('parses checkpointed outcome lines as active-looking', () => {
+    applyGoalStatusText('s1', '⊙ Goal set: x')
+    applyGoalStatusText('s1', '⊙ Goal active · checkpointed · turn_budget_exhausted (6/50 turns): x')
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'active', title: 'x' })
+  })
+
+  it('parses the time-barrier waiting line', () => {
+    applyGoalStatusText('s1', '⊙ Goal set: rate-limited work')
+    applyGoalStatusText('s1', '⏳ Goal active · waiting (12s — backoff, 6/50 turns): rate-limited work')
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'waiting', title: 'rate-limited work' })
+  })
+
+  it('replaces a stale waiting pill when the goal resumes work', () => {
+    applyGoalStatusText('s1', '⊙ Goal set: ci merge train')
+    applyGoalStatusText('s1', '⊙ Goal active · waiting for authority (7/50 turns): ci merge train')
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'waiting' })
+
+    applyGoalStatusText('s1', '⊙ Goal active · running (8/50 turns): ci merge train')
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'active' })
+  })
+
+  it('parses continuation-pending checkpointed lines as active', () => {
+    applyGoalStatusText('s1', '⊙ Goal set: y')
+    applyGoalStatusText('s1', '⊙ Goal active · checkpointed · continuation pending (9/50 turns, contract): y')
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'active', title: 'y' })
+  })
+
+  it('parses the nudge-parked confirmation line as waiting (second judge-done)', () => {
+    applyGoalStatusText('s1', '⊙ Goal set: finish phases')
+    applyGoalStatusText('s1', '⊙ Goal active · awaiting your confirmation (verify with /goal complete, 9/50 turns): finish phases')
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'active' })
+
+    // The post-nudge authority wait reuses the same line but with the
+    // post-nudge semantics the runtime emits after a SECOND judge-done.
+    applyGoalStatusText('s1', '⊙ Goal active · awaiting your confirmation (verify with /goal complete, 10/50 turns): finish phases')
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'active', title: 'finish phases' })
+  })
 })

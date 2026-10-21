@@ -627,6 +627,17 @@ class GoalState:
     waiting_until: float = 0.0
     waiting_reason: Optional[str] = None
     waiting_since: float = 0.0
+    # One-shot confirmation nudge (free-form goals:. see hermes_cli/goals.py
+    # module notes at the top of this field's declaration): when a judge
+    # returns ``done`` on a goal WITHOUT a contract or gates, the first such
+    # verdict parks NOTHING — it fires a single continuation turn asking the
+    # agent to either surface real completion evidence (/goal complete
+    # <evidence>) or declare a real wait barrier (/goal wait …, goal pause).
+    # This flag records that the nudge already ran so the SECOND consecutive
+    # judge-done can park honestly (WAITING_FOR_AUTHORITY, "awaiting your
+    # confirmation") without re-nudging forever. Cleared on any non-done
+    # verdict and on /goal pause / resume / clear.
+    done_confirmation_nudged: bool = False
     # Optional structured completion contract (outcome / verification /
     # constraints / boundaries / stop_when). Empty by default; a goal with
     # no contract behaves exactly like the original free-form goal.
@@ -703,6 +714,7 @@ class GoalState:
             paused_reason=data.get("paused_reason"),
             consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
             consecutive_transport_failures=int(data.get("consecutive_transport_failures", 0) or 0),
+            done_confirmation_nudged=bool(data.get("done_confirmation_nudged", False)),
             subgoals=subgoals,
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
@@ -1850,9 +1862,13 @@ class GoalManager:
                 remaining = int(s.waiting_until - time.time())
                 wr = s.waiting_reason or f"{remaining}s"
                 return f"⏳ Goal active · waiting ({remaining}s — {wr}, {meta}): {s.goal}"
+            if s.continuation_pending and s.last_stop_reason == "MODEL_JUDGED_DONE_AWAITING_USER_CONFIRMATION":
+                return f"⊙ Goal active · awaiting your confirmation (verify with /goal complete, {meta}): {s.goal}"
             if s.continuation_pending:
                 return f"⊙ Goal active · checkpointed · continuation pending ({meta}): {s.goal}"
             if s.outcome == WAITING_FOR_AUTHORITY:
+                if s.last_stop_reason == "MODEL_JUDGED_DONE_WITHOUT_VERIFIED_EVIDENCE_CONFIRMATION_NUDGED":
+                    return f"⊙ Goal active · awaiting your confirmation (verify with /goal complete, {meta}): {s.goal}"
                 return f"⊙ Goal active · waiting for authority ({meta}): {s.goal}"
             if s.outcome == GOAL_BLOCKED:
                 return f"⊙ Goal active · blocked ({meta}): {s.goal}"
@@ -1999,6 +2015,8 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
+        # Same for the done-confirmation nudge: resuming starts fresh.
+        self._state.done_confirmation_nudged = False
         if not save_goal(self.session_id, self._state, before):
             self._state = GoalState.from_json(before)
             return None
@@ -2857,6 +2875,11 @@ class GoalManager:
         )
         state.last_verdict = verdict
         state.last_reason = reason
+        # A non-done verdict clears the confirmation-nudge flag: the nudge is
+        # only meaningful back-to-back. If the agent does more work and the
+        # judge later says done again, it gets a fresh nudge then.
+        if verdict != "done":
+            state.done_confirmation_nudged = False
 
         # Track consecutive judge parse failures. Reset on any usable reply,
         # including API / transport errors (parse_failed=False) so a flaky
@@ -2907,20 +2930,93 @@ class GoalManager:
             # that the command, receipt, artifact, or test actually passed.
             # Deterministic completion must enter through ``confirm_completion``
             # or a verifier that supplies an explicit verified receipt.
+            #
+            # Evidence-scoped authority branch (goal-wait-effort-clobber-20261020):
+            # a goal WITHOUT contract/gates gets ONE bounded confirmation-nudge
+            # turn instead of an immediate dead park. The nudge turn leans the
+            # agent toward either producing real completion evidence
+            # (/goal complete <evidence>) or declaring a real wait barrier
+            # (/goal wait …); the done_confirmation_nudged flag makes the
+            # SECOND consecutive judge-done park honestly — same authority
+            # outcome as below, but labeled "awaiting your confirmation", not
+            # a bare stall. Contracted/gated goals skip the nudge: their
+            # evidence boundary is explicit and the strict gate stands.
+            if not (state.has_contract() or state.gates) and not state.done_confirmation_nudged:
+                state.outcome = GOAL_ACTIVE
+                state.last_stop_reason = "MODEL_JUDGED_DONE_AWAITING_USER_CONFIRMATION"
+                state.next_action = (
+                    "agent was asked to produce completion evidence (/goal complete <evidence>) "
+                    "or declare a real barrier (/goal wait … / goal pause); the judge re-evaluates after that turn"
+                )
+                state.last_verdict = "done"
+                state.last_reason = reason
+                state.done_confirmation_nudged = True
+                # The nudge rides the SAME continuation machinery as a normal
+                # continue: _apply_goal_checkpoint mints continuation_pending,
+                # the continuation token, and the checkpoint payload the
+                # gateway's claim/release lease validates. Without it,
+                # claim_continuation() refuses and the nudge turn never fires.
+                nudged = self._checkpoint(
+                    GOAL_ACTIVE,
+                    "MODEL_JUDGED_DONE_AWAITING_USER_CONFIRMATION",
+                    state.next_action,
+                    continuation=True,
+                    metadata={
+                        "current_task": "produce completion evidence or declare a real barrier",
+                        "verified_completed_work": [],
+                        "unfinished_work": ["confirmation of judged-done goal"],
+                        "required_authority": (
+                            "judge prose is not completion evidence; /goal complete <evidence> "
+                            "or an explicit wait barrier is required"
+                        ),
+                    },
+                )
+                # done_confirmation_nudged must survive the checkpoint write:
+                # _apply_goal_checkpoint touches only its own fields, but the
+                # save re-persists the same mutated object — verify.
+                if not nudged:
+                    return self._persistence_failure("done-confirmation nudge checkpoint could not be saved")
+                persisted = load_goal(self.session_id)
+                if persisted is not None:
+                    self._state = persisted
+                return {
+                    "status": "active",
+                    "should_continue": True,
+                    "continuation_prompt": (
+                        f"Goal feedback: the judge believes the goal looks complete ({reason}), "
+                        f"but no deterministic completion evidence exists yet. Either (a) surface the "
+                        f"evidence now via /goal complete <evidence — command output, receipt path, or "
+                        f"verified artifact>, or (b) if real async work still blocks the goal, declare it "
+                        f"explicitly with /goal wait <pid|session|seconds> or /goal pause. Do not merely "
+                        f"re-describe finished work."
+                    ),
+                    "verdict": "done",
+                    "reason": reason,
+                    "message": f"⊙ Goal active · awaiting your confirmation — the model judged done ({reason}). Send /goal complete <evidence> to confirm, or keep working if something still blocks it.",
+                }
             state.outcome = WAITING_FOR_AUTHORITY
-            state.last_stop_reason = "MODEL_JUDGED_DONE_WITHOUT_VERIFIED_EVIDENCE"
+            state.last_stop_reason = (
+                "MODEL_JUDGED_DONE_WITHOUT_VERIFIED_EVIDENCE_CONFIRMATION_NUDGED"
+                if state.done_confirmation_nudged
+                else "MODEL_JUDGED_DONE_WITHOUT_VERIFIED_EVIDENCE"
+            )
             state.next_action = "user must provide explicit completion evidence via /goal complete <evidence>"
             state.last_verdict = "done"
             state.last_reason = reason
             if not save_goal(self.session_id, state):
                 return self._persistence_failure("authority wait could not be saved")
+            _authority_msg = (
+                f"⏸ Goal active · awaiting your confirmation — the model judged done ({reason}), but no deterministic completion evidence exists. Use /goal complete <evidence> to confirm, or /goal unwait to keep working."
+                if state.done_confirmation_nudged
+                else f"⏸ Goal active · waiting for authority — the model judged done ({reason}), but no deterministic completion evidence exists. Use /goal complete <evidence>."
+            )
             return {
                 "status": "active",
                 "should_continue": False,
                 "continuation_prompt": None,
                 "verdict": "waiting_for_authority",
                 "reason": reason,
-                "message": f"⏸ Goal active · waiting for authority — the model judged done ({reason}), but no deterministic completion evidence exists. Use /goal complete <evidence>.",
+                "message": _authority_msg,
             }
 
         # Auto-pause when the judge cannot reach the API at all N turns in a

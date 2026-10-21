@@ -10,6 +10,7 @@ import { setMutableRef } from '@/lib/mutable-ref'
 import {
   $activeSessionId,
   $messages,
+  hasComposerOptionIntent,
   setActiveSessionStoredIdRotation,
   setCurrentFastMode,
   setCurrentModel,
@@ -43,9 +44,17 @@ function syncRuntimeMetadataToView(cached: ClientSessionState, sessionId: string
     live && (live.selectorObservation || live.pendingModelSelection || live.pendingRuntimeOptions) ? live : cached
   setCurrentModel(state.model ?? '')
   setCurrentProvider(state.provider ?? '')
-  setCurrentReasoningEffort(state.reasoningEffort ?? '', false)
+  // A client-originated composer effort pick still in flight owns the draft
+  // surface (goal-wait-effort-clobber-20261020 case 2): the runtime-slice
+  // mirror must not repaint the pre-pick value until the pick's readback
+  // settles or its TTL expires — server truth is authoritative again then.
+  if (!hasComposerOptionIntent('effort')) {
+    setCurrentReasoningEffort(state.reasoningEffort ?? '', false)
+  }
   setCurrentServiceTier(state.serviceTier ?? '')
-  setCurrentFastMode(state.fast ?? false, false)
+  if (!hasComposerOptionIntent('fast')) {
+    setCurrentFastMode(state.fast ?? false, false)
+  }
   setYoloActive(state.yolo ?? false)
   setCurrentPersonality(state.personality ?? '')
 }
