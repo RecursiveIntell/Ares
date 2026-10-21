@@ -358,7 +358,7 @@ def _(rid, params: dict) -> dict:
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
     if (
-        isolation_cfg["require_compute_host"]
+        isolation_cfg.get("require_compute_host")
         and not turn_isolation
         and not _inside_compute_host_child()
     ):
@@ -936,7 +936,7 @@ def _(rid, params: dict) -> dict:
             # This request either conflicts with a retained owner or may have
             # reached the host. An inline retry would create another executor.
             return isolated_response
-        if isolation_cfg["require_compute_host"]:
+        if isolation_cfg.get("require_compute_host"):
             # A failed dispatch must not become an inline provider/tool turn.
             # Keep the attempted prompt as a resumable failed snapshot without
             # persisting a new message or retrying an ambiguous effect.

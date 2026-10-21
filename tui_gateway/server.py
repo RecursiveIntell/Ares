@@ -12088,7 +12088,7 @@ def _drain_queued_prompt_claim(rid, sid: str, session: dict, *, recovery=None):
         return (session, claim_agent, claim_inflight, claim_window, claim_nonce, queued, generation)
     use_compute_host = _session_uses_compute_host(session)
     require_compute_host = (
-        _load_dashboard_process_isolation_config()["require_compute_host"]
+        bool(_load_dashboard_process_isolation_config().get("require_compute_host"))
         and not _inside_compute_host_child()
     )
     if not use_compute_host and require_compute_host:
@@ -12180,7 +12180,7 @@ def _drain_queued_prompt_claim(rid, sid: str, session: dict, *, recovery=None):
                 error = resp.get("error") or {}
                 message = str(error.get("message") or "queued prompt failed")
                 require_compute_host = (
-                    _load_dashboard_process_isolation_config()["require_compute_host"]
+                    bool(_load_dashboard_process_isolation_config().get("require_compute_host"))
                     and not _inside_compute_host_child()
                 )
                 delivery = (error.get("data") or {}).get("delivery")
