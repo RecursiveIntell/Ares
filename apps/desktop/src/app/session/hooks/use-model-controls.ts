@@ -743,6 +743,24 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
 
         finishSwitch(result)
 
+        // Record-back (goal-wait-effort-clobber-20261020 Task 3.1) — here,
+        // NOT only inside finishSwitch: a bare-RPC resolution legitimately
+        // fails finishSwitch's owns('model') target-key gate, yet still
+        // carries the server-confirmed selector state for the model the user
+        // picked. A non-deferred ack stamps the target model's remembered
+        // preset with the effort the session ACTUALLY ends with, so the next
+        // selection of this model opens at the effort the user experienced.
+        // Deferred switches confirm later via session.info; stamping nothing
+        // there is exactly right.
+        if (!result?.deferred && result?.selector_info) {
+          const confirmedEffort = result.selector_info.reasoning_effort
+          const ackModel = result.selector_info.model ?? result.value
+
+          if (typeof confirmedEffort === 'string' && confirmedEffort && ackModel === selection.model) {
+            setModelPreset(selection.provider, selection.model, { effort: confirmedEffort })
+          }
+        }
+
         // A superseded ACK still means THIS write was acknowledged, so the
         // boolean keeps its documented "abort only on a failed switch" meaning.
         // Not re-applying a stale preset is the CALLER's job: preserving
