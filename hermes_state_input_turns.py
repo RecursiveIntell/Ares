@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
@@ -292,7 +293,8 @@ class SessionContextInputTurnsMixin:
             raise ContextContinuationError("CONTEXT_INPUT_RECOVERY_EXHAUSTED")
 
     def record_model_dispatch_materialization(self, session_id, *, turn_lease_holder,
-            source, request_digest, purpose, provider_identity, model_ref, api_mode):
+            source, request_digest, purpose, provider_identity, model_ref, api_mode,
+            execution_id=None):
         """Append an ordinary-call correlation record under the existing turn owner.
 
         Generation is explicitly the persisted session-lineage depth, not a
@@ -310,7 +312,7 @@ class SessionContextInputTurnsMixin:
             self._assert_input_turn_owner_on_conn(conn, session_id, turn_lease_holder, phase)
             lineage = self._context_rebase_lineage_on_conn(conn, session_id)
             context = ManagedCallContextV2.create({
-                "call_ref": "ares-call:" + uuid.uuid4().hex,
+                "call_ref": ("ares-call:" + execution_id) if execution_id else ("ares-call:" + uuid.uuid4().hex),
                 "session_ref": session_id, "session_generation": len(lineage) - 1,
                 "turn_ref": phase["phase_id"], "input_digest": "sha256:" + phase["receipts_digest"],
                 "source_revision": source["source_revision"], "source_digest": source["source_digest"],
@@ -323,6 +325,20 @@ class SessionContextInputTurnsMixin:
             record["materialization_ref"] = "ares-materialization:" + record_digest.removeprefix("sha256:")
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
                 (record["materialization_ref"], _canonical(record)))
+            if execution_id:
+                from hermes_state_execution import ExecutionRecordStoreError
+                try:
+                    self.transition_execution_record_on_conn(
+                        conn,
+                        execution_id,
+                        "materialized",
+                        materialization_ref=record["materialization_ref"],
+                        logical_request_digest=request_digest,
+                        source_revision=source["source_revision"],
+                    )
+                except ExecutionRecordStoreError as exc:
+                    if exc.code != "EXECUTION_NOT_FOUND":
+                        raise
             return record
         return self._execute_write(write)
 
@@ -404,7 +420,7 @@ class SessionContextInputTurnsMixin:
                 self._cancelled_input_cut_on_conn(conn, root, profile, previous)
             now = time.time()
             if previous is not None and previous["state"] not in {"answered", "cancelled"}:
-                if previous["dispatch_attempts"]:
+                if previous["dispatch_attempts"] and not self._all_dispatch_attempts_abandoned_on_conn(conn, previous):
                     raise ContextContinuationError("CONTEXT_INPUT_EXECUTION_UNCERTAIN")
                 if previous["last_sequence"] > receipt.sequence:
                     raise ContextContinuationError("CONTEXT_INPUT_TURN_PENDING")
@@ -443,6 +459,73 @@ class SessionContextInputTurnsMixin:
             return value
         return self._execute_write(write)
 
+    def _all_dispatch_attempts_abandoned_on_conn(self, conn, phase) -> bool:
+        for attempt_id in phase.get("dispatch_attempts", []):
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key=?",
+                ("context-dispatch-result:" + attempt_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            raw = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+            try:
+                if _strict_json(raw).get("disposition") != "abandoned":
+                    return False
+            except Exception:
+                return False
+        return True
+
+    def abandon_unsent_context_dispatch(self, session_id, *, governor_mode="enforce") -> bool:
+        """Terminally abandon attempts that provably never reached the provider.
+
+        Only an enforcing governor can prove the pre-send marker was required;
+        observe/unqualified modes leave the turn conservative.
+        """
+        if governor_mode != "enforce":
+            return False
+
+        def write(conn):
+            root, profile = self._context_input_scope_on_conn(conn, session_id)
+            phase = self._input_turn_on_conn(conn, root, profile)
+            if phase is None or not phase.get("dispatch_attempts"):
+                return True
+            all_abandoned = True
+            for attempt_id in phase["dispatch_attempts"]:
+                try:
+                    record = self._read_execution_on_conn(conn, attempt_id)
+                except Exception:
+                    all_abandoned = False
+                    continue
+                if record.state == "abandoned":
+                    continue
+                if record.state not in {"admitted", "materialized"}:
+                    all_abandoned = False
+                    continue
+                self.transition_execution_record_on_conn(conn, attempt_id, "abandoned")
+                admission_row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key=?",
+                    ("context-dispatch:" + attempt_id,),
+                ).fetchone()
+                payload_digest = None
+                if admission_row is not None:
+                    raw = admission_row["value"] if isinstance(admission_row, sqlite3.Row) else admission_row[0]
+                    payload_digest = _strict_json(raw).get("payload_digest")
+                result = {
+                    "schema": "SessionDBContextDispatchResultV1",
+                    "attempt_id": attempt_id,
+                    "payload_digest": payload_digest,
+                    "settled_at": time.time(),
+                    "disposition": "abandoned",
+                    "reason": "never_sent",
+                }
+                conn.execute(
+                    "INSERT OR REPLACE INTO state_meta(key,value) VALUES(?,?)",
+                    ("context-dispatch-result:" + attempt_id, _canonical(result)),
+                )
+            return all_abandoned
+
+        return self._execute_write(write)
+
     def _bind_input_turn_dispatch_on_conn(self, conn, session_id, holder, attempt_id):
         root, profile = self._context_input_scope_on_conn(conn, session_id)
         value = self._input_turn_on_conn(conn, root, profile)
@@ -456,6 +539,7 @@ class SessionContextInputTurnsMixin:
         conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", ("context-input-dispatch:" + attempt_id,
             _canonical({"schema": "SessionDBContextInputDispatchV1", "phase_id": value["phase_id"],
                 "conversation_root": root, "receipts_digest": value["receipts_digest"], "attempt": value["attempts"]})))
+        return value["phase_id"]
 
     def release_context_input_turn(self, session_id, *, turn_lease_holder):
         """Orderly release is explicit; expiry alone never means process death."""
@@ -503,7 +587,7 @@ class SessionContextInputTurnsMixin:
             raise ContextContinuationError("CONTEXT_INPUT_FINAL_ATTEMPT_CHANGED")
         for attempt_id in value["dispatch_attempts"]:
             result = conn.execute("SELECT value FROM state_meta WHERE key=?", ("context-dispatch-result:" + attempt_id,)).fetchone()
-            allowed = {"response_received"} if attempt_id == final_attempt_id else {"response_received", "response_discarded"}
+            allowed = {"response_received"} if attempt_id == final_attempt_id else {"response_received", "response_discarded", "abandoned"}
             if result is None or _strict_json(result[0]).get("disposition") not in allowed:
                 raise ContextContinuationError("CONTEXT_INPUT_EXECUTION_UNCERTAIN")
         admission_row = conn.execute("SELECT value FROM state_meta WHERE key=?", ("context-dispatch:" + final_attempt_id,)).fetchone()

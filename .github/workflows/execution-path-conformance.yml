@@ -1,0 +1,103 @@
+name: Execution path conformance
+
+on:
+  pull_request:
+    paths:
+      - "ares_runtime/**"
+      - "hermes_state*.py"
+      - "gateway/context_input_recovery.py"
+      - "agent/conversation_loop.py"
+      - "plugins/dispatch_governor/**"
+      - "scripts/verify_execution_record.py"
+      - "tests/conformance/execution_path/**"
+      - "tests/ares_runtime/test_execution_record*.py"
+      - "tests/hermes_state/test_execution_record_store.py"
+      - ".github/workflows/execution-path-conformance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance-313:
+    name: Execution path conformance (repo Python 3.13)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.9.28"
+      - name: Sync declared environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --frozen --extra dev --python 3.13
+      - name: Run execution-path gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh \
+            tests/ares_runtime/test_execution_record.py \
+            tests/ares_runtime/test_execution_record_digests.py \
+            tests/ares_runtime/test_execution_record_binding.py \
+            tests/ares_runtime/test_dispatch_governor_plugin.py \
+            tests/ares_runtime/test_execution_path_ledger.py \
+            tests/hermes_state/test_execution_record_store.py \
+            tests/conformance/execution_path \
+            tests/ares_runtime/test_continuity_dispatch.py \
+            tests/agent/test_final_sdk_context_dispatch.py \
+            tests/ares_runtime/test_context_input_lifetime.py \
+            tests/gateway/test_context_input_recovery.py \
+            -- -q
+      - name: Upload conformance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: execution-path-conformance-313
+          path: |
+            .pytest_cache
+            tests/conformance/execution_path
+          if-no-files-found: warn
+
+  conformance-314-operator:
+    name: Execution path conformance (operator Python 3.14, advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.9.28"
+      - name: Sync declared environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --frozen --extra dev --python 3.14
+      - name: Run execution-path gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh \
+            tests/ares_runtime/test_execution_record.py \
+            tests/ares_runtime/test_execution_record_digests.py \
+            tests/ares_runtime/test_execution_record_binding.py \
+            tests/ares_runtime/test_dispatch_governor_plugin.py \
+            tests/ares_runtime/test_execution_path_ledger.py \
+            tests/hermes_state/test_execution_record_store.py \
+            tests/conformance/execution_path \
+            -- -q
+      - name: Upload operator-floor evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: execution-path-conformance-314
+          path: |
+            .pytest_cache
+            tests/conformance/execution_path
+          if-no-files-found: warn
