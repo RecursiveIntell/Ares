@@ -905,6 +905,11 @@ def test_desktop_gpu_policy_reads_the_ares_scoped_config(tmp_path: Path) -> None
 def test_desktop_launch_bridges_configured_gpu_policy_without_overriding_environment(
     tmp_path: Path, monkeypatch
 ) -> None:
+    # The first assertion exercises the config->env bridge, which only runs when
+    # the process environment carries no explicit override. A Desktop-launched
+    # session exports HERMES_DESKTOP_DISABLE_GPU, so start from a clean slate;
+    # the explicit-override precedence is asserted separately below.
+    monkeypatch.delenv("HERMES_DESKTOP_DISABLE_GPU", raising=False)
     runtime = _runtime(tmp_path)
     revision = "a" * 40
     source = _release(runtime, revision)
