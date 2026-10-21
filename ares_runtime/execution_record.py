@@ -247,7 +247,8 @@ def _validate(value: Mapping[str, Any]) -> None:
     _integer(value.get("sequence"), "sequence", minimum=1)
     recorded_at = value.get("recorded_at")
     if (
-        type(recorded_at) not in (int, float)
+        isinstance(recorded_at, bool)
+        or not isinstance(recorded_at, (int, float))
         or not math.isfinite(recorded_at)
         or recorded_at < 0
     ):
@@ -265,7 +266,9 @@ class ExecutionRecordV1:
 
     @classmethod
     def create(cls, values: Mapping[str, Any]) -> "ExecutionRecordV1":
-        value = {field: None for field in FIELDS if field != "record_digest"}
+        value: dict[str, Any] = {
+            field: None for field in FIELDS if field != "record_digest"
+        }
         value.update(dict(values))
         value["schema_version"] = SCHEMA_VERSION
         if value.get("logical_projection_schema") is None:

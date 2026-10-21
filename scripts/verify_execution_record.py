@@ -106,10 +106,8 @@ def verify_record(
         )
 
     admission_ref = record.get("admission_ref")
-    _require(
-        isinstance(admission_ref, str) and admission_ref in meta,
-        "ADMISSION_REF_MISSING",
-    )
+    if not isinstance(admission_ref, str) or admission_ref not in meta:
+        raise Failure("ADMISSION_REF_MISSING")
     admission = json.loads(meta[admission_ref])
     _require(
         admission.get("schema") == "SessionDBContextDispatchV2",

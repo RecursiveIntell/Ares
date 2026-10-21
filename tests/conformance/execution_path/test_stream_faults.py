@@ -73,7 +73,7 @@ def _stream_server():
     bodies = []
 
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):
+        def log_message(self, format, *args):
             pass
 
         def do_POST(self):

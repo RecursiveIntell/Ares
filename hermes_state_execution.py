@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
 from typing import Any, Mapping
 
 from ares_runtime.execution_record import (
@@ -48,6 +49,9 @@ def _value(row: Any) -> str:
 
 class SessionExecutionRecordMixin:
     """SessionDB mixin for execution heads and their bounded event projection."""
+
+    _execute_write: Callable[..., Any]
+    _read_ctx: Callable[..., Any]
 
     def _execution_head_key(self, execution_id: str) -> str:
         if not isinstance(execution_id, str) or not execution_id:
