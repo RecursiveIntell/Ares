@@ -262,10 +262,10 @@ def produce_dispatch_materialization(agent, payload, *, purpose, route=None, exe
     agent = agent if agent is not None else _model_call_owner.get()
     route = route or {}
     if not getattr(agent, "session_id", None):
-        return {"materialization": None, "qualification_error": "SESSION_IDENTITY_UNAVAILABLE"}
+        return {"materialization": None, "execution_id": execution_id, "qualification_error": "SESSION_IDENTITY_UNAVAILABLE"}
     db = getattr(agent, "_session_db", None)
     if not callable(getattr(type(db), "record_model_dispatch_materialization", None)):
-        return {"materialization": None, "qualification_error": "SESSION_OWNER_UNAVAILABLE"}
+        return {"materialization": None, "execution_id": execution_id, "qualification_error": "SESSION_OWNER_UNAVAILABLE"}
     from ares_runtime.local_runtime import read_dispatch_source_identity
     from hermes_state_continuity import ContextContinuationError
     try:
