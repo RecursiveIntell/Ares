@@ -52,8 +52,10 @@ test.skipIf(process.platform !== 'linux')(
     const args = ['--headless', '--ozone-platform=headless', '--disable-gpu', '--disable-dev-shm-usage', main]
     const evidence = process.env.P1A_EVIDENCE_DIR ?? path.join(root, 'evidence')
     fs.mkdirSync(evidence, { recursive: true })
+
     const fixturePython =
       process.env.P2_FIXTURE_PYTHON ?? new URL('../../../.venv/bin/python', import.meta.url).pathname
+
     expect(
       fs.existsSync(fixturePython),
       'Run uv sync to provision the repository Python before native security tests'

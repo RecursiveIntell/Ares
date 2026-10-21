@@ -158,6 +158,7 @@ test.each(['protocol', 'nonce', 'identity', 'issued_at', 'session_digest', 'proo
           if (field === 'malformed') {
             return new Response('{')
           }
+
           result[field] = field === 'issued_at' ? issued - 1 : 'foreign'
 
           return new Response(JSON.stringify(result))

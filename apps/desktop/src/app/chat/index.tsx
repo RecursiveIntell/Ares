@@ -531,9 +531,11 @@ const ChatViewContent = memo(function ChatViewContent({
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
   const catalogOwner = knownOwnerForSession(activeSessionId)
+
   const catalogProfile =
     (typeof catalogOwner === 'string' ? catalogOwner : catalogOwner?.targetProfile || catalogOwner?.profile) ||
     activeGatewayProfile
+
   const catalogConnection =
     catalogOwner && typeof catalogOwner === 'object'
       ? catalogOwner.connectionId

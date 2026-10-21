@@ -31,12 +31,15 @@ describe('terminal focus intent', () => {
   it('cancels a delayed terminal click after newer prompt focus', () => {
     const button = document.createElement('button'),
       prompt = document.createElement('input')
+
     document.body.append(button, prompt)
     button.focus()
     requestTerminalFocus('delayed')
     prompt.focus()
+
     const focus = vi.fn(() => true),
       stop = registerTerminalFocus('delayed', focus)
+
     expect(focus).not.toHaveBeenCalled()
     expect(document.activeElement).toBe(prompt)
     stop()
@@ -44,6 +47,7 @@ describe('terminal focus intent', () => {
   it('does not fulfill an intent for an inactive hidden host', () => {
     const parent = document.createElement('div'),
       host = document.createElement('div')
+
     parent.style.visibility = 'hidden'
     parent.append(host)
     document.body.append(parent)

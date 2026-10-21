@@ -336,6 +336,7 @@ async function run() {
     if (trusted) {
       privilegedAppContents.add(win.webContents.id)
     }
+
     transport.register(win.webContents)
 
     return win
@@ -480,6 +481,7 @@ async function stop() {
   for (const timer of fixtureTimers) {
     clearTimeout(timer)
   }
+
   await Promise.all(
     children.map(
       child =>

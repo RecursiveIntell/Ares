@@ -140,6 +140,7 @@ describe('diagnostic negative witnesses: observation ordering', () => {
       model: sessionStates!.get(ACTIVE_SID)?.model,
       effort: sessionStates!.get(ACTIVE_SID)?.reasoningEffort
     }
+
     console.log('WITNESS backend → real renderer event replay:', observed)
     expect(observed).toEqual({ model: 'B', effort: 'high' })
   })

@@ -22,6 +22,7 @@ async function boundedJson(response: Response): Promise<any> {
   if (!reader) {
     throw new Error('Missing native bootstrap proof')
   }
+
   const chunks: Uint8Array[] = []
   let size = 0
 
@@ -32,6 +33,7 @@ async function boundedJson(response: Response): Promise<any> {
       if (row.done) {
         break
       }
+
       size += row.value.length
 
       if (size > 4096) {
@@ -53,6 +55,7 @@ async function resolveServedDashboardToken(baseUrl, fallbackToken, options: any 
   if (options.bootstrapKey === undefined && options.identity === undefined) {
     return fallbackToken
   }
+
   const key = options.bootstrapKey
   const identity = options.identity
 
@@ -114,6 +117,7 @@ async function adoptServedDashboardToken(baseUrl, spawnToken, { childAlive, labe
   if (!childAlive()) {
     throw new Error(`${label} exited; refusing its session token.`)
   }
+
   const servedToken = await resolveServedDashboardToken(baseUrl, spawnToken, options)
 
   if (!childAlive()) {
