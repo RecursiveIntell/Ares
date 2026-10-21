@@ -223,6 +223,8 @@ def test_dashboard_process_isolation_config_defaults_without_default_merge(monke
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
         "detached_execution_max_s": 300,
+        "require_compute_host": False,
+        "require_compute_host": False,
     }
 
 
@@ -240,6 +242,7 @@ def test_dashboard_process_isolation_config_coerces_raw_values():
         "compute_host_heartbeat_secs": 30,
         "compute_host_respawn_max": 0,
         "detached_execution_max_s": 300,
+        "require_compute_host": False,
     }
 
     malformed = {"dashboard": "enabled"}
@@ -248,6 +251,8 @@ def test_dashboard_process_isolation_config_coerces_raw_values():
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
         "detached_execution_max_s": 300,
+        "require_compute_host": False,
+        "require_compute_host": False,
     }
 
 
@@ -21561,3 +21566,16 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+def test_require_compute_host_config_invalid_value_cannot_enable_inline_fallback():
+    # An explicit but malformed requirement must not be interpreted as permission
+    # to run the turn in the serving process.
+    cfg = server._load_dashboard_process_isolation_config({"dashboard": {
+        "turn_isolation": True, "require_compute_host": "not-a-boolean",
+    }})
+    assert cfg["require_compute_host"] is True
+    disabled = server._load_dashboard_process_isolation_config({"dashboard": {
+        "turn_isolation": True, "require_compute_host": "no",
+    }})
+    assert disabled["require_compute_host"] is False
+
+

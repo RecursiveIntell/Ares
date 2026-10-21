@@ -5377,7 +5377,27 @@ def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[st
             _DASHBOARD_DETACHED_EXECUTION_MAX_S_DEFAULT,
             min_value=1.0,
         ),
+        # Dispatch-location requirement, not an isolation guarantee. Kept
+        # explicit rather than truthy-coerced so a malformed value can never
+        # read as "off" and silently authorize an inline fallback.
+        "require_compute_host": _require_compute_host_value(
+            dashboard.get("require_compute_host"),
+        ),
     }
+
+
+def _require_compute_host_value(value: Any) -> bool:
+    """Parse ``dashboard.require_compute_host`` fail-closed.
+
+    Only an absent or explicitly false value disables the requirement; any
+    other value (including an unrecognized string) enables it. A typo must not
+    silently downgrade the operator's dispatch-location requirement.
+    """
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return value != 0
 
 
 def _load_cfg_raw() -> dict:
@@ -12108,6 +12128,31 @@ def _drain_queued_prompt_claim(rid, sid: str, session: dict, *, recovery=None):
         session["running"] = False
         return (session, claim_agent, claim_inflight, claim_window, claim_nonce, queued, generation)
     use_compute_host = _session_uses_compute_host(session)
+    require_compute_host = (
+        bool(_load_dashboard_process_isolation_config().get("require_compute_host"))
+        and not _inside_compute_host_child()
+    )
+    if not use_compute_host and require_compute_host:
+        # Opt-in dispatch-location requirement: a queued envelope that cannot
+        # reach the compute host must fail visibly here. The claim above already
+        # advanced queued_prompt to the next envelope, so only this turn is
+        # settled as a failed snapshot and the follow-up stays queued.
+        message = "compute host required but queued session cannot route to it"
+        with session["history_lock"]:
+            session["running"] = False
+            session["last_active"] = time.time()
+            _start_inflight_turn(session, queued["text"])
+            _fail_inflight_turn(
+                session,
+                message,
+                error_surface={
+                    "layer": "runtime",
+                    "code": "compute_host_dispatch_failed",
+                    "retryable": True,
+                },
+            )
+        _emit("error", sid, {"message": message})
+        return True
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
             if int(session.get("_last_stop_queue_generation", 0)) > queue_generation:
@@ -12175,6 +12220,10 @@ def _drain_queued_prompt_claim(rid, sid: str, session: dict, *, recovery=None):
             if resp.get("error"):
                 error = resp.get("error") or {}
                 message = str(error.get("message") or "queued prompt failed")
+                require_compute_host = (
+                    bool(_load_dashboard_process_isolation_config().get("require_compute_host"))
+                    and not _inside_compute_host_child()
+                )
                 delivery = (error.get("data") or {}).get("delivery")
                 failed_request = (error.get("data") or {}).get("host_request_id")
                 settled = False
@@ -12205,6 +12254,27 @@ def _drain_queued_prompt_claim(rid, sid: str, session: dict, *, recovery=None):
                     return reanchored
                 if settled:
                     _emit("error", sid, {"message": message})
+                if require_compute_host:
+                    # Dispatch-location requirement: this envelope must never be
+                    # retried inline. Settle it as a resumable failed snapshot so
+                    # the follow-up queue survives and the user sees the failure.
+                    with session["history_lock"]:
+                        session["running"] = False
+                        session["last_active"] = time.time()
+                        if not isinstance(session.get("inflight_turn"), dict):
+                            _start_inflight_turn(session, queued["text"])
+                        _fail_inflight_turn(
+                            session,
+                            message,
+                            error_surface={
+                                "layer": "runtime",
+                                "code": "compute_host_dispatch_failed",
+                                "retryable": True,
+                            },
+                        )
+                    if not settled:
+                        _emit("error", sid, {"message": message})
+                    return True
                 dispatch_failed = True
         else:
             dispatch_failed = _run_prompt_submit(rid, sid, session, queued["text"],
