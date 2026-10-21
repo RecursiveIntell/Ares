@@ -357,6 +357,15 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
+    if (
+        isolation_cfg["require_compute_host"]
+        and not turn_isolation
+        and not _inside_compute_host_child()
+    ):
+        # Opt-in dispatch-location requirement: refuse rather than run the turn
+        # inline. This is NOT an OS isolation guarantee (the host inherits the
+        # user's privileges); it only stops a silent inline fallback.
+        return _err(rid, 5019, "compute host required but this session cannot route to it")
     if turn_isolation:
         with session["history_lock"]:
             if (session.get("_compute_host_active_request_id") or session.get("_stop_pending")
@@ -926,6 +935,25 @@ def _(rid, params: dict) -> dict:
         if isinstance(delivery, dict) and delivery.get("delivery") in {"owner_busy", "uncertain"}:
             # This request either conflicts with a retained owner or may have
             # reached the host. An inline retry would create another executor.
+            return isolated_response
+        if isolation_cfg["require_compute_host"]:
+            # A failed dispatch must not become an inline provider/tool turn.
+            # Keep the attempted prompt as a resumable failed snapshot without
+            # persisting a new message or retrying an ambiguous effect.
+            with session["history_lock"]:
+                session["running"] = False
+                session["last_active"] = time.time()
+                _fail_inflight_turn(
+                    session,
+                    (isolated_response["error"] or {}).get(
+                        "message", "compute-host dispatch failed"
+                    ),
+                    error_surface={
+                        "layer": "runtime",
+                        "code": "compute_host_dispatch_failed",
+                        "retryable": True,
+                    },
+                )
             return isolated_response
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",
