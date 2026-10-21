@@ -535,6 +535,50 @@ def test_production_canary_requires_complete_well_typed_transport_before_activat
     ) == (True, None, None)
 
 
+def test_absent_permit_socket_fails_closed_rather_than_disabling_the_canary(
+    monkeypatch, tmp_path
+):
+    """A configured-but-unreachable permit transport must deny, not downgrade.
+
+    Regression pin. Returning "canary inactive" for a missing socket would
+    silently allow the effect, so the gate must not validate socket existence:
+    the transport config is admitted (engaging the boundary) and the call is
+    refused. Only an explicitly disabled bridge may fall back to the
+    non-canary path.
+    """
+    absent = tmp_path / "absent-permit.sock"
+    assert not absent.exists()
+
+    config = _production_canary_config()
+    config["ares"]["permit_daemon"]["socket_path"] = str(absent)
+    monkeypatch.setattr(
+        collaboration, "_load_runtime_config", lambda: config, raising=False
+    )
+
+    # The transport config is admitted: the canary is engaged for this session.
+    assert collaboration.production_permit_canary_enabled(session_id="session:canary")
+
+    allowed, code, permit = dispatcher_boundary(
+        "write_file",
+        {"path": "/tmp/ares-permit-test.txt", "content": "exact"},
+        mission_ref="mission:1",
+        session_id="session:canary",
+    )
+    assert allowed is False, "an unreachable permit transport must not allow the effect"
+    assert code
+    assert permit is None
+
+    # Control: an explicitly disabled bridge is the only way this effect is
+    # allowed without a permit.
+    config["ares"]["permit_daemon"]["enabled"] = False
+    assert dispatcher_boundary(
+        "write_file",
+        {"path": "/tmp/ares-permit-test.txt", "content": "exact"},
+        mission_ref="mission:1",
+        session_id="session:canary",
+    ) == (True, None, None)
+
+
 def test_production_outcome_receipt_uses_exact_consumption_adapter(monkeypatch):
     config = _production_canary_config()
     recorded = []
