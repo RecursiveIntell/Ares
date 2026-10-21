@@ -70,7 +70,6 @@ ORPHAN_LEDGER: dict[str, tuple[str, str, str]] = {
     "PersistedManagedMaterialization": ("unexport", "2.3", "internal persisted record"),
     "RELEASE_MANIFEST_SCHEMA": ("unexport", "1.3", "internal schema constant"),
     "RUNTIME_IDENTITY_SCHEMA": ("unexport", "1.3", "internal schema constant"),
-    "ResolvedPolicyBasisV2": ("unexport", "2.1", "consumed through its V1 base type"),
     "ResolvedRuntime": ("unexport", "4.3", "internal resolution record"),
     "RoleContractV1": ("unexport", "1.3", "internal contract artifact"),
     "RuntimeImage": ("unexport", "1.3", "internal image record"),
