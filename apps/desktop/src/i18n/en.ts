@@ -155,6 +155,8 @@ export const en: Translations = {
       elevenLabsNeedsKey: 'ElevenLabs STT needs ELEVENLABS_API_KEY.',
       elevenLabsRejectedKey: 'ElevenLabs rejected the API key (401).',
       diskFull: 'Disk full — free some space, then try again.',
+      sessionBusyRetry: 'The session was still finishing background work — your message did not start. Send it again.',
+      sessionBusyQueued: 'The session was busy — your message is queued and will run after the current turn.',
       gatewayAuthFailed: 'Gateway authentication failed — check your API_SERVER_KEY.',
       methodNotAllowed:
         'The desktop backend rejected that request (405 Method Not Allowed). Try restarting Hermes Desktop.',
@@ -2350,6 +2352,7 @@ export const en: Translations = {
     queueMessage: 'Queue message',
     steer: 'Steer the current run',
     stop: 'Stop',
+      stopAgain: 'Stop again — this turn may still be running',
     send: 'Send',
     speaking: 'Speaking',
     transcribing: 'Transcribing',
@@ -2408,6 +2411,8 @@ export const en: Translations = {
     attachments: count => `${count} attachment${count === 1 ? '' : 's'}`,
     editingInComposer: 'Editing in composer',
     editingQueuedInComposer: 'Editing queued turn in composer',
+      queuedBehindBusy: 'Will run as soon as the current turn finishes.',
+      queuedBehindPrompt: 'Will run after you answer the prompt above.',
     queueEdit: 'Edit',
     queueSendNext: 'Next',
     queueSteer: 'Steer — redirect the live turn now',
@@ -3178,6 +3183,9 @@ export const en: Translations = {
       loadingSession: 'Loading session',
       showEarlier: 'Show earlier messages',
       loadingResponse: 'Hermes is loading a response',
+      activityBackground: 'working on a background update',
+      activityGoalCheck: 'checking the goal',
+      activityGoalStep: 'working toward the goal',
       resumeWhenBackgroundDone: count =>
         count === 1
           ? 'Will resume when the background task finishes'

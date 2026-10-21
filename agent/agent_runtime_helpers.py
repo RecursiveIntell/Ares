@@ -3870,6 +3870,13 @@ def _drop_results_without_ids(messages: List[Dict[str, Any]]) -> List[Dict[str, 
     return kept
 
 
+# One WARNING per repaired call id per process — see the empty-name repair in
+# sanitize_api_messages. Bounded so a long-lived gateway cannot grow it without
+# limit; clearing only re-arms the first warning for older ids.
+_EMPTY_NAME_REPAIR_WARNED: set[str] = set()
+_EMPTY_NAME_REPAIR_WARNED_LIMIT = 1024
+
+
 def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Fix orphaned tool_call / tool_result pairs before every LLM call.
 
@@ -3966,12 +3973,25 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 name = getattr(fn, "name", None) if fn else None
             if isinstance(name, str) and name.strip():
                 continue
-            _ra().logger.warning(
-                "Pre-call sanitizer: repairing tool_call with empty "
-                "function.name -> %r (id=%s)",
-                _EMPTY_NAME_SENTINEL,
-                _ra().AIAgent._get_tool_call_id_static(tc),
-            )
+            _tc_id = _ra().AIAgent._get_tool_call_id_static(tc)
+            # One WARNING per call id per process. The sanitizer runs on the
+            # per-call API copy, so a stored assistant message with an empty
+            # tool name is re-repaired on EVERY subsequent request — a single
+            # bad call produced 121 identical warnings over 50 minutes because
+            # the repair never touches stored history (by design: rewriting the
+            # transcript is not this layer's authority).
+            _warn_key = str(_tc_id or "")
+            if not _warn_key or _warn_key not in _EMPTY_NAME_REPAIR_WARNED:
+                if _warn_key:
+                    if len(_EMPTY_NAME_REPAIR_WARNED) >= _EMPTY_NAME_REPAIR_WARNED_LIMIT:
+                        _EMPTY_NAME_REPAIR_WARNED.clear()
+                    _EMPTY_NAME_REPAIR_WARNED.add(_warn_key)
+                _ra().logger.warning(
+                    "Pre-call sanitizer: repairing tool_call with empty "
+                    "function.name -> %r (id=%s)",
+                    _EMPTY_NAME_SENTINEL,
+                    _tc_id,
+                )
             if isinstance(fn, dict):
                 fn["name"] = _EMPTY_NAME_SENTINEL
             elif fn is not None and hasattr(fn, "name"):

@@ -80,8 +80,25 @@ export type GatewayEventPayload = {
   approval_mode?: string
   yolo?: boolean
   running?: boolean
+  /** What the running turn is doing (see `session.info`). */
+  activity?: string
+  activity_since?: number
+  last_progress_at?: number
   // A completed bubble may still belong to an open host-owned turn.
   chain_pending?: boolean
+  /** Structured goal state carried by `status.update` (kind "goal").
+   * Declared structurally here so the message layer does not import the goal
+   * store; `store/goals.applyGoalState` consumes it. Absent on older
+   * gateways, where the text line remains the fallback. */
+  goal_state?: {
+    continuation_pending?: boolean
+    max_turns?: number
+    outcome?: string | null
+    status?: string
+    title?: string | null
+    turns_used?: number
+    waiting?: boolean
+  }
   turn_started_at?: number | null
   cwd?: string
   branch?: string

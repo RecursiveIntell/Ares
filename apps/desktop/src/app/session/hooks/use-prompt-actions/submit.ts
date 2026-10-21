@@ -34,6 +34,7 @@ import {
   touchSessionActivity
 } from '@/store/session'
 import { $sessionStates } from '@/store/session-states'
+import { recordUnadmittedSend } from '@/store/unadmitted-send'
 
 import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
@@ -786,7 +787,18 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           await withSessionNotFoundResume(
             sessionId,
             recoverStoredSessionId,
-            liveId => requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS),
+            liveId => {
+              // Remember exactly what was sent so an admission refusal can
+              // restore it instead of leaving an unrun bubble in the transcript.
+              recordUnadmittedSend(liveId, {
+                optimisticId,
+                queueKey: resolveComposerSessionKey(targetStoredSessionId ?? liveId, $sessions.get()),
+                text: typeof text === 'string' ? text : visibleText,
+                attachments
+              })
+
+              return requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+            },
             {
               requestGateway,
               driftReason: sessionDriftReason,

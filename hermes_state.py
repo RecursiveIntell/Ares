@@ -7915,6 +7915,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             return False
         now = time.time()
         expires_at = now + max(0.1, float(ttl_seconds))
+        # Only reclaim rows WELL past expiry. A lease that merely lapsed during
+        # a long tool call may still be refreshed by its holder; yanking it here
+        # would widen the mutual-exclusion window for no benefit.
+        prune_before = now - 3600.0
 
         def _do(conn):
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
@@ -7934,6 +7938,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                         "WHERE conversation_id = ? AND holder = ?",
                         (conversation_id, current_holder),
                     )
+            # Global hygiene: leases for conversations nobody has touched since
+            # (a compressed-away tip, an abandoned profile, a crashed host)
+            # otherwise accumulate forever — the cleanup above only ever sees
+            # the key being acquired. Observed: rows from two months earlier.
+            conn.execute(
+                "DELETE FROM session_turn_leases WHERE expires_at < ?",
+                (prune_before,),
+            )
             conn.execute(
                 "INSERT OR IGNORE INTO session_turn_leases "
                 "(conversation_id, holder, acquired_at, expires_at) "

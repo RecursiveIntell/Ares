@@ -1130,6 +1130,7 @@ def _teardown_popped_session(
     if session is None:
         return False
     run_thread = _get_run_thread(session)
+    still_alive = False
     if (
         end_reason != "tui_shutdown"
         and run_thread is not None
@@ -1139,12 +1140,25 @@ def _teardown_popped_session(
             if run_thread.is_alive():
                 run_thread.join(timeout=_TURN_SETTLE_BEFORE_CLOSE_SECONDS)
             if run_thread.is_alive():
+                still_alive = True
                 logger.warning(
                     "session turn thread still alive after %.1fs teardown grace",
                     _TURN_SETTLE_BEFORE_CLOSE_SECONDS,
                 )
         except Exception:
             logger.debug("failed waiting for session turn thread", exc_info=True)
+    if still_alive:
+        # The record is already detached, but the turn still owns it and is
+        # still appending history. Finalizing here stamped `ended_at` BEFORE
+        # messages the thread wrote afterwards — one observed session carried
+        # 53 rows later than its own `ended_at`. Hand the full teardown to the
+        # turn's settle path, which already runs a deferred teardown.
+        session["_run_checkpoint_teardown_deferred"] = end_reason
+        logger.info(
+            "session teardown deferred to live turn thread sid=%s",
+            session.get("_sid"),
+        )
+        return True
     _teardown_session(session, end_reason=end_reason)
     return True
 
@@ -9095,6 +9109,32 @@ def _custom_readiness_route(agent, identity: tuple, session: dict | None = None)
             reset_hermes_home_override(home_token)
 
 
+def _activity_fields(session: dict | None) -> dict:
+    """Describe what the running turn is doing, from the session's own record.
+
+    ``running: true`` alone cannot tell the operator whether the model is
+    generating, a tool is executing, or the post-turn goal judge is still
+    deciding. The judge runs *after* ``message.complete``, so the transcript
+    looks finished while admission is still owned — the exact window that made
+    a normal send collide with "session busy". Additive fields; older clients
+    ignore them.
+    """
+    if not isinstance(session, dict):
+        return {}
+    activity = session.get("turn_activity")
+    if not activity:
+        return {}
+    fields: dict = {"activity": str(activity)}
+    since = session.get("activity_since")
+    if isinstance(since, (int, float)) and since > 0:
+        fields["activity_since"] = float(since)
+    inflight = session.get("inflight_turn")
+    progress = inflight.get("updated_at") if isinstance(inflight, dict) else None
+    if isinstance(progress, (int, float)) and progress > 0:
+        fields["last_progress_at"] = float(progress)
+    return fields
+
+
 def _session_info(agent, session: dict | None = None, *, lock_held: bool = False) -> dict:
     if session is None:
         for candidate in _sessions.values():
@@ -9191,6 +9231,7 @@ def _session_info(agent, session: dict | None = None, *, lock_held: bool = False
         "running": bool((session or {}).get("running") or (session or {}).get("_host_turn_request_id")
                         or (session or {}).get("_stop_pending") or (session or {}).get("_stop_uncertain")),
         "turn_started_at": turn_started_at,
+        **_activity_fields(session),
         "title": _session_live_title(session or {}, session_key) if session_key else "",
         "stored_session_id": session_key or "",
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
@@ -14390,6 +14431,34 @@ def _dispatch_autonomous_turn(
 _COALESCE_MAX_EVENTS = 8
 _COALESCE_MAX_TEXT_CHARS = 48_000
 
+# A goal parked on operator authority cannot be satisfied by any automatic
+# event, so waking the session only spends a turn re-judging the same
+# "done without evidence" verdict (observed: 14 notification-driven turns in a
+# day on one session). Requeue and re-check rather than drop — the notification
+# must still arrive once the operator completes or clears the goal.
+_AUTHORITY_HOLD_POLL_S = 5.0
+
+
+def _authority_holds_notifications(session: dict) -> bool:
+    """True when a goal is parked on operator authority (not a barrier).
+
+    Barrier precedence matters: a goal parked on a pid/session/time *is* waiting
+    for an automatic event, and holding its wakeup would deadlock the loop.
+    """
+    sid_key = str(session.get("session_key") or "")
+    if not sid_key:
+        return False
+    try:
+        from hermes_cli.goals import WAITING_FOR_AUTHORITY, GoalManager
+
+        mgr = GoalManager(session_id=sid_key)
+        if not mgr.is_active() or mgr.is_waiting():
+            return False
+        state = mgr.state
+        return bool(state is not None and state.outcome == WAITING_FOR_AUTHORITY)
+    except Exception:
+        return False
+
 
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
@@ -14551,6 +14620,30 @@ def _notification_poller_loop(
         if _dedup_key not in _emitted:
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
+
+        # An authority-parked goal must not be woken by background traffic: no
+        # automatic event can supply the completion evidence it is waiting for,
+        # so the wakeup would only re-judge the same verdict and hold the
+        # session busy again. Requeue and re-check; the notification still
+        # arrives once the goal is completed or cleared.
+        if _authority_holds_notifications(session):
+            _hold_key = f"authority-held:{sid}"
+            if _hold_key not in _emitted:
+                _emit(
+                    "status.update",
+                    sid,
+                    {
+                        "kind": "goal",
+                        "text": (
+                            "⏸ Goal is waiting for completion evidence — "
+                            "background notifications are held until then."
+                        ),
+                    },
+                )
+                _emitted.add(_hold_key)
+            process_registry.completion_queue.put(evt)
+            time.sleep(_AUTHORITY_HOLD_POLL_S)
+            continue
 
         # ── Coalesce same-session delegation completions ──
         # A backlog (overnight disconnect, or a fan-out finishing together)
@@ -15219,6 +15312,29 @@ def _prepend_note(run_message: Any, note: str) -> Any:
 
 
 _GOAL_COMPRESSION_RECOVERY_ATTEMPTS = "_goal_compression_recovery_attempts"
+_GOAL_STOP_HOLD = "_goal_suppress_after_interrupt"
+
+
+def _clear_goal_stop_hold_for_user_turn(session: dict, display_kind: str | None) -> None:
+    """A user-originated turn lifts a Stop-era goal hold.
+
+    Synthetic turns (goal continuations, notification wakes) must NOT clear it:
+    they are exactly what the hold exists to suppress. Called under
+    ``session["history_lock"]`` at turn admission.
+    """
+    if display_kind != "internal_notification":
+        session.pop(_GOAL_STOP_HOLD, None)
+
+
+def _goal_held_after_stop(session: dict) -> bool:
+    """True when a user Stop should suppress the next goal continuation.
+
+    Set by the compute host when it applies ``session.interrupt``; covers the
+    case where the run thread never observes the interrupt (a provider read
+    that cannot cancel), which otherwise let the judge re-fire immediately and
+    made Stop look broken.
+    """
+    return bool(session.get(_GOAL_STOP_HOLD))
 _GOAL_COMPRESSION_RECOVERY_LIMIT = 1
 
 
@@ -15397,6 +15513,20 @@ def _run_prompt_submit(
     history_ready = session.get("resume_history_ready")
     registered = _sessions.get(sid) is session
     with session["history_lock"]:
+        _clear_goal_stop_hold_for_user_turn(session, display_kind)
+        # What this turn IS. The client cannot infer it from `running` alone,
+        # and a synthetic turn is precisely what makes a visible transcript
+        # coexist with a busy session.
+        _synthetic_source = (
+            display_metadata.get("synthetic_source")
+            if isinstance(display_metadata, dict)
+            else None
+        )
+        if display_kind == "internal_notification":
+            session["turn_activity"] = str(_synthetic_source or "notification")
+        else:
+            session["turn_activity"] = "user"
+        session["activity_since"] = time.time()
         inflight = session.get("inflight_turn")
         admission = inflight.get("started_at") if isinstance(inflight, dict) else None
         admission_generation = int(session.get("_queued_prompt_generation", 0))
@@ -16276,9 +16406,28 @@ def _run_prompt_submit(
 
             # Compression failures are never judge input: the error text is
             # not work toward the goal, and evaluating it would spend a turn.
-            if not compression_exhausted and _is_successful_goal_turn(
-                result, status, raw
-            ):
+            #
+            # A user Stop holds the chain even when the run thread never
+            # observed the interrupt (a provider read that cannot cancel). The
+            # host sets this flag when it applies `session.interrupt`; only the
+            # next user-originated turn clears it. Without this the judge
+            # re-fires immediately and Stop looks broken.
+            goal_held_after_stop = _goal_held_after_stop(session)
+            if goal_held_after_stop:
+                _emit(
+                    "status.update",
+                    sid,
+                    {
+                        "kind": "goal",
+                        "text": (
+                            "⏸ Goal held after Stop — send a message or "
+                            "/goal resume to continue."
+                        ),
+                    },
+                )
+
+            if (not goal_held_after_stop and not compression_exhausted
+                    and _is_successful_goal_turn(result, status, raw)):
                 try:
                     from hermes_cli.goals import GoalManager
 
@@ -16299,6 +16448,11 @@ def _run_prompt_submit(
                                 _bg_procs = _gather_bg()
                             except Exception:
                                 _bg_procs = None
+                            # The judge runs after `message.complete`, so the
+                            # transcript already looks finished. Naming this
+                            # phase is what explains the remaining busy window.
+                            session["turn_activity"] = "goal_judge"
+                            session["activity_since"] = time.time()
                             decision = goal_mgr.evaluate_after_turn(
                                 raw,
                                 user_initiated=True,
@@ -16306,11 +16460,18 @@ def _run_prompt_submit(
                             )
                             verdict_msg = decision.get("message") or ""
                             if verdict_msg:
-                                _emit(
-                                    "status.update",
-                                    sid,
-                                    {"kind": "goal", "text": verdict_msg},
-                                )
+                                _goal_status_event = {
+                                    "kind": "goal",
+                                    "text": verdict_msg,
+                                }
+                                # Structured twin of the text line. The desktop
+                                # must not infer goal state by parsing prose: it
+                                # missed every ``⊙ Goal active · …`` variant and
+                                # left a stale "Goal waiting" chip on screen.
+                                _goal_payload = goal_mgr.status_payload()
+                                if _goal_payload is not None:
+                                    _goal_status_event["goal_state"] = _goal_payload
+                                _emit("status.update", sid, _goal_status_event)
                             if decision.get("should_continue"):
                                 cont_prompt = decision.get("continuation_prompt") or ""
                                 if cont_prompt:
