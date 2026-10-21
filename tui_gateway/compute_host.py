@@ -414,8 +414,18 @@ class ComputeHost:
             return
         admitted, request_id = self._admit_real_turn(frame)
         if not admitted:
+            # A refusal is not a failed turn: no execution started. Carry the
+            # classification so clients can reconcile (queue / retry / explain)
+            # instead of painting a terminal error card for an attempt that was
+            # never made. `error_surface` is the field the desktop already
+            # parses; `reason` stays for older clients and logs.
             self.emit({"type": "turn.error", "sid": sid, "request_id": request_id,
-                       "message": "session busy", "reason": "admission_refused_busy"})
+                       "message": "session busy", "reason": "admission_refused_busy",
+                       "error_surface": {
+                           "layer": "admission",
+                           "code": "session_busy",
+                           "retryable": True,
+                       }})
 
     def admit_autonomous_turn(self, frame: dict[str, Any]) -> bool:
         """Admit an autonomously-initiated turn through the same registry as a
@@ -461,7 +471,13 @@ class ComputeHost:
             return
         with session.lock:
             if session.running:
-                self.emit({"type": "turn.error", "sid": sid, "request_id": frame.get("request_id"), "message": "session busy"})
+                self.emit({"type": "turn.error", "sid": sid, "request_id": frame.get("request_id"),
+                           "message": "session busy", "reason": "admission_refused_busy",
+                           "error_surface": {
+                               "layer": "admission",
+                               "code": "session_busy",
+                               "retryable": True,
+                           }})
                 return
             session.running = True
         future = self._executor.submit(self._run_spike_turn, session, dict(frame))
@@ -521,6 +537,14 @@ class ComputeHost:
                         previous_receipt = getattr(agent, "_context_stop_receipt", None)
                         server._interrupt_session_turn(sid, session, request_id=frame.get("request_id"),
                             **({"operation_id": frame["operation_id"]} if frame.get("operation_id") is not None else {}))
+                        # A user Stop ends the goal chain at this boundary even
+                        # when the run thread cannot observe the interrupt (a
+                        # provider read that never cancels). The post-turn goal
+                        # hook checks this flag; the next user-originated prompt
+                        # clears it. Without it, Stop ACKs while the judge
+                        # immediately re-fires the continuation.
+                        with session["history_lock"]:
+                            session["_goal_suppress_after_interrupt"] = True
                         receipt = getattr(agent, "_context_stop_receipt", None)
                         if isinstance(receipt, dict) and receipt is not previous_receipt:
                             ack["stop_receipt"] = {"session_key": receipt.get("session_key"),

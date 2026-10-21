@@ -282,4 +282,18 @@ describe('parked queue sessions', () => {
       })
     ).toBe(false)
   })
+
+  it('keeps the note explaining why an entry is waiting', () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, {
+      text: 'run the tests after you approve',
+      attachments: [],
+      note: 'Will run after you answer the prompt above.'
+    })
+
+    expect(entry?.note).toBe('Will run after you answer the prompt above.')
+    expect(getQueuedPrompts(SESSION_KEY)[0]).toMatchObject({
+      note: 'Will run after you answer the prompt above.',
+      text: 'run the tests after you approve'
+    })
+  })
 })

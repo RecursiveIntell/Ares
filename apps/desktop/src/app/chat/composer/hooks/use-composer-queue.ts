@@ -185,14 +185,14 @@ export function useComposerQueue({
     return true
   }
 
-  const queueCurrentDraft = useCallback(() => {
+  const queueCurrentDraft = useCallback((note?: string) => {
     const text = draftRef.current
 
     if (!activeQueueSessionKey || (!text.trim() && attachments.length === 0)) {
       return false
     }
 
-    if (!enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments })) {
+    if (!enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments, ...(note ? { note } : {}) })) {
       return false
     }
 

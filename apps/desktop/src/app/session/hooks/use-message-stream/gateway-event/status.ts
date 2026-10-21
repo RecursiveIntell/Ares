@@ -5,8 +5,9 @@ import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { type AgentNoticePayload, clearAgentNotice, nativeNoticeInput, showAgentNotice } from '@/store/agent-notices'
 import { clearClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
+import { enqueueQueuedPrompt } from '@/store/composer-queue'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
-import { applyGoalStatusText } from '@/store/goals'
+import { applyGoalState, applyGoalStatusText, type GoalStatePayload } from '@/store/goals'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { isDiskFullErrorMessage, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
@@ -14,6 +15,7 @@ import { flashPetActivity, setPetActivity } from '@/store/pet'
 import { clearAllPrompts } from '@/store/prompts'
 import { setTurnStartedAt } from '@/store/session'
 import { clearActiveSessionTodos } from '@/store/todos'
+import { takeUnadmittedSend } from '@/store/unadmitted-send'
 
 import type { GatewayEventContext } from './types'
 
@@ -35,7 +37,15 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
       // completions / watch matches here — re-sync the status stack.
       void refreshBackgroundProcesses(sessionId)
     } else if (sessionId && payload?.kind === 'goal') {
-      applyGoalStatusText(sessionId, coerceGatewayText(payload?.text))
+      // Prefer the authoritative structured state; fall back to the text
+      // grammar only for older gateways that do not send `goal_state`.
+      const structured = payload?.goal_state
+
+      if (structured && typeof structured === 'object') {
+        applyGoalState(sessionId, structured as GoalStatePayload)
+      } else {
+        applyGoalStatusText(sessionId, coerceGatewayText(payload?.text))
+      }
     }
 
     return true
@@ -120,11 +130,27 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
   if (event.type === 'error') {
     const errorMessage = payload?.message || 'Hermes reported an error'
     const looksLikeProviderSetup = isProviderSetupErrorMessage(errorMessage)
+    // A retryable admission refusal is NOT a failed turn: the host declined to
+    // start one because another turn still owned the session (typically an
+    // invisible notification/goal-judge turn). Painting it as a terminal error
+    // produced a "Turn failed" notification, an error card with the model name,
+    // and a global toast for a message that was never attempted. Match the
+    // frame's structured classification when present, else the wire text that
+    // every surface already emits.
+    const errorSurface = (payload?.error_surface ?? undefined) as { code?: string; retryable?: boolean } | undefined
+    // Narrow on purpose: only the admission-refusal code is transient. Matching
+    // any `retryable` surface would also swallow failed-turn treatment for
+    // future error classes that happen to carry that flag. The text fallback
+    // applies only when the gateway sends no structured surface at all.
+    const transientAdmissionRefusal =
+      errorSurface?.code === 'session_busy' || (!errorSurface && /session busy/i.test(errorMessage))
 
     // A turn that errors out has also ended — drop any open blocking prompt
     // for this session so an approval/sudo/secret overlay can't linger past
-    // the failed turn (same intent as the message.complete clear).
-    if (sessionId) {
+    // the failed turn (same intent as the message.complete clear). A refused
+    // admission ended nothing: the owning turn is still live, so its approval
+    // or clarify prompt must stay answerable.
+    if (sessionId && !transientAdmissionRefusal) {
       clearAllPrompts(sessionId)
       clearClarifyRequest(undefined, sessionId)
       clearActiveSessionTodos(sessionId)
@@ -134,17 +160,39 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
 
     if (isActiveEvent) {
       setPetActivity({ reasoning: false, toolRunning: false })
-      flashPetActivity({ error: true })
+      if (!transientAdmissionRefusal) {
+        flashPetActivity({ error: true })
+      }
     }
 
-    dispatchNativeNotification({
-      body: errorMessage,
-      kind: 'turnError',
-      sessionId,
-      title: translateNow('notifications.native.turnErrorTitle')
-    })
+    if (!transientAdmissionRefusal) {
+      dispatchNativeNotification({
+        body: errorMessage,
+        kind: 'turnError',
+        sessionId,
+        title: translateNow('notifications.native.turnErrorTitle')
+      })
+    }
 
-    if (looksLikeProviderSetup) {
+    // A refused send was recorded at dispatch. Re-queue it and drop its
+    // optimistic bubble: leaving the bubble would keep a user message that
+    // never ran, and dropping the text would lose work.
+    const unadmitted = transientAdmissionRefusal && sessionId ? takeUnadmittedSend(sessionId) : null
+
+    if (transientAdmissionRefusal) {
+      if (unadmitted?.queueKey) {
+        enqueueQueuedPrompt(unadmitted.queueKey, {
+          text: unadmitted.text,
+          attachments: unadmitted.attachments,
+          note: translateNow('composer.queuedBehindBusy')
+        })
+        notify({ kind: 'info', message: translateNow('notifications.errors.sessionBusyQueued') })
+      } else {
+        // Older gateway or a send that was never recorded: be honest rather
+        // than silently dropping it.
+        notify({ kind: 'info', message: translateNow('notifications.errors.sessionBusyRetry') })
+      }
+    } else if (looksLikeProviderSetup) {
       requestDesktopOnboarding(errorMessage)
     } else if (isDiskFullErrorMessage(errorMessage)) {
       notifyError(new Error(errorMessage), translateNow('notifications.errors.diskFull'))
@@ -163,7 +211,23 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
 
     if (sessionId) {
       flushQueuedDeltas(sessionId)
-      failAssistantMessage(sessionId, errorMessage, occurredAt)
+
+      if (transientAdmissionRefusal) {
+        // No turn started. Drop the optimistic bubble for a re-queued send (it
+        // now lives in the queue) and settle the send state. When the send
+        // could not be recovered, keep the bubble as the record of the attempt.
+        updateSessionState(sessionId, state => ({
+          ...state,
+          messages: unadmitted ? state.messages.filter(message => message.id !== unadmitted.optimisticId) : state.messages,
+          awaitingResponse: false,
+          busy: false,
+          reconnecting: false,
+          turnStartedAt: null
+        }))
+      } else {
+        takeUnadmittedSend(sessionId)
+        failAssistantMessage(sessionId, errorMessage, occurredAt)
+      }
     }
 
     if (isActiveEvent) {
