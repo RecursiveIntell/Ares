@@ -117,6 +117,7 @@ test('status and cancel are explicit operations; unknown payload fields are reje
   })
 
   const endpoint = JSON.parse(fs.readFileSync(path.join(root, 'specialist-dispatch.json'), 'utf8'))
+
   const base = {
     schema: 'AresDesktopSpecialistDispatchEnvelopeV1',
     token: endpoint.token,
@@ -137,6 +138,7 @@ test('status and cancel are explicit operations; unknown payload fields are reje
 test('authenticated quiesce leases are exact, releasable, and never expose the endpoint capability', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ares-specialist-dispatch-'))
   roots.push(root)
+
   const acquire = vi.fn(async (profileIds: string[]) => ({
     leaseId: 'specialist-quiesce-00000000-0000-4000-8000-000000000000',
     profileIds

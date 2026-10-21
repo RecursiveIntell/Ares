@@ -1,0 +1,133 @@
+name: macOS-only tests (advisory)
+
+# Advisory lane: runs the ``macos_only`` marked tests on macos-latest, but is
+# deliberately NOT a needs-dependency of ``all-checks-pass`` in ci.yaml and so
+# is not required by branch protection. Ares targets Linux first; this lane
+# keeps macOS visible without letting runner scarcity block unrelated work.
+# Promote it back into tests-os.yml (and the KNOWN_JOBS contract) only if
+# macOS becomes a supported, gated platform.
+#
+# Selection and the zero-test guard are identical to tests-os.yml.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-tests:
+    name: macOS-only tests
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      MARKER: macos_only
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          # Pinned for the same reason as the Linux lane: unpinned, setup-uv
+          # resolves "latest" by fetching a manifest on every job and a
+          # transient fetch failure fails the whole job.
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        # Same extras as the Linux test lane so an OS-marked test can import
+        # anything its Linux siblings can. ``[all]`` is deliberately
+        # Windows/macOS-installable (see the policy comment on the extra in
+        # pyproject.toml — matrix/python-olm was removed from it precisely
+        # because it could not build here).
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Minimize uv cache
+        run: uv cache prune --ci
+
+      - name: Run ${{ env.MARKER }} tests
+        # Two-step selection:
+        #
+        #   1. scripts/ci/list_os_marked_tests.py narrows WHICH FILES are
+        #      imported. ``-m`` filters after collection, and collection
+        #      imports every module under tests/ — on this host that would
+        #      drag ~900 unrelated test modules through import, where a
+        #      single unrelated ImportError would fail a job whose own
+        #      subject is fine. The helper exits non-zero if the marker
+        #      matches no file at all.
+        #   2. ``-m`` decides WHICH TESTS run, and stays authoritative.
+        #      Passing it on the command line REPLACES pyproject's
+        #      ``-m 'not integration'`` addopts (same option, last wins) —
+        #      hence repeating ``not integration``, or the integration
+        #      suite would return through the side door.
+        #
+        # ``--timeout-method`` needs no override: tests/conftest.py's
+        # pytest_configure already downgrades the signal-based timer on
+        # Windows, which has no SIGALRM.
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          LIST="${RUNNER_TEMP:-.}/selected-tests.txt"
+
+          # Process substitution would hide the helper's exit status, so write
+          # to a file and check it explicitly.
+          if ! uv run --no-sync python scripts/ci/list_os_marked_tests.py \
+                 "${{ env.MARKER }}" > "$LIST"; then
+            echo "::error::could not enumerate ${{ env.MARKER }} test files"
+            exit 1
+          fi
+          if [ ! -s "$LIST" ]; then
+            echo "::error::empty ${{ env.MARKER }} file list"
+            exit 1
+          fi
+
+          # Deliberately NOT `mapfile`: that is a bash 4 builtin and the macOS
+          # runner's /bin/bash is 3.2. Word-splitting is safe here because the
+          # helper emits repo-relative test paths, which contain no spaces.
+          # shellcheck disable=SC2046
+          set -- $(cat "$LIST")
+          echo "selected $# file(s) for ${{ env.MARKER }}:"
+          cat "$LIST"
+
+          # ``shell: bash`` runs this script with ``-e`` injected, which
+          # ``set -uo pipefail`` above does not clear. A bare pytest call
+          # would therefore abort the script on any non-zero exit and the
+          # exit-5 branch below would be unreachable dead code — the job
+          # would still fail red, but the diagnostic would never print.
+          status=0
+          uv run --no-sync python -m pytest \
+            "$@" \
+            -m "${{ env.MARKER }} and not integration" \
+            -v --tb=short || status=$?
+          if [ "$status" -eq 5 ]; then
+            echo "::error::No tests matched -m ${{ env.MARKER }}. Either the" \
+                 "marker was renamed/dropped or selection is broken — this job" \
+                 "must never pass without running its OS's tests."
+            exit 1
+          fi
+          exit "$status"
+        env:
+          # Belt-and-suspenders with tests/conftest.py's env blanking: no
+          # test may reach a real provider API.
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""

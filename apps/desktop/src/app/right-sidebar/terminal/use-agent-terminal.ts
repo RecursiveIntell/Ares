@@ -138,6 +138,7 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id: 
         if (!terminalHostVisible(host)) {
           return false
         }
+
         term.focus()
 
         return true
@@ -173,6 +174,7 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id: 
         unregisterMounted()
         unregisterWriter()
       }
+
       unregisterReader = registerTerminalReader(id, makeTerminalReader(term))
     }
 

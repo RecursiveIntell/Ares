@@ -22,6 +22,7 @@ export function validSelectorVersion(value: unknown): value is SelectorVersion {
   if (!value || typeof value !== 'object') {
     return false
   }
+
   const stamp = value as SelectorVersion
 
   return (
