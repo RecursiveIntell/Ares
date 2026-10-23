@@ -1906,6 +1906,40 @@ print(json.dumps({'binary': ContextGovernorEngine().binary,
             return True, "clean"
         return False, f"dirty ({len(changed)} path(s))"
 
+    def _transport_backend_check(self, python: Path, source: Path) -> tuple[str, bool, str]:
+        """Ask the selected interpreter whether leased model calls can run there.
+
+        The leased transport refuses every governed send on an unqualified
+        httpx/httpcore/anyio stack; surfacing that here beats discovering it
+        as UNSUPPORTED_TRANSPORT on the first model call.
+        """
+        label = "governed transport backend"
+        program = (
+            "import json\n"
+            "from ares_runtime.transport_lease import transport_backend_mismatches\n"
+            "print(json.dumps(list(transport_backend_mismatches())))\n"
+        )
+        try:
+            probe = subprocess.run(
+                [python, "-c", program],
+                cwd=source,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60,
+                check=False,
+            )
+            if probe.returncode:
+                return label, False, "probe failed: " + (probe.stderr.strip().splitlines() or ["no output"])[-1]
+            mismatches = json.loads(probe.stdout)
+        except subprocess.TimeoutExpired:
+            return label, False, "probe timed out"
+        except (OSError, ValueError) as exc:
+            return label, False, f"probe failed: {type(exc).__name__}"
+        if not isinstance(mismatches, list):
+            return label, False, "probe returned an unexpected result"
+        return label, not mismatches, "qualified" if not mismatches else "; ".join(map(str, mismatches))
+
     def doctor(self) -> list[tuple[str, bool, str]]:
         checks: list[tuple[str, bool, str]] = []
         try:
@@ -1936,6 +1970,7 @@ print(json.dumps({'binary': ContextGovernorEngine().binary,
                 probe.returncode == 0,
                 (probe.stderr or "ok").strip(),
             ))
+            checks.append(self._transport_backend_check(python, source))
             try:
                 from hermes_cli.sqlite_runtime import probe_sqlite_runtime
 

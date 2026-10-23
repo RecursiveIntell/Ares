@@ -40,6 +40,14 @@ dependencies = [
   "python-dotenv==1.2.2",
   "fire==0.7.1",
   "httpx[socks]==0.28.1",
+  # httpx's transport stack, pinned because Ares's leased model-call transport
+  # (ares_runtime/transport_lease.py) reaches into their private pool, backend
+  # and cancel-scope internals and refuses every governed send on any other
+  # version. Left unpinned they float with httpx's ranges: a pip install
+  # resolved anyio 4.15.1 and denied all leased calls as UNSUPPORTED_TRANSPORT.
+  # Bump together with QUALIFIED_TRANSPORT_BACKEND only after requalifying.
+  "httpcore==1.0.9",
+  "anyio==4.12.1",
   "blake3>=1.0.8,<2",  # Exact physical provider-body ContentDigest; never substitute SHA.
   "rich==14.3.3",
   "tenacity==9.1.4",
