@@ -127,8 +127,29 @@ def settle_llm_dispatch(tickets: list[Any], *, outcome: str,
 
 
 def _dispatch_error_outcome(error: BaseException) -> str:
+    """Classify why a governed call or stream ended before completing.
+
+    GeneratorExit means the consumer stopped reading: it closed, or dropped the
+    last reference to, a generator chain suspended inside a body wrapper. The
+    provider did not fail, so this is the same terminal as an explicit close().
+    """
     import asyncio
-    return "interrupted" if isinstance(error, (InterruptedError, KeyboardInterrupt, asyncio.CancelledError)) else "provider_error"
+    if isinstance(error, GeneratorExit):
+        return "abandoned"
+    if isinstance(error, (InterruptedError, KeyboardInterrupt, asyncio.CancelledError)):
+        return "interrupted"
+    return "provider_error"
+
+
+def _dispatch_error_settlement(error: BaseException) -> tuple[str, BaseException | None]:
+    """Outcome plus the error to record; abandonment records no error.
+
+    An explicit close() settles ``abandoned`` with ``error=None``. A consumer
+    stop observed as GeneratorExit must settle identically, so governors never
+    see a control-flow signal presented as a failure cause.
+    """
+    outcome = _dispatch_error_outcome(error)
+    return outcome, (None if outcome == "abandoned" else error)
 
 
 def run_llm_dispatch(payload: Any, callback: Callable, *, stream: bool = False, _dispatch_agent=None, **context: Any) -> Any:
@@ -143,7 +164,8 @@ def run_llm_dispatch(payload: Any, callback: Callable, *, stream: bool = False, 
             if stream and _get_middleware_callbacks(LLM_DISPATCH_MIDDLEWARE):
                 response = bind_deferred_result(response, basis)
     except BaseException as error:
-        settle_llm_dispatch(tickets, outcome=_dispatch_error_outcome(error), error=error)
+        outcome, cause = _dispatch_error_settlement(error)
+        settle_llm_dispatch(tickets, outcome=outcome, error=cause)
         raise
     if tickets and stream:
         return GovernedStreamProxy(response, tickets)
@@ -168,7 +190,8 @@ async def async_run_llm_dispatch(payload: Any, callback: Callable, **context: An
             if _get_middleware_callbacks(LLM_DISPATCH_MIDDLEWARE):
                 response = bind_deferred_result(response, basis)
     except BaseException as error:
-        await asyncio.to_thread(settle_llm_dispatch, tickets, outcome=_dispatch_error_outcome(error), error=error)
+        outcome, cause = _dispatch_error_settlement(error)
+        await asyncio.to_thread(settle_llm_dispatch, tickets, outcome=outcome, error=cause)
         raise
     await asyncio.to_thread(settle_llm_dispatch, tickets, outcome="ok", response=response)
     return response
@@ -215,7 +238,7 @@ class GovernedStreamProxy:
             self._settle("ok")
             raise
         except BaseException as error:
-            self._settle("interrupted" if isinstance(error, (InterruptedError, KeyboardInterrupt)) else "provider_error", error)
+            self._settle(*_dispatch_error_settlement(error))
             raise
         return value
 
@@ -262,8 +285,8 @@ class GovernedStreamProxy:
             self._settle("provider_error", close_error)
             raise
         finally:
-            self._settle("interrupted" if isinstance(error, (InterruptedError, KeyboardInterrupt)) else
-                         "provider_error" if error is not None else "abandoned", error)
+            # A relaying generator closed mid-stream exits here with GeneratorExit.
+            self._settle(*(("abandoned", None) if error is None else _dispatch_error_settlement(error)))
         # Never swallow a provider or governance exception.
         return False
 
