@@ -928,6 +928,28 @@ def test_exit_zero_invalidated_oauth_report_fails_closed(tmp_path: Path) -> None
     assert panel["execution_complete"] is False
 
 
+def test_exit_zero_expired_oauth_report_fails_closed(tmp_path: Path) -> None:
+    runtime = make_runtime(
+        tmp_path,
+        profile_program(
+            'print("HTTP 401: Your authentication token has expired. Please try refreshing it.")\n'
+        ),
+    )
+    out = tmp_path / "receipt"
+    completed = invoke(runtime, out, "--profiles", "cognitive-scientist")
+
+    assert completed.returncode == 1
+    panel = json.loads((out / "panel.json").read_text(encoding="utf-8"))
+    result = panel["results"][0]
+    assert result["exit_code"] == 0
+    assert result["outcome"] == "blocked"
+    assert result["termination_reason"] == "operational_blocked_report"
+    assert result["operational_block"] == "oauth_token_expired"
+    assert (out / result["stdout_path"]).read_text().startswith("HTTP 401:")
+    assert panel["terminal_state"] == "completed_with_failures"
+    assert panel["execution_complete"] is False
+
+
 def test_quoted_historical_oauth_401_is_not_a_runtime_block(tmp_path: Path) -> None:
     report = json.dumps({
         "analysis": "A historical fixture returned HTTP 401: Encountered invalidated oauth token for user, failing request; no live auth error occurred."
@@ -935,6 +957,25 @@ def test_quoted_historical_oauth_401_is_not_a_runtime_block(tmp_path: Path) -> N
     runtime = make_runtime(tmp_path, profile_program(f"print({report!r})\n"))
     out = tmp_path / "receipt"
     completed = invoke(runtime, out, "--profiles", "psychometrician")
+
+    assert completed.returncode == 0
+    panel = json.loads((out / "panel.json").read_text(encoding="utf-8"))
+    result = panel["results"][0]
+    assert result["outcome"] == "returned"
+    assert result["termination_reason"] == "returned"
+    assert result["operational_block"] is None
+    assert panel["execution_complete"] is True
+
+
+def test_quoted_historical_expired_oauth_401_is_not_a_runtime_block(
+    tmp_path: Path,
+) -> None:
+    report = json.dumps({
+        "analysis": "A historical fixture returned HTTP 401: Your authentication token has expired. Please try refreshing it.; no live auth error occurred."
+    })
+    runtime = make_runtime(tmp_path, profile_program(f"print({report!r})\n"))
+    out = tmp_path / "receipt"
+    completed = invoke(runtime, out, "--profiles", "cognitive-scientist")
 
     assert completed.returncode == 0
     panel = json.loads((out / "panel.json").read_text(encoding="utf-8"))

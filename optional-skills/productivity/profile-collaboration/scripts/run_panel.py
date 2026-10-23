@@ -118,6 +118,11 @@ def reported_operational_block(stdout: bytes, stderr: bytes) -> str | None:
     oauth_error = b"http 401: encountered invalidated oauth token for user, failing request"
     if any(stream.strip().lower() == oauth_error for stream in (stdout, stderr)):
         return "oauth_token_invalidated"
+    expired_oauth_error = (
+        b"http 401: your authentication token has expired. please try refreshing it."
+    )
+    if any(stream.strip().lower() == expired_oauth_error for stream in (stdout, stderr)):
+        return "oauth_token_expired"
     quota_error = (
         rb"api call failed after [0-9]+ retries: http 429: you used all included pro usage"
         rb"(?:\. max is \$[0-9.]+/month for \$[0-9.]+ of usage: "
