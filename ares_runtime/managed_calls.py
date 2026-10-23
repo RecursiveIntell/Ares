@@ -251,7 +251,7 @@ def model_call_owner_scope(agent):
         _model_call_owner.reset(token)
 
 
-def produce_dispatch_materialization(agent, payload, *, purpose, route=None):
+def produce_dispatch_materialization(agent, payload, *, purpose, route=None, execution_id=None):
     """Use actual source, SessionDB, input-phase and lease owners or qualify none.
 
     A missing owner is data, not authorization. The consuming enforce governor
@@ -278,10 +278,11 @@ def produce_dispatch_materialization(agent, payload, *, purpose, route=None):
             provider_identity=route.get("provider") or getattr(agent, "provider", None),
             model_ref=payload.get("model") or getattr(agent, "model", None),
             api_mode=route.get("api_mode") or getattr(agent, "api_mode", None),
+            execution_id=execution_id,
         )
     except (ContractError, ContextContinuationError, ValueError, TypeError) as error:
-        return {"materialization": None, "qualification_error": getattr(error, "code", "MATERIALIZATION_UNAVAILABLE")}
-    return {"materialization": artifact, "qualification_error": None}
+        return {"materialization": None, "execution_id": execution_id, "qualification_error": getattr(error, "code", "MATERIALIZATION_UNAVAILABLE")}
+    return {"materialization": artifact, "execution_id": execution_id, "qualification_error": None}
 
 
 __all__ = ["MANAGED_CALL_CONTEXT_SCHEMA", "ManagedCallContextV1", "ManagedCallContextV2",

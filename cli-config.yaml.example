@@ -1971,3 +1971,18 @@ updates:
 #   # This runs ONCE per process at startup, so it cannot replace a credential
 #   # that expires mid-session. For a single provider whose token needs
 #   # re-minting during a session, use `providers.<name>.key_cmd` instead.
+
+# =============================================================================
+# Dispatch governor (optional plugin)
+# =============================================================================
+# The bundled `dispatch-governor` plugin persists the exact physical-send
+# observation onto the execution record. It is disabled unless listed in
+# `plugins.enabled`. `observe` records what it can; `enforce` refuses a send
+# when the pre-send `send_started` marker cannot be committed.
+#
+# plugins:
+#   enabled:
+#     - dispatch-governor
+#
+# dispatch_governor:
+#   mode: observe        # observe (default) or enforce
