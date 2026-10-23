@@ -239,6 +239,64 @@ print(json.dumps({{"denied": denied, "subprocess_denied": result.returncode != 0
     assert not (profile_home / "state.db").exists()
 
 
+@pytest.mark.linux_only
+def test_readonly_review_uses_run_owned_auth_lock_and_readonly_auth_store(
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path, profile_program("print('report')\n"))
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    auth_store = profile_home / "auth.json"
+    auth_store.write_text('{"version": 1, "providers": {}}\n', encoding="utf-8")
+    canonical_lock = profile_home / "auth.lock"
+    canonical_lock.write_text("canonical-lock\n", encoding="utf-8")
+    receipt = tmp_path / "receipt"
+    receipt.mkdir()
+
+    context = run_panel.readonly_review_context(
+        runtime=runtime,
+        profile_home=profile_home,
+        receipt_dir=receipt,
+        profile="public",
+    )
+    state = Path(context["state_home"])
+    run_lock = state / "auth.lock"
+
+    assert context["run_owned_profile_entries"] == ["auth.lock"]
+    assert "auth.json" in context["protected_profile_entries"]
+    assert "auth.lock" not in context["protected_profile_entries"]
+    assert run_lock.is_file()
+    assert run_lock.stat().st_mode & 0o777 == 0o600
+
+    program = f'''
+import json, pathlib
+auth_store = pathlib.Path({str(auth_store)!r})
+auth_lock = pathlib.Path({str(canonical_lock)!r})
+try:
+    auth_store.write_text("unauthorized")
+    store_denied = False
+except OSError:
+    store_denied = True
+auth_lock.write_text("run-owned-lock\\n")
+print(json.dumps({{"store_denied": store_denied, "lock_text": auth_lock.read_text()}}))
+'''
+    completed = subprocess.run(
+        [*context["launch_prefix"], sys.executable, "-P", "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "store_denied": True,
+        "lock_text": "run-owned-lock\n",
+    }
+    assert auth_store.read_text(encoding="utf-8") == '{"version": 1, "providers": {}}\n'
+    assert canonical_lock.read_text(encoding="utf-8") == "canonical-lock\n"
+    assert run_lock.read_text(encoding="utf-8") == "run-owned-lock\n"
+
+
 def test_normal_return_reaps_live_descendant_without_inherited_pipes(tmp_path: Path) -> None:
     pid_file = tmp_path / "descendant.pid"
     ready = tmp_path / "descendant.ready"
@@ -307,6 +365,57 @@ def test_safe_path_verification_preserves_failed_and_successful_attempts(tmp_pat
     assert failed_path.read_bytes() == failed_bytes
     assert failed["execution_artifacts_verified"] is False
     assert subprocess.run(command + ["--require-read-only-review"], env=environment, capture_output=True).returncode == 1
+
+
+def test_verifier_rejects_contained_receipt_without_run_owned_auth_lock(
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path, profile_program("print('report')\n"))
+    initialize_git_repository(runtime)
+    out = tmp_path / "receipt"
+    assert invoke(runtime, out, "--profiles", "public").returncode == 0
+
+    state = out / "session-state" / "public"
+    scratch = out / "scratch" / "public"
+    state.mkdir(parents=True)
+    scratch.mkdir(parents=True)
+    panel_path = out / "panel.json"
+    panel = json.loads(panel_path.read_text(encoding="utf-8"))
+    panel["read_only_review"] = True
+    result = panel["results"][0]
+    result["containment"] = {
+        "policy": run_panel.READONLY_REVIEW_POLICY,
+        "state_home": str(state),
+        "scratch": str(scratch),
+        "network_isolation": "none",
+        "secret_isolation": "not_provided",
+        "protected_profile_entries": ["auth.json", "auth.lock"],
+        "run_owned_profile_entries": [],
+    }
+    result["session_archive_outcome"] = "archived"
+    input_path = out / result["input_manifest_path"]
+    input_manifest = json.loads(input_path.read_text(encoding="utf-8"))
+    input_manifest["containment"] = result["containment"]
+    input_path.write_text(json.dumps(input_manifest, indent=2) + "\n", encoding="utf-8")
+    result["input_manifest_bytes"] = input_path.stat().st_size
+    result["input_manifest_sha256"] = run_panel.sha256_file(input_path)
+    panel_path.write_text(json.dumps(panel), encoding="utf-8")
+
+    environment = {**os.environ, "PYTHONPATH": str(SCRIPT.parent)}
+    command = [
+        sys.executable,
+        "-P",
+        str(VERIFY_SCRIPT),
+        "--receipt",
+        str(out),
+        "--runtime",
+        str(runtime),
+        "--require-read-only-review",
+    ]
+    completed = subprocess.run(command, env=environment, capture_output=True, text=True)
+
+    assert completed.returncode == 1
+    assert "run-owned auth lock" in completed.stdout
 
 
 @pytest.mark.linux_only

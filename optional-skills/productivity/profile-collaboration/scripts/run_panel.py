@@ -403,6 +403,15 @@ def readonly_review_context(
     scratch = receipt_dir.resolve() / "scratch" / profile
     state_home.mkdir(mode=0o700, parents=True, exist_ok=False)
     scratch.mkdir(mode=0o700, parents=True, exist_ok=False)
+    # The auth reader takes an advisory lock even for a pure credential read.
+    # The canonical auth store remains read-only, but its lock cannot be: an
+    # ``a+`` open against the read-only bind fails before a contained reviewer
+    # can make any provider call.  Give the sandbox an empty, run-owned lock in
+    # the already-authorized session-state directory.  This lock carries no
+    # credential material and cannot mutate or replace the profile's lock.
+    auth_lock = state_home / "auth.lock"
+    auth_lock.touch(mode=0o600, exist_ok=False)
+    auth_lock.chmod(0o600)
     profile_home = profile_home.resolve()
     prefix += [
         "--bind", str(state_home), str(state_home),
@@ -410,9 +419,10 @@ def readonly_review_context(
         "--bind", str(state_home), str(profile_home),
     ]
     protected = []
+    run_owned = {"auth.lock"}
     transient = {"state.db", "state.db-wal", "state.db-shm", "logs", "cache"}
     for child in sorted(profile_home.iterdir()):
-        if child.name in transient:
+        if child.name in transient or child.name in run_owned:
             continue
         prefix += ["--ro-bind", str(child), str(profile_home / child.name)]
         protected.append(child.name)
@@ -428,6 +438,7 @@ def readonly_review_context(
         "scratch": str(scratch),
         "profile_home": str(profile_home),
         "protected_profile_entries": protected,
+        "run_owned_profile_entries": sorted(run_owned),
         "bwrap_sha256": sha256_file(Path(binary)),
         "launch_prefix": prefix,
     }

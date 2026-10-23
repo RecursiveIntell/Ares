@@ -220,6 +220,17 @@ def main() -> int:
                         errors.append(f"{profile}: containment {key} escapes run directory")
                 if containment.get("network_isolation") != "none" or containment.get("secret_isolation") != "not_provided":
                     errors.append(f"{profile}: containment overstates isolation")
+                protected_entries = containment.get("protected_profile_entries")
+                run_owned_entries = containment.get("run_owned_profile_entries")
+                if (
+                    not isinstance(protected_entries, list)
+                    or "auth.json" not in protected_entries
+                    or "auth.lock" in protected_entries
+                    or run_owned_entries != ["auth.lock"]
+                ):
+                    errors.append(
+                        f"{profile}: contained review is missing the run-owned auth lock contract"
+                    )
                 if result.get("session_archive_outcome") != "archived":
                     errors.append(f"{profile}: contained session was not archived")
         if result.get("outcome") != "returned" or result.get("exit_code") != 0:
