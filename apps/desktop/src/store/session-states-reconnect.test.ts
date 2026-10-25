@@ -141,6 +141,63 @@ describe('reconcileBusyStatesOnReconnect', () => {
     expect($workingSessionIds.get()).toContain('sLocal')
   })
 
+  // A turn that keeps running backend-side after a socket drop is interrupted
+  // 300s later unless a session.resume cancels its detached-orphan reaper.
+  it('re-resumes every running durable session so the backend orphan reaper is cancelled', async () => {
+    const resumed: [string, unknown][] = []
+
+    setSessionTileDelegate({
+      resumeTile: async (id: string, options?: unknown) => {
+        resumed.push([id, options])
+
+        return 'rt-new'
+      }
+    } as unknown as SessionTileDelegate)
+    publishSessionState('rt1', state({ busy: true, storedSessionId: 's1' }))
+    publishSessionState('rt2', state({ busy: true, storedSessionId: 's2' }))
+    publishSessionState('rt3', state({ busy: false, storedSessionId: 's3' }))
+    // Two runtimes for one durable session resume it once.
+    publishSessionState('rt1b', state({ busy: true, storedSessionId: 's1' }))
+
+    reconcileBusyStatesOnReconnect()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(resumed.map(([id]) => id).sort()).toEqual(['s1', 's2'])
+    expect(resumed.every(([, o]) => (o as { force?: boolean }).force === true)).toBe(true)
+  })
+
+  it('a failed rebind does not throw or mark the session idle', async () => {
+    setSessionTileDelegate({
+      resumeTile: async () => {
+        throw new Error('gateway down')
+      }
+    } as unknown as SessionTileDelegate)
+    publishSessionState('rt1', state({ busy: true, storedSessionId: 's1' }))
+
+    expect(() => reconcileBusyStatesOnReconnect()).not.toThrow()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect($sessionStates.get().rt1?.reconnecting).toBe(true)
+  })
+
+  it('does not rebind sessions that were not running', async () => {
+    const resumed: string[] = []
+
+    setSessionTileDelegate({
+      resumeTile: async (id: string) => {
+        resumed.push(id)
+
+        return 'x'
+      }
+    } as unknown as SessionTileDelegate)
+    publishSessionState('rt1', state({ busy: false, storedSessionId: 's1' }))
+
+    reconcileBusyStatesOnReconnect()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(resumed).toEqual([])
+  })
+
   // #93059: the store is a mirror of the wiring cache; downgrading only the
   // mirror leaves the cache busy, and warm resume ORs it over `running: false`.
   it('routes the downgrade through the session-state write path (#93059)', () => {
