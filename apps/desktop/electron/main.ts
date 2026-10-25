@@ -6984,7 +6984,11 @@ const nativeSocketTransport = new NativeSocketTransport({
       followRedirects: false,
       rejectUnauthorized: true
     }),
-  emit: (owner, event) => owner.senderFrame.send('hermes:transport:event', event)
+  emit: (owner, event) => owner.senderFrame.send('hermes:transport:event', event),
+  diagnostic: info =>
+    rememberLog(
+      `[native-socket] retired reason=${info.reason} channel=${info.channel} queued=${info.queued} bytes=${info.bytes} sends=${info.sends}`
+    )
 })
 
 // Bind the resolved endpoint to its actual owning cache generation, including
