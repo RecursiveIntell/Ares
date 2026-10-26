@@ -49,6 +49,29 @@ from utils import (
 
 logger = logging.getLogger("gateway.run")
 
+
+def _goal_persistence_gateway_message(cause: str) -> str:
+    """Per-cause user-facing reply for a failed goal persistence (F0.1).
+
+    Mirrors the CLI/TUI messages; the UNAVAILABLE case must not advertise
+    `/goal status` as verification — the in-memory manager reports the goal
+    active while the DB row is missing.
+    """
+    from hermes_cli.goals import GoalPersistenceCause
+
+    cause = (cause or "").strip()
+    if cause == GoalPersistenceCause.UNAVAILABLE:
+        return (
+            "Goal set in this chat but NOT yet persisted (storage warming up). "
+            "It will flush automatically; if the gateway restarts before then it is lost. "
+            "Do not rely on /goal status alone to verify."
+        )
+    if cause == GoalPersistenceCause.CONFLICT:
+        return "Another writer changed the goal concurrently — check /goal status and retry."
+    if cause == GoalPersistenceCause.INVALID_SESSION:
+        return "No live session to attach the goal to."
+    return "Goal persistence failed — please retry."
+
 # Upper bound on the off-loop agent-resource cleanup during a /new or /reset
 # (see _handle_reset_command). A stuck teardown must not block the event loop;
 # past this the reset proceeds and the cleanup is left to finish (or leak) in
@@ -2965,6 +2988,9 @@ class GatewaySlashCommandsMixin:
             state = mgr.set(args, contract=contract)
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
+        except RuntimeError as exc:
+            cause = getattr(exc, "cause", None) or "write_failed"
+            return _goal_persistence_gateway_message(cause)
 
         # Queue the goal text as an immediate first turn so the agent
         # starts making progress. The post-turn hook takes over after.

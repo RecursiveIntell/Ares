@@ -7,7 +7,7 @@ import { clearClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
 import { enqueueQueuedPrompt } from '@/store/composer-queue'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
-import { applyGoalState, applyGoalStatusText, type GoalStatePayload } from '@/store/goals'
+import { applyGoalState, applyGoalStatusText, rehouseGoalChip, type GoalStatePayload } from '@/store/goals'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { isDiskFullErrorMessage, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
@@ -39,12 +39,23 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
     } else if (sessionId && payload?.kind === 'goal') {
       // Prefer the authoritative structured state; fall back to the text
       // grammar only for older gateways that do not send `goal_state`.
+      // F1.2: chip keys off the STORED session id when the runtime→stored
+      // binding is known (the binding outlives a re-bind; the runtime id does
+      // not). Unbound runtime (fresh session before first persist) keeps the
+      // runtime key pendingRekey until rehouseGoalChip re-homes it.
+      const storedId = deps.sessionStateByRuntimeIdRef.current.get(sessionId)?.storedSessionId ?? null
+      const mapKey = storedId ?? sessionId
+
+      if (mapKey !== sessionId) {
+        rehouseGoalChip(sessionId, mapKey)
+      }
+
       const structured = payload?.goal_state
 
       if (structured && typeof structured === 'object') {
-        applyGoalState(sessionId, structured as GoalStatePayload)
+        applyGoalState(sessionId, structured as GoalStatePayload, { runtimeId: sessionId, mapKey })
       } else {
-        applyGoalStatusText(sessionId, coerceGatewayText(payload?.text))
+        applyGoalStatusText(sessionId, coerceGatewayText(payload?.text), { runtimeId: sessionId, mapKey })
       }
     }
 

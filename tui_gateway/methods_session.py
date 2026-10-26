@@ -1119,6 +1119,19 @@ def _(rid, params: dict) -> dict:
                         session_db=db,
                         source=source,
                     )
+                    # F3.4 (goal-loop fix plan): resume-side goal heal. The
+                    # resumed DB session id is now bound to this runtime. If
+                    # the current key holds no goal and a lineage ancestor
+                    # does, migrate it forward — the same primitive
+                    # conversation_compression.py uses at compression
+                    # boundaries; without this an ancestor-held goal stays
+                    # invisible after await-the-resume return.
+                    try:
+                        from hermes_cli.goals import _resume_goal_heal
+
+                        _resume_goal_heal(current_session_id=str(target or ""), session_db=db)
+                    except Exception as _goal_heal_exc:
+                        logger.debug("goal resume heal failed: %s", _goal_heal_exc)
                     # Ownership TRANSFER — the registered session's agent now
                     # holds this handle for its whole life, and _init_session
                     # never closes a caller-supplied session_db (its

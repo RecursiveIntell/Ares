@@ -41,7 +41,7 @@ import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,42 @@ _ALLOWED_OUTCOMES = {
     TURN_BUDGET_EXHAUSTED, TOOL_BUDGET_EXHAUSTED,
     PROVIDER_FAILED, EXECUTION_FAILED, CANCELLED, PERSISTENCE_FAILED,
 }
+
+
+# ── Persistence outcome taxonomy (F0.1 of the goal-loop fix plan) ─────
+# One class per distinct user-facing failure message.  Five raw failure
+# modes inside save_goal collapse into these four (CAS-lost and a failed
+# post-commit readback both mean "wrote but cannot prove durability").
+
+class _GoalPersistenceCause:
+    INVALID_SESSION = "invalid_session"
+    UNAVAILABLE = "unavailable"
+    CONFLICT = "concurrent_writer_won"
+    WRITE_FAILED = "write_failed"
+
+
+GoalPersistenceCause = _GoalPersistenceCause()
+
+
+class SaveOutcome(NamedTuple):
+    """Result of one goal-row persistence attempt.
+
+    ``cause`` is None exactly when ``is_durable`` is True.
+    """
+    is_durable: bool
+    cause: Optional[str]
+
+
+class GoalPersistenceError(RuntimeError):
+    """Raised by GoalManager.set() when a goal write cannot be made durable.
+
+    ``cause`` carries one of the GoalPersistenceCause classes so surfaces
+    can print the per-cause message instead of a generic failure.
+    """
+
+    def __init__(self, cause: str, detail: str = ""):
+        self.cause = cause
+        super().__init__(detail or cause)
 
 DEFAULT_MAX_TURNS = 20
 DEFAULT_JUDGE_TIMEOUT = 30.0
@@ -754,12 +790,79 @@ _DB_CACHE: Dict[str, Any] = {}
 _DB_BOOTSTRAP_LOCK = threading.Lock()
 _DB_BOOTSTRAP_INFLIGHT: Dict[str, threading.Event] = {}
 
+# ── Deferred-write journal (F0.2 of the goal-loop fix plan) ──────────
 # Writes that `save_goal` could not persist because no SessionDB was
-# available yet (cold cache, bootstrap window expired). Keyed by
-# ``(home, session_id)`` so a later successful `_get_session_db()` can
-# flush them. Bounded: one entry per session, replaced on rewrite.
-_DEFERRED_GOAL_WRITES: Dict[Tuple[str, str], Dict[str, Any]] = {}
+# available yet. The former in-memory buffer died with its process on
+# SIGKILL/crash — the exact "goal was acknowledged on screen, then vanished"
+# class. Replaced by a per-PID, append-only JSONL journal (tombstones, never
+# rewrites) that a later healthy process drains. See
+# hermes_cli/goal_journal_README.md for the record format.
 _DEFERRED_WRITES_LOCK = threading.Lock()
+_MEMORY_DEFERRED_GOAL_WRITES: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_DEFERRED_GOAL_JOURNAL_DIRNAME = "goal-deferred"
+
+
+def _deferred_journal_dir(home: str) -> str:
+    return os.path.join(home, _DEFERRED_GOAL_JOURNAL_DIRNAME)
+
+
+def _deferred_journal_path(home: str) -> str:
+    return os.path.join(_deferred_journal_dir(home), f"{os.getpid()}.jsonl")
+
+
+def _journal_append(home: str, record: Dict[str, Any]) -> bool:
+    """Append one JSON line to this process's journal file. Best-effort."""
+    try:
+        d = _deferred_journal_dir(home)
+        os.makedirs(d, exist_ok=True)
+        with open(_deferred_journal_path(home), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        return True
+    except Exception as exc:
+        logger.debug("GoalManager: journal append failed: %s", exc)
+        return False
+
+
+def _process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return False
+    return True
+
+
+def _parse_journal_lines(path: str) -> List[Tuple[str, Dict[str, Any]]]:
+    """Return live (non-tombstoned) records as (id, record) pairs, in order."""
+    records: List[Tuple[str, Dict[str, Any]]] = []
+    tombstoned: set = set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                kind = rec.get("kind")
+                rid = rec.get("id")
+                if kind == "tombstone" and rid:
+                    tombstoned.add(rid)
+                elif kind == "write" and rid:
+                    records.append((rid, rec))
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.debug("GoalManager: journal read failed (%s): %s", path, exc)
+        return []
+    return [(rid, rec) for rid, rec in records if rid not in tombstoned]
 
 
 def _goal_write_conflicts(current: "GoalState", proposal: "GoalState", *, replacement_bound: bool = False) -> bool:
@@ -782,15 +885,14 @@ def _goal_write_conflicts(current: "GoalState", proposal: "GoalState", *, replac
 
 
 def _defer_goal_write(session_id: str, state: "GoalState") -> None:
-    """Remember a goal write that could not be persisted yet.
+    """Journal a goal write that could not be persisted yet (F0.2).
 
     ``save_goal`` returns False when SessionDB is unavailable, but the
     caller has already told the user the goal is set. Dropping the write
-    makes that reply a lie for the whole lifetime of the process: the DB
-    may come up a moment later (the gateway warms it off-loop) and every
-    subsequent read would still find nothing. Buffering the write lets
-    the next successful ``_get_session_db()`` flush it, so durability is
-    late instead of lost.
+    makes that reply a lie for the whole lifetime of the process — and the
+    former in-memory buffer also died with the process on SIGKILL. An
+    append-only per-PID journal survives both; the next healthy process
+    drains it (see :func:`_drain_dead_pid_journals`).
     """
     try:
         from hermes_constants import get_hermes_home
@@ -803,19 +905,157 @@ def _defer_goal_write(session_id: str, state: "GoalState") -> None:
     except Exception as exc:
         logger.debug("GoalManager: could not serialize deferred goal: %s", exc)
         return
+    record = {
+        "kind": "write",
+        "id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "payload": payload,
+        "at": time.time(),
+    }
+    if _journal_append(home, record):
+        return
+    # Journal unavailable (disk full, read-only home): fall back to the
+    # in-memory buffer so a same-process bootstrap still flushes it late.
     with _DEFERRED_WRITES_LOCK:
-        _DEFERRED_GOAL_WRITES[(home, session_id)] = {"payload": payload, "at": time.time()}
+        _MEMORY_DEFERRED_GOAL_WRITES[(home, session_id)] = {
+            "payload": payload, "at": time.time(),
+        }
+
+
+def _tombstone_journal(home: str, rid: str) -> None:
+    _journal_append(home, {"kind": "tombstone", "id": rid})
+
+
+def _apply_journal_record(db: Any, home: str, rid: str, rec: Dict[str, Any]) -> bool:
+    """Apply one journalled write through the same CAS path as live saves.
+
+    Returns True when the record is settled (durable or superseded) and may
+    be tombstoned; False keeps it pending for a later pass.
+    """
+    session_id = str(rec.get("session_id") or "")
+    payload = rec.get("payload")
+    if not session_id or not isinstance(payload, str):
+        return True  # malformed — tombstone it
+    try:
+        key = _meta_key(session_id)
+        current_raw = db.get_meta(key)
+        if current_raw:
+            current = GoalState.from_json(current_raw)
+            deferred = GoalState.from_json(payload)
+            if _goal_write_conflicts(current, deferred):
+                return True  # a newer canonical state won — settled
+        if current_raw == payload:
+            return True
+        return bool(db.compare_and_set_meta(key, current_raw, payload))
+    except Exception as exc:
+        logger.debug(
+            "GoalManager: journal write for %s still not durable: %s", session_id, exc,
+        )
+        return False
+
+
+def _drain_dead_pid_journals(home: str, db: Any) -> None:
+    """Drain journals whose owning process is gone (F0.2).
+
+    Called on every successful ``_get_session_db()`` cache miss→hit for
+    ``home``, before the in-memory flush. Live-PID files are skipped: the
+    owning process will drain its own records at its next cache hit.
+    """
+    directory = _deferred_journal_dir(home)
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        logger.debug("GoalManager: journal dir listing failed: %s", exc)
+        return
+    drained_any = False
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        pid_text = name[:-len(".jsonl")]
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == os.getpid() or _process_alive(pid):
+            continue
+        path = os.path.join(directory, name)
+        settled_ids: List[str] = []
+        for rid, rec in _parse_journal_lines(path):
+            try:
+                if _apply_journal_record(db, home, rid, rec):
+                    settled_ids.append(rid)
+            except Exception as exc:
+                logger.debug("GoalManager: journal drain record failed: %s", exc)
+        # Tombstones go to the DEAD process's own file (append-only, no
+        # cross-process rewrite): append via a standalone handle.
+        if settled_ids:
+            try:
+                with open(path, "a", encoding="utf-8") as f:
+                    for rid in settled_ids:
+                        f.write(json.dumps({"kind": "tombstone", "id": rid},
+                                           separators=(",", ":")) + "\n")
+                drained_any = True
+            except Exception as exc:
+                logger.debug("GoalManager: journal tombstone failed: %s", exc)
+    if drained_any:
+        _compact_fully_tombstoned_journals(directory)
+
+
+def _compact_fully_tombstoned_journals(directory: str) -> None:
+    """Delete journal files whose every live record is tombstoned.
+
+    Maintenance-only (called from the drain tail and the CLI command), never
+    a turn path. A file that only a live process owns is left alone.
+    """
+    try:
+        names = os.listdir(directory)
+    except Exception:
+        return
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        try:
+            pid = int(name[:-len(".jsonl")])
+        except ValueError:
+            continue
+        if pid == os.getpid() or _process_alive(pid):
+            continue
+        path = os.path.join(directory, name)
+        if not _parse_journal_lines(path):
+            try:
+                os.unlink(path)
+            except Exception as exc:
+                logger.debug("GoalManager: journal compaction failed: %s", exc)
 
 
 def _flush_deferred_goal_writes(home: str, db: Any) -> None:
-    """Persist buffered goal writes for ``home`` now that a DB exists.
+    """Persist journalled + buffered goal writes for ``home`` now a DB exists.
 
-    Best-effort: a flush failure leaves the entry in place for the next
-    attempt rather than discarding state we already acknowledged.
+    Order: dead-PID journals first (they belong to processes that can never
+    flush themselves), then this process's own journal records, then the
+    in-memory fallback. Best-effort: an unsettled record stays pending for
+    the next pass rather than discarding state we already acknowledged.
     """
+    _drain_dead_pid_journals(home, db)
+
+    # This process's own journal records (live PID — flush and tombstone).
+    mine = _deferred_journal_path(home)
+    settled_ids: List[str] = []
+    for rid, rec in _parse_journal_lines(mine):
+        try:
+            if _apply_journal_record(db, home, rid, rec):
+                settled_ids.append(rid)
+        except Exception as exc:
+            logger.debug("GoalManager: own journal record failed: %s", exc)
+    for rid in settled_ids:
+        _tombstone_journal(home, rid)
+
+    # In-memory fallback (only populated when the journal itself failed).
     with _DEFERRED_WRITES_LOCK:
-        keys = [k for k in _DEFERRED_GOAL_WRITES if k[0] == home]
-        pending = {k: _DEFERRED_GOAL_WRITES[k] for k in keys}
+        keys = [k for k in _MEMORY_DEFERRED_GOAL_WRITES if k[0] == home]
+        pending = {k: _MEMORY_DEFERRED_GOAL_WRITES[k] for k in keys}
     for (_home, session_id), entry in pending.items():
         try:
             key = _meta_key(session_id)
@@ -825,8 +1065,7 @@ def _flush_deferred_goal_writes(home: str, db: Any) -> None:
                 deferred = GoalState.from_json(entry["payload"])
                 if _goal_write_conflicts(current, deferred):
                     with _DEFERRED_WRITES_LOCK:
-                        if _DEFERRED_GOAL_WRITES.get((_home, session_id)) is entry:
-                            _DEFERRED_GOAL_WRITES.pop((_home, session_id), None)
+                        _MEMORY_DEFERRED_GOAL_WRITES.pop((_home, session_id), None)
                     continue
             if current_raw != entry["payload"] and not db.compare_and_set_meta(key, current_raw, entry["payload"]):
                 continue
@@ -841,9 +1080,45 @@ def _flush_deferred_goal_writes(home: str, db: Any) -> None:
             )
             continue
         with _DEFERRED_WRITES_LOCK:
-            current = _DEFERRED_GOAL_WRITES.get((_home, session_id))
-            if current is entry:
-                _DEFERRED_GOAL_WRITES.pop((_home, session_id), None)
+            _MEMORY_DEFERRED_GOAL_WRITES.pop((_home, session_id), None)
+
+
+def flush_goal_journal() -> int:
+    """Operator/CLI entry: drain every settleable journal record once.
+
+    Returns the number of records settled. Never raises.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = str(get_hermes_home())
+    except Exception:
+        return 0
+    db = _get_session_db()
+    if db is None:
+        return 0
+    before = _journal_pending_count(home)
+    _flush_deferred_goal_writes(home, db)
+    return max(0, before - _journal_pending_count(home))
+
+
+def _journal_pending_count(home: str) -> int:
+    directory = _deferred_journal_dir(home)
+    try:
+        names = os.listdir(directory)
+    except Exception:
+        names = []
+    total = 0
+    for name in names:
+        if name.endswith(".jsonl"):
+            try:
+                pid = int(name[:-len(".jsonl")])
+            except ValueError:
+                continue
+            if pid != os.getpid() and _process_alive(pid):
+                continue
+            total += len(_parse_journal_lines(os.path.join(directory, name)))
+    return total
 
 # How long a loop-thread caller waits for an ALREADY-RUNNING bootstrap
 # before degrading to None. Normal SessionDB init is ~10-100ms, so a call
@@ -1038,39 +1313,69 @@ def load_goal(session_id: str) -> Optional[GoalState]:
 
 
 def save_goal(session_id: str, state: GoalState, expected_raw: Optional[str] = None) -> bool:
-    """Persist a goal and report durability failures to the owner."""
+    """Persist a goal and report durability failures to the owner.
+
+    Compatibility wrapper over :func:`save_goal_outcome` — the typed outcome
+    lives there (``SaveOutcome`` naming one of the four persistence failure
+    classes); this keeps the historical truthiness contract for the ~20
+    in-module callers and the tests that assert ``is False``.  Feature code
+    that must distinguish causes should call ``save_goal_outcome`` directly.
+    """
+    return save_goal_outcome(session_id, state, expected_raw).is_durable
+
+
+def save_goal_outcome(session_id: str, state: GoalState, expected_raw: Optional[str] = None) -> "SaveOutcome":
+    """Persist a goal, carrying the exact failure-class back to the caller.
+
+    Returns a :class:`SaveOutcome`.  The cause taxonomy (five observed
+    failure modes collapse into the four terminal classes the surfaces have
+    distinct user-facing messages for — see F0.1 of the goal-loop fix plan):
+
+    - ``INVALID_SESSION``  — empty/absent session id (never happens in
+      feature flows; a defensive branch).
+    - ``UNAVAILABLE``      — no SessionDB yet (deferred-write journal took
+      the payload; durability is late).
+    - ``CONFLICT``         — a concurrent newer writer holds the row; the
+      caller must re-read and retry with a fresh expected_raw.
+    - ``WRITE_FAILED``     — CAS lost mid-flight or the readback after a
+      commit could not confirm durability.  Both are "wrote but cannot
+      prove it survived" and share one user message.
+    """
     if not session_id:
         logger.error("GoalManager: refusing to persist goal without session id")
-        return False
+        return SaveOutcome(False, GoalPersistenceCause.INVALID_SESSION)
     db = _get_session_db()
     if db is None:
         # The caller has already told the user the goal is set. Do not drop
-        # the write: buffer it so the next successful _get_session_db() can
-        # flush it once the bootstrap lands.
+        # the write: journal it so the next successful _get_session_db()
+        # can flush it once the bootstrap lands.
         _defer_goal_write(session_id, state)
         logger.error("GoalManager: SessionDB unavailable; goal state is not durable")
-        return False
+        return SaveOutcome(False, GoalPersistenceCause.UNAVAILABLE)
     payload = None
     try:
         payload = state.to_json()
         key = _meta_key(session_id)
         current_raw = db.get_meta(key)
         if current_raw == payload:
-            return True
+            return SaveOutcome(True, None)
         if current_raw and _goal_write_conflicts(GoalState.from_json(current_raw), state,
                 replacement_bound=expected_raw is not None and expected_raw == current_raw):
-            return False
-        return bool(db.compare_and_set_meta(key, expected_raw if expected_raw is not None else current_raw, payload))
+            return SaveOutcome(False, GoalPersistenceCause.CONFLICT)
+        if db.compare_and_set_meta(key, expected_raw if expected_raw is not None else current_raw, payload):
+            return SaveOutcome(True, None)
+        # CAS returned falsy without raising: a concurrent writer won.
+        return SaveOutcome(False, GoalPersistenceCause.CONFLICT)
     except Exception as exc:
         # A write may have committed before its acknowledgement failed.
         try:
             if payload is not None and db.get_meta(_meta_key(session_id)) == payload:
-                return True
+                return SaveOutcome(True, None)
         except Exception:
             pass
         _defer_goal_write(session_id, state)
         logger.error("GoalManager: conditional write failed; goal state is not durable: %s", exc)
-        return False
+        return SaveOutcome(False, GoalPersistenceCause.WRITE_FAILED)
 
 
 def list_persisted_goals() -> List[Tuple[str, GoalState]]:
@@ -1185,6 +1490,237 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         return True
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("GoalManager: goal migration failed: %s", exc)
+        return False
+
+
+# ── Boundary migration / archive (F3.1/F3.2, goal-loop fix plan) ─────
+# The single row-ending boundary semantics: successor-exists → migrate;
+# no successor → archive visibly. Compression continues to use
+# migrate_goal_to_session directly at its own (earlier) boundary.
+
+_NONTERMINAL_GOAL_STATUSES = frozenset({"active", "paused"})
+
+
+def _goal_row_nonterminal(db: Any, session_id: str) -> bool:
+    if db is None or not session_id:
+        return False
+    try:
+        raw = db.get_meta(_meta_key(session_id))
+    except Exception:
+        return False
+    if not raw:
+        return False
+    try:
+        return GoalState.from_json(raw).status in _NONTERMINAL_GOAL_STATUSES
+    except Exception:
+        return False
+
+
+def _migrate_or_archive_on_boundary(*, old_session_id: str, successor_session_id: str, reason: str = "") -> bool:
+    """One goal-row transition per session boundary (F3.1/F3.2).
+
+    Called from the single row-ending site (gateway/session.py's
+    promote_to_session_reset point; orphan-reap shapes route through the
+    same end/promote convergence). Semantics:
+
+    - successor exists and predecessor holds a non-terminal goal →
+      migrate_goal_to_session (origin row becomes ``cleared`` with
+      ``MIGRATED_TO:<id>``; successor row holds the live goal).
+    - no successor and predecessor holds a non-terminal goal → archive the
+      origin row ``cleared`` with ``SESSION_EXPIRED_NO_SUCCESSOR`` and warn
+      once (per session) — never silent.
+    - nothing non-terminal → no-op (False).
+    """
+    if not old_session_id:
+        return False
+    db = _get_session_db()
+    if db is None:
+        return False
+    if not _goal_row_nonterminal(db, old_session_id):
+        return False
+    successor = (successor_session_id or "").strip()
+    if successor and successor != old_session_id:
+        result = migrate_goal_to_session(old_session_id, successor, reason=reason or "boundary")
+        if result:
+            return True
+        # Fall through to the visible archive: a failed migration must not
+        # leave the row silently orphaned either.
+    archived_raw = db.get_meta(_meta_key(old_session_id))
+    if not archived_raw:
+        return False
+    try:
+        archived = GoalState.from_json(archived_raw)
+        if archived.status not in _NONTERMINAL_GOAL_STATUSES:
+            return False
+        before = archived_raw
+        archived.status = "cleared"
+        archived.outcome = CANCELLED
+        archived.last_stop_reason = (
+            f"SESSION_EXPIRED_NO_SUCCESSOR:{reason}" if reason else "SESSION_EXPIRED_NO_SUCCESSOR"
+        )
+        archived.next_action = None
+        archived.continuation_pending = False
+        if db.compare_and_set_meta(_meta_key(old_session_id), before, archived.to_json()):
+            logger.warning(
+                "GoalManager: session %s expired with a standing goal and no successor; "
+                "goal archived (last_stop_reason=SESSION_EXPIRED_NO_SUCCESSOR%s)",
+                old_session_id,
+                f":{reason}" if reason else "",
+            )
+            return True
+    except Exception as exc:
+        logger.debug("GoalManager: goal boundary archive failed: %s", exc)
+    return False
+
+
+# ── Non-terminal goal guard helper (F3.5, goal-loop fix plan) ────────
+# Fail-closed on DB exception (matching has_active_processes_fn's
+# keep-session-alive precedent), fail-open when no DB handle exists at all.
+# 30 s TTL cache keeps the routing hot path from re-reading per message.
+
+_NONTERMINAL_GOAL_CACHE_TTL_S = 30.0
+_NONTERMINAL_GOAL_LAST_WARN: Dict[str, float] = {}
+_NONTERMINAL_GOAL_WARN_INTERVAL_S = 60.0
+_nonterminal_goal_cache: Dict[str, Tuple[bool, float]] = {}
+
+
+def has_nonterminal_goal_for_session(session_id: str) -> bool:
+    """True when the session holds a standing /goal (active or paused).
+
+    Wired from gateway/run.py into SessionStore as
+    ``has_nonterminal_goal_fn``; consulted at the same three expiry/reset
+    call-sites that already gate on active background processes.
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return False
+    now = time.monotonic()
+    cached = _nonterminal_goal_cache.get(sid)
+    if cached is not None and (now - cached[1]) < _NONTERMINAL_GOAL_CACHE_TTL_S:
+        return cached[0]
+    db = _get_session_db()
+    if db is None:
+        # No storage at all: fail open (mirror the unset-closure behavior of
+        # _has_active_processes_safe; cannot pin sessions alive config-less).
+        result = False
+    else:
+        try:
+            raw = db.get_meta(_meta_key(sid))
+            if not raw:
+                result = False
+            else:
+                status = GoalState.from_json(raw).status
+                result = status in _NONTERMINAL_GOAL_STATUSES
+        except Exception as exc:
+            # Fail CLOSED: treat the goal as present so the session is not
+            # expired while goal state is unreadable. Bounded warn.
+            result = True
+            last = _NONTERMINAL_GOAL_LAST_WARN.get(sid, 0.0)
+            if (now - last) > _nonterminal_goal_warn_interval():
+                _NONTERMINAL_GOAL_LAST_WARN[sid] = now
+                logger.warning(
+                    "has_nonterminal_goal_for_session(%s): goal lookup failed; "
+                    "failing closed (keeping session alive): %s", sid, exc,
+                )
+        finally:
+            _nonterminal_goal_cache[sid] = (result, now)
+    return result
+
+
+def _nonterminal_goal_warn_interval() -> float:
+    interval = os.environ.get("HERMES_GOAL_GUARD_WARN_INTERVAL_S")
+    if interval:
+        try:
+            return max(1.0, float(interval))
+        except ValueError:
+            pass
+    return _NONTERMINAL_GOAL_WARN_INTERVAL_S
+
+
+def _goal_persistence_message(cause: Optional[str]) -> str:
+    """Per-cause user-facing message for a failed goal persistence (F0.1).
+
+    The UNAVAILABLE message deliberately does NOT point at /goal status as
+    verification: the in-memory manager still holds the goal and would report
+    it active while the DB row is missing.
+    """
+    cause = (cause or "").strip()
+    if cause == GoalPersistenceCause.UNAVAILABLE:
+        return (
+            "Goal set in this session but NOT yet persisted (storage warming up). "
+            "It will flush automatically; if the app restarts before then it is lost. "
+            "Do not rely on /goal status alone to verify."
+        )
+    if cause == GoalPersistenceCause.CONFLICT:
+        return "Another writer changed the goal concurrently — check /goal status and retry."
+    if cause == GoalPersistenceCause.INVALID_SESSION:
+        return "No live session to attach the goal to."
+    return "Goal persistence failed — please retry."
+
+
+def invalidate_nonterminal_goal_cache(session_id: Optional[str] = None) -> None:
+    """Drop the guard cache when a goal row changes (goal set/clear/migrate)."""
+    if session_id is None:
+        _nonterminal_goal_cache.clear()
+    else:
+        sid = (session_id or "").strip()
+        if sid:
+            _nonterminal_goal_cache.pop(sid, None)
+
+
+# ── Resume-side goal heal (F3.4, goal-loop fix plan) ─────────────────
+# When a desktop session is resumed after an implicit boundary (orphan reap,
+# compression child, restart), the flat goal lookup keys on the CURRENT db
+# session id and returns nothing — even though a non-terminal goal row lives
+# on a lineage ancestor. The heal follows the SAME parent-edge traversal the
+# context-continuation tip resolver uses (read-only), then reuses
+# migrate_goal_to_session (the write the compression boundary already owns)
+# to move the goal forward. No new state model: lookup + one existing write.
+
+_RESUME_HEAL_MAX_DEPTH = 32
+
+
+def _resume_goal_heal(current_session_id: str, *, session_db=None) -> bool:
+    """Migrate a lineage-ancestor goal onto the resumed session (best-effort)."""
+    sid = (current_session_id or "").strip()
+    if not sid:
+        return False
+    db = session_db if session_db is not None else _get_session_db()
+    if db is None:
+        return False
+    try:
+        if _goal_row_nonterminal(db, sid):
+            return False  # current key already holds a live goal — no-op
+        # Walk parent_session_id edges upward (bounded); use the first
+        # ancestor carrying a non-terminal goal.
+        ancestor: Optional[str] = None
+        current = sid
+        seen = {sid}
+        for _ in range(_RESUME_HEAL_MAX_DEPTH):
+            try:
+                row = db.get_session(current)
+            except Exception:
+                row = None
+            parent = str((row or {}).get("parent_session_id") or "").strip()
+            if not parent or parent in seen:
+                break
+            seen.add(parent)
+            if _goal_row_nonterminal(db, parent):
+                ancestor = parent
+                break
+            current = parent
+        if not ancestor:
+            return False
+        result = migrate_goal_to_session(ancestor, sid, reason="resume_rebind", session_db=db)
+        if result:
+            invalidate_nonterminal_goal_cache(sid)
+            logger.info(
+                "GoalManager: resume heal migrated goal %s -> %s (resume_rebind)",
+                ancestor, sid,
+            )
+        return result
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("GoalManager: resume goal heal failed: %s", exc)
         return False
 
 
@@ -1973,10 +2509,18 @@ class GoalManager:
         )
         db = _get_session_db()
         if db is None:
-            raise RuntimeError("goal state could not be persisted: storage unavailable")
+            raise GoalPersistenceError(
+                GoalPersistenceCause.UNAVAILABLE,
+                "goal state could not be persisted: storage unavailable",
+            )
         expected_raw = db.get_meta(_meta_key(self.session_id))
-        if not save_goal(self.session_id, state, expected_raw):
-            raise RuntimeError("goal state could not be persisted; refresh before retrying")
+        outcome = save_goal_outcome(self.session_id, state, expected_raw)
+        if not outcome.is_durable:
+            raise GoalPersistenceError(
+                outcome.cause or GoalPersistenceCause.WRITE_FAILED,
+                "goal state could not be persisted; refresh before retrying",
+            )
+        invalidate_nonterminal_goal_cache(self.session_id)
         self._state = state
         return state
 
@@ -2103,6 +2647,7 @@ class GoalManager:
             current.next_action = None
             current.continuation_pending = False
             if save_goal(self.session_id, current, raw):
+                invalidate_nonterminal_goal_cache(self.session_id)
                 self._state = None
                 return True
         return False
