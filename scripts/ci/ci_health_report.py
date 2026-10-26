@@ -291,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.input:
-        fixture = json.loads(Path(args.input).read_text())
+        fixture = json.loads(Path(args.input).read_text(encoding="utf-8"))
         reports = [build_report(wf, d.get("runs", []), d.get("failed_jobs", {}), DEFAULT_BUDGET_MIN)
                    for wf, d in fixture.items()]
         alerts = fixture.get("__alerts__")
@@ -303,8 +303,8 @@ def main(argv: list[str] | None = None) -> int:
                "reports": reports, "alert_baseline": alerts}
     text = to_markdown(reports, alerts)
     if args.out:
-        Path(f"{args.out}.json").write_text(json.dumps(payload, indent=2) + "\n")
-        Path(f"{args.out}.md").write_text(text)
+        Path(f"{args.out}.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        Path(f"{args.out}.md").write_text(text, encoding="utf-8")
         print(f"wrote {args.out}.json and {args.out}.md")
     else:
         print(text)
