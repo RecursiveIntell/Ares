@@ -3507,6 +3507,13 @@ def _install_psutil_android_compat(
             env=env,
         )
 
+def _uv_version_tuple_of(bin_path: str) -> tuple[int, int, int] | None:
+    """Admission helper: parse a candidate uv binary's version, or None."""
+    from hermes_cli.managed_uv import _uv_version_tuple
+
+    return _uv_version_tuple(bin_path)
+
+
 def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
     """Best-effort uv bootstrap on Termux for faster update installs.
 
@@ -3515,6 +3522,10 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
     installer may not work (glibc vs bionic).  Prefer a uv already on PATH
     (e.g. ``pkg install uv``); only if there is none do we fall back to a
     wheel-only ``pip install uv`` so we never source-build the Rust crate.
+
+    Reviewed-range admission applies to EVERY candidate, including PATH
+    binaries: an out-of-range or unreadable uv is never returned to the
+    sync call sites (round-5 verifier HIGH).
     """
     from hermes_cli.managed_uv import resolve_uv_admitted
 
@@ -3526,7 +3537,15 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
     # A Termux-packaged uv lands on PATH but not in the managed bin dir, so
     # the managed lookup misses it. Use it before pip, which has no Android wheel and
     # would otherwise build uv from source on a low-memory device.
-    system_uv = shutil.which("uv")
+    def _admitted(path: str | None) -> str | None:
+        if not path:
+            return None
+        version = _uv_version_tuple_of(path)
+        if version is not None and (0, 9, 28) <= version < (0, 13, 0):
+            return path
+        return None
+
+    system_uv = _admitted(shutil.which("uv"))
     if system_uv:
         return system_uv
     try:
@@ -3540,8 +3559,8 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
             return None
     except Exception:
         pass
-    # After pip install, check managed path first, then PATH
-    return resolve_uv_admitted() or shutil.which("uv")
+    # After pip install, check managed path first, then PATH (both admitted).
+    return _admitted(resolve_uv_admitted() or shutil.which("uv"))
 
 def _npm_manifest_paths() -> tuple[Path, ...]:
     """Manifests whose changes must defeat the update-skip.
