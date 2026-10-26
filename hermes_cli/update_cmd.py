@@ -1966,10 +1966,15 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     _m()._abort_dependency_sync_if_self_locked()
     print("→ Updating Python dependencies...")
 
-    from hermes_cli.managed_uv import ensure_uv, update_managed_uv
+    from hermes_cli.managed_uv import ensure_uv, resolve_uv, update_managed_uv
 
     # Keep managed uv current — runs `uv self update` if we already have one.
-    update_managed_uv()
+    # None return = out-of-range managed uv that could not be repaired: the
+    # sync is refused (uv-pin fail-closed contract).
+    if update_managed_uv() is None and resolve_uv():
+        print("  ✗ Managed uv is outside the reviewed range and could not be repaired; "
+              "skipping the Python dependency sync (re-run the installer to repair)")
+        return 1
 
     uv_bin = ensure_uv()
 
@@ -9355,10 +9360,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("→ Python dependencies unchanged — skipping reinstall")
         else:
             print("→ Updating Python dependencies...")
-        from hermes_cli.managed_uv import ensure_uv, update_managed_uv
+        from hermes_cli.managed_uv import ensure_uv, resolve_uv, update_managed_uv
 
         # Keep managed uv current — runs `uv self update` if we already have one.
-        update_managed_uv()
+        # None return = the managed uv is out of the reviewed range and could
+        # not be repaired: refuse the sync rather than run it on the stale
+        # binary (uv-pin fail-closed contract).
+        if update_managed_uv() is None and resolve_uv():
+            print("  ✗ Managed uv is outside the reviewed range and could not be repaired; "
+                  "skipping the Python dependency sync (re-run the installer to repair)")
+            return 1
 
         uv_bin = ensure_uv()
 

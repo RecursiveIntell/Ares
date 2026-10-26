@@ -10,6 +10,7 @@ argv contract assertable directly).
 
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -168,3 +169,29 @@ def test_in_range_managed_uv_is_not_reinstalled(managed_home, recorded_subproces
     assert result is not None
     targeted = [c for c in recorded_subprocess if len(c) >= 4 and c[-1] == PIN and "update" in c]
     assert targeted, "in-range uv still gets refreshed to the pin (not the newest release)"
+
+
+def test_update_cmd_refuses_sync_on_unrepairable_uv():
+    """End-to-end contract (round-2 verifier HIGH): both update-call sites in
+    hermes_cli/update_cmd.py must treat update_managed_uv() -> None (with an
+    existing managed binary) as 'refuse the sync' — not fall through to
+    ensure_uv() on the stale binary."""
+    import inspect
+
+    import hermes_cli.update_cmd as uc
+
+    src = inspect.getsource(uc)
+    # Both call sites guard on the None return before ensure_uv().
+    guards = re.findall(
+        r"if update_managed_uv\(\) is None and resolve_uv\(\):", src
+    )
+    assert len(guards) >= 2, (
+        f"expected the fail-closed sync guard at both update call sites, found {len(guards)}"
+    )
+    # No call site may call ensure_uv() unguarded right after update_managed_uv().
+    for m in re.finditer(r"update_managed_uv\(\)\n", src):
+        tail = src[m.end():m.end() + 400]
+        assert "if update_managed_uv() is None and resolve_uv():" in tail or \
+               "update_managed_uv() is None" in tail, (
+            "an update_managed_uv() call site ignores the fail-closed contract:\n" + tail[:200]
+        )
