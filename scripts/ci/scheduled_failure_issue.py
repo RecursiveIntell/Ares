@@ -124,15 +124,26 @@ def issue_body(workflow_name: str, run: dict, job_rows: list[tuple[str, str]], z
 def ensure_label(repo: str) -> None:
     """Create the tracking label if missing (gh issue create --label fails
     otherwise, and the first real failure would then go unreported)."""
-    out = subprocess.run(["gh", "label", "list", "--repo", repo, "--json", "name"],
-                         capture_output=True, text=True, timeout=60)
-    if out.returncode == 0:
+    names: set[str] = set()
+    page = 1
+    while True:
+        out = subprocess.run(
+            ["gh", "label", "list", "--repo", repo, "--json", "name",
+             "--limit", "100", "--page", str(page)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if out.returncode != 0:
+            break
         try:
-            names = {n.get("name") for n in json.loads(out.stdout or "[]")}
-            if LABEL in names:
-                return
+            batch = json.loads(out.stdout or "[]")
         except json.JSONDecodeError:
-            pass
+            break
+        names.update(n.get("name") for n in batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    if LABEL in names:
+        return
     proc = subprocess.run(
         ["gh", "label", "create", LABEL, "--repo", repo,
          "--description", "A scheduled CI run failed (auto-managed by ares-scheduled-failure-watch)",

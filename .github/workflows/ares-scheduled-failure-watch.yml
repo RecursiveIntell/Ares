@@ -22,6 +22,9 @@ on:
   workflow_dispatch: {}
 
 permissions:
+  # contents: read is required for the actions/checkout step (the repo is
+  # private-capable; a token without contents read cannot check out).
+  contents: read
   actions: read
   issues: write
 
