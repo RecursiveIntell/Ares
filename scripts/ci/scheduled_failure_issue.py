@@ -66,45 +66,93 @@ def decide(run: dict | None, job_conclusions: list[str] | None) -> tuple[str, li
         return "skip", None
     if (run.get("status") or "").lower() != "completed":
         return "pending", None
-    bad = []
-    if job_conclusions:  # None or [] both mean "no usable job detail"
+    run_bad = (run.get("conclusion") or "").lower() in BAD_CONCLUSIONS
+    if run_bad:
+        # RED outranks job detail: a red run must never close its issue even
+        # when the fetched job page looks green (startup failures, rollup
+        # artifacts, >page-size truncation can all hide failures).
+        bad = [c for c in (job_conclusions or []) if c in BAD_CONCLUSIONS]
+        return "report", bad
+    if job_conclusions:  # run not bad, usable job detail
         bad = [c for c in job_conclusions if c in BAD_CONCLUSIONS]
         if not bad:
             return "close", []
         return "report", bad
-    # Job detail unavailable or empty (startup-level failures can have zero
-    # job records): fall back to the run-level conclusion only.
-    if (run.get("conclusion") or "").lower() in BAD_CONCLUSIONS:
-        return "report", []
+    # No usable job detail and the run itself is not bad: close only on
+    # explicit success; anything else makes no decision.
     if (run.get("conclusion") or "").lower() == "success":
         return "close", []
     return "pending", None
 
 
-def issue_body(workflow_name: str, run: dict, failing: list[str], zero_jobs: bool) -> str:
+def issue_body(workflow_name: str, run: dict, job_rows: list[tuple[str, str]], zero_jobs: bool) -> str:
+    """Issue body. job_rows: (name, conclusion) for EVERY fetched job; the
+    table lists the failing rows (or the startup-level placeholder)."""
     run_url = run.get("url") or f"https://github.com/THIS/actions/runs/{run.get('databaseId')}"
+    failing = [(n, c) for (n, c) in job_rows if c in BAD_CONCLUSIONS]
+    if zero_jobs:
+        summary = "Startup-level failure (no job records available for this run)."
+    else:
+        summary = f"Failed: {len(failing)} of {len(job_rows)} job(s)."
     lines = [
         f"Scheduled run of **{workflow_name}** failed.",
         "",
         f"- Run: {run_url}",
-        f"- Failed: {len(failing)} jobs",
+        f"- {summary}",
         "",
         "| job | conclusion |",
         "|---|---|",
     ]
     if zero_jobs:
         lines.append("| (no job records available for this run — startup-level failure) | - |")
+    else:
+        for name, conclusion in failing:
+            lines.append(f"| {name} | {conclusion} |")
+        if not failing:
+            # Run-level red with no identifiable failing job on the fetched
+            # pages: say so instead of leaving an empty table.
+            lines.append("| (run-level failure; no failing job on fetched job pages) | - |")
     lines.append("")
     lines.append("<!-- ares-scheduled-failure-watch v1; auto-managed: closed on next green scheduled run -->")
     return "\n".join(lines) + "\n"
 
 
+def ensure_label(repo: str) -> None:
+    """Create the tracking label if missing (gh issue create --label fails
+    otherwise, and the first real failure would then go unreported)."""
+    out = subprocess.run(["gh", "label", "list", "--repo", repo, "--json", "name"],
+                         capture_output=True, text=True, timeout=60)
+    if out.returncode == 0:
+        try:
+            names = {n.get("name") for n in json.loads(out.stdout or "[]")}
+            if LABEL in names:
+                return
+        except json.JSONDecodeError:
+            pass
+    proc = subprocess.run(
+        ["gh", "label", "create", LABEL, "--repo", repo,
+         "--description", "A scheduled CI run failed (auto-managed by ares-scheduled-failure-watch)",
+         "--color", "D73A4A"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if proc.returncode != 0 and "already_exists" not in (proc.stderr or ""):
+        raise RuntimeError(f"label create failed: {(proc.stderr or '')[:200]}")
+
+
 def find_open_issue(repo: str, workflow_name: str) -> str:
+    """Deterministic open-issue lookup: REST list by label (NOT the
+    eventually-consistent search index, which can miss a just-created issue
+    and cause duplicates or missed closes), exact-title match client-side."""
     title = f"[{LABEL}] {workflow_name}"
-    out = gh_raw(["api", "-X", "GET", "search/issues",
-                  "-f", f"q=repo:{repo} is:open label:{LABEL} in:title \"{title}\"",
-                  "--jq", ".items[0].number"])
-    return out.strip()
+    out = gh_raw(["api", f"/repos/{repo}/issues?labels={LABEL}&state=open&per_page=100"])
+    try:
+        issues = json.loads(out) if out.strip() else []
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"issue list parse failed: {exc}") from exc
+    for issue in issues:
+        if issue.get("title") == title and "pull_request" not in issue:
+            return str(issue.get("number"))
+    return ""
 
 
 def sweep(repo: str, watched: list[str], dry_run: bool = False) -> int:
@@ -119,13 +167,23 @@ def sweep(repo: str, watched: list[str], dry_run: bool = False) -> int:
             # displayTitle (a commit subject that changes per run and would
             # fragment the tracked issue across runs).
             wf_name = wf
-            jobs: list[str] | None = None
+            job_rows: list[tuple[str, str]] | None = None  # (name, conclusion)
             if run is not None:
-                data = gh_json(["api", f"/repos/{repo}/actions/runs/{run['databaseId']}/jobs?per_page=100"])
-                job_list = data.get("jobs", []) if isinstance(data, dict) else data
-                jobs = [j.get("conclusion") or "unknown" for j in job_list]
+                # Paginate: a matrix run can exceed one page; a truncated page
+                # could hide a failing job.
+                page = 1
+                job_list: list[dict] = []
+                while True:
+                    data = gh_json(["api",
+                                    f"/repos/{repo}/actions/runs/{run['databaseId']}/jobs?per_page=100&page={page}"])
+                    batch = data.get("jobs", []) if isinstance(data, dict) else data
+                    job_list.extend(batch)
+                    if len(batch) < 100:
+                        break
+                    page += 1
+                job_rows = [(j.get("name") or "?", j.get("conclusion") or "unknown") for j in job_list]
 
-            action, failing = decide(run, jobs)
+            action, failing = decide(run, [c for (_, c) in job_rows] if job_rows is not None else None)
             existing = find_open_issue(repo, wf_name) if action in ("report", "close") else ""
 
             if action == "skip":
@@ -141,12 +199,13 @@ def sweep(repo: str, watched: list[str], dry_run: bool = False) -> int:
                 else:
                     print(f"{wf}: green; no open failure issue")
             elif action == "report":
-                zero_jobs = run is not None and jobs == []
-                body = issue_body(wf_name, run or {}, failing or [], zero_jobs)
-                print(f"{wf}: RED ({len(failing or [])} bad jobs, zero_jobs={zero_jobs})")
+                zero_jobs = run is not None and job_rows == []
+                body = issue_body(wf_name, run or {}, job_rows or [], zero_jobs)
+                print(f"{wf}: RED (zero_jobs={zero_jobs})")
                 if dry_run:
                     print(body)
                     continue
+                ensure_label(repo)
                 if existing:
                     proc = subprocess.run(["gh", "issue", "edit", existing, "--repo", repo,
                                            "--body-file", "-"], input=body, text=True, capture_output=True, timeout=120)

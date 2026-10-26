@@ -1,9 +1,11 @@
 """Unit tests for the scheduled-failure issue sweeper decision core.
 
 Run: uv run --python 3.14 --with pytest python -m pytest tests/ci/test_scheduled_failure_issue.py -q
-Covers: green-close, red-report, zero-job startup failures, in-progress
-runs, never-scheduled workflows, run-conclusion fallback when job detail is
-unavailable, and the issue body shape (no empty-table holes).
+Covers: green-close, red-report, red-outranks-green-job-page (verifier
+finding: a red run must never close its issue), zero-job startup failures,
+in-progress runs, never-scheduled workflows, explicit-success close with no
+job detail, and the issue body shape (failing rows present; never an empty
+table).
 """
 
 from __future__ import annotations
@@ -29,14 +31,25 @@ def test_red_run_reports():
     assert action == "report" and failing == ["failure", "cancelled"]
 
 
+def test_red_run_never_closes_even_if_job_page_is_green():
+    """Verifier high finding: a red run with a green-looking job page must
+    still report (startup failures / truncation can hide failures)."""
+    action, failing = sfi.decide({"status": "completed", "conclusion": "failure"},
+                                 ["success", "success"])
+    assert action == "report"
+    action, _ = sfi.decide({"status": "completed", "conclusion": "timed_out"}, ["success"])
+    assert action == "report"
+    action, _ = sfi.decide({"status": "completed", "conclusion": "cancelled"}, ["success", "skipped"])
+    assert action == "report"
+
+
 def test_zero_job_startup_failure_reports_with_zero_jobs():
     action, failing = sfi.decide({"status": "completed", "conclusion": "failure"}, [])
     assert action == "report" and failing == []
 
 
 def test_in_progress_run_is_pending():
-    action, _ = sfi.decide({"status": "in_progress", "conclusion": None},
-                           ["failure"])  # jobs fetched but run not completed
+    action, _ = sfi.decide({"status": "in_progress", "conclusion": None}, ["failure"])
     assert action == "pending"
 
 
@@ -45,14 +58,21 @@ def test_never_scheduled_is_skipped():
     assert action == "skip" and failing is None
 
 
-def test_run_conclusion_fallback_without_jobs():
-    action, failing = sfi.decide({"status": "completed", "conclusion": "failure"}, None)
-    assert action == "report" and failing == []
+def test_success_without_job_detail_closes_other_conclusions_pending():
     action, _ = sfi.decide({"status": "completed", "conclusion": "success"}, None)
     assert action == "close"
-    # unknown non-terminal conclusion -> no decision
+    # Unknown/neutral run conclusion and no job detail -> no decision.
     action, _ = sfi.decide({"status": "completed", "conclusion": "neutral"}, None)
     assert action == "pending"
+
+
+def test_issue_body_lists_failing_rows():
+    rows = [("build ok", "success"), ("tests broken", "failure"), ("deploy", "cancelled")]
+    body = sfi.issue_body("W", {"databaseId": 1, "url": "u"}, rows, False)
+    assert "| tests broken | failure |" in body
+    assert "| deploy | cancelled |" in body
+    assert "| build ok |" not in body
+    assert "Failed: 2 of 3 job(s)." in body
 
 
 def test_issue_body_renders_startup_failure_row():
@@ -63,7 +83,7 @@ def test_issue_body_renders_startup_failure_row():
     assert "[ci-scheduled-failure]" not in body  # title is separate from body
 
 
-def test_issue_body_no_empty_table():
-    body = sfi.issue_body("W", {"databaseId": 1, "url": "u"}, ["failure"], False)
-    assert body.count("| job |") == 1
-    assert "startup-level failure" not in body
+def test_issue_body_run_level_red_with_green_jobs_never_empty_table():
+    body = sfi.issue_body("W", {"databaseId": 1, "url": "u"},
+                          [("all green", "success")], False)
+    assert "| (run-level failure; no failing job on fetched job pages) | - |" in body
