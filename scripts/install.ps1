@@ -750,10 +750,21 @@ function Install-Uv {
     $managedUv = Join-Path $HermesHome "bin\uv.exe"
 
     if (Test-Path $managedUv) {
-        $script:UvCmd = $managedUv
-        $version = & $managedUv --version
-        Write-Success "Managed uv found ($version)"
-        return $true
+        $version = (& $managedUv --version 2>$null | Out-String).Trim()
+        if ($version -match '^uv (\d+)\.(\d+)\.(\d+)') {
+            [version]$v = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+            $min = [version]"0.9.28"; $max = [version]"0.13.0"
+            if ($v -lt $min -or $v -ge $max) {
+                Write-Info "Managed uv ($version) is outside the reviewed range; replacing with pinned uv 0.12.24"
+                # fall through to the install branch below
+            } else {
+                $script:UvCmd = $managedUv
+                Write-Success "Managed uv found ($version)"
+                return $true
+            }
+        } else {
+            Write-Info "Managed uv version unreadable; replacing with pinned uv 0.12.24"
+        }
     }
 
     Write-Info "Installing managed uv into $HermesHome\bin ..."
@@ -1072,15 +1083,31 @@ function Resolve-UvCmd {
     # Check the managed location first -- this is where Install-Uv puts it.
     $managedUv = Join-Path $HermesHome "bin\uv.exe"
     if (Test-Path $managedUv) {
-        $script:UvCmd = $managedUv
-        return
+        # Reviewed-range admission (uv-pin contract): only an in-range
+        # managed uv may be adopted; otherwise fall through to PATH/refuse.
+        $version = (& $managedUv --version 2>$null | Out-String).Trim()
+        if ($version -match '^uv (\d+)\.(\d+)\.(\d+)') {
+            [version]$v = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+            if ([version]"0.9.28" -le $v -and $v -lt [version]"0.13.0") {
+                $script:UvCmd = $managedUv
+                return
+            }
+        }
     }
 
     # Fall back to PATH (covers edge cases where the installer ran in a
-    # sibling process and HERMES_HOME wasn't propagated).
-    if (Get-Command uv -ErrorAction SilentlyContinue) {
-        $script:UvCmd = "uv"
-        return
+    # sibling process and HERMES_HOME wasn't propagated). The PATH uv is
+    # also version-admitted before adoption.
+    $pathUv = (Get-Command uv -ErrorAction SilentlyContinue).Source
+    if ($pathUv) {
+        $version = (& $pathUv --version 2>$null | Out-String).Trim()
+        if ($version -match '^uv (\d+)\.(\d+)\.(\d+)') {
+            [version]$v = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+            if ([version]"0.9.28" -le $v -and $v -lt [version]"0.13.0") {
+                $script:UvCmd = $pathUv
+                return
+            }
+        }
     }
 
     # Refresh PATH from registry in case the current process started before
