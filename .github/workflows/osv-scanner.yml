@@ -151,4 +151,3 @@ jobs:
     uses: ./.github/workflows/ares-report-scheduled.yml
     with:
       workflow-name: OSV-Scanner
-    secrets: inherit

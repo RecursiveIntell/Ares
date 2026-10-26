@@ -122,4 +122,3 @@ jobs:
     uses: ./.github/workflows/ares-report-scheduled.yml
     with:
       workflow-name: Hermes cross-grade canary (advisory)
-    secrets: inherit
