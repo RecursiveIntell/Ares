@@ -50,6 +50,8 @@ _ON_KEYS = ("on", True)
 def _triggers(doc: dict) -> set[str]:
     for key in _ON_KEYS:
         triggers = doc.get(key)
+        if isinstance(triggers, str):
+            return {triggers}  # scalar `on: pull_request`
         if isinstance(triggers, list):
             return {str(t) for t in triggers}
         if isinstance(triggers, dict):
@@ -57,6 +59,20 @@ def _triggers(doc: dict) -> set[str]:
         if triggers is True:
             return {"push"}  # bare `on: true` is push-equivalent; not PR
     return set()
+
+
+def _has_real_code_execution(doc: dict) -> bool:
+    """True when any job runs foreign code — run-steps with a `uses:` action
+    or reusable-workflow jobs. Comment-only mentions don't count."""
+    for job in (doc.get("jobs") or {}).values():
+        if not isinstance(job, dict):
+            continue
+        if isinstance(job.get("uses"), str) and job["uses"].strip():
+            return True  # reusable workflow job
+        for step in (job.get("steps") or []):
+            if isinstance(step, dict) and isinstance(step.get("uses"), str) and step["uses"].strip():
+                return True
+    return False
 
 
 def check(workflow_dir: Path = WF_DIR) -> list[str]:
@@ -73,24 +89,37 @@ def check(workflow_dir: Path = WF_DIR) -> list[str]:
         events = _triggers(doc)
         if not (PR_EVENTS & events):
             continue  # non-PR flows are sanctioned write contexts (out of scope)
-        if NO_CHECKOUT_EXEMPT and "actions/checkout" not in raw:
+        if not _has_real_code_execution(doc):
             continue  # activity-only automation; never executes PR code
 
         perms = doc.get("permissions")
         if perms is None:
+            # Explicit-minimal contract: a PR-triggered workflow that runs
+            # code must declare its permissions, not inherit repo defaults.
+            findings.append(
+                f"{path.name}: PR-triggered workflow that runs code declares no "
+                f"workflow-level permissions (inherits repo defaults; declare an explicit minimal map)"
+            )
             continue
         if not isinstance(perms, dict):
             findings.append(f"{path.name}: workflow-level permissions '{perms}' is not an explicit minimal map")
             continue
+        # The SARIF caller-cap exception must reference the reusable flow
+        # structurally (a job `uses:` the osv-scanner workflow), not merely
+        # mention the name in a comment.
+        sarif_caller = any(
+            isinstance(j, dict) and "workflows/osv-scanner.yml" in str(j.get("uses", ""))
+            for j in (doc.get("jobs") or {}).values()
+        )
         for scope, level in sorted(perms.items()):
             if level != "write":
                 continue  # read scopes are fine (incl. pull-requests: read)
             if scope == "security-events":
-                # Allowed in the SARIF producer, or in a caller that merely
-                # caps the reusable osv-scanner flow (GitHub requires callers
-                # to hold the scopes the callee uses; the write executes in
-                # the callee's job, not on PR code).
-                if path.name in SECURITY_EVENTS_ALLOWED or "osv-scanner.yml" in raw:
+                # Allowed in the SARIF producer, or in a caller that invokes
+                # the reusable osv-scanner flow (GitHub requires callers to
+                # hold the scopes the callee uses; the write executes in the
+                # callee's job, not on PR code).
+                if path.name in SECURITY_EVENTS_ALLOWED or sarif_caller:
                     continue
             findings.append(
                 f"{path.name}: workflow-level '{scope}: write' refused on a PR-triggered "
@@ -102,6 +131,11 @@ def check(workflow_dir: Path = WF_DIR) -> list[str]:
             if not isinstance(job, dict):
                 continue
             jperms = job.get("permissions")
+            if jperms == "write-all" or jperms == "read-all":
+                findings.append(
+                    f"{path.name}: job '{job_name}' uses '{jperms}' — explicit minimal maps only"
+                )
+                continue
             if not isinstance(jperms, dict):
                 continue
             for scope, level in sorted(jperms.items()):
