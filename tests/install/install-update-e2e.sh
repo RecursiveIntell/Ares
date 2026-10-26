@@ -157,7 +157,13 @@ rm -rf -- "$SANDBOX_ROOT"
 # and argparse prints every option it accepts.
 update_supports() {
   local flag="$1"
-  in_sandbox "hermes update --help 2>&1" | grep -qF -- "$flag"
+  local help_text=""
+  help_text="$(in_sandbox "hermes update --help 2>&1")"
+  # Consume the full output, THEN grep a here-string: `grep -q` exits after
+  # the first match, so a producer fed through a pipe (printf/in_sandbox)
+  # takes SIGPIPE under `set -o pipefail` on large surfaces (E-47) and the
+  # probe reports a present flag as absent.
+  grep -qF -- "$flag" <<<"$help_text"
 }
 
 # Does the installer at REF accept FLAG? Read it out of that ref's own
@@ -177,7 +183,10 @@ installer_supports() {
     git fetch -q --depth 1 "$UPSTREAM_URL" "$ref" 2>/dev/null || return 1
     script="$(git show FETCH_HEAD:scripts/install.sh 2>/dev/null)" || return 1
   }
-  printf '%s' "$script" | grep -qF -- "$flag"
+  # Consume the full blob, THEN grep a here-string: `grep -q` exits after the
+  # first match, so printf-as-producer takes SIGPIPE under pipefail on the
+  # ~200 KB install script (E-47) and a present flag reads as absent.
+  grep -qF -- "$flag" <<<"$script"
 }
 
 # Run the real install one-liner inside the sandbox. `ref` non-empty installs
