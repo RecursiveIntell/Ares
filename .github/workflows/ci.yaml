@@ -25,7 +25,7 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write # needed by lint (PR comment) + supply-chain review_status
+  pull-requests: read # label reads for the review gate; comments post from ci-review-comment.yml (workflow_run) — Task 4.2
   actions: read # needed by osv-scanner (SARIF upload)
   security-events: write # needed by osv-scanner (SARIF upload)
 
@@ -319,6 +319,9 @@ jobs:
           .github/workflows/ci.yaml
           .github/workflows/context-continuity-qualification.yml
           .github/workflows/current-owner-integration.yml
+
+      - name: Workflow token-permission check (Task 4.2)
+        run: python3 scripts/ci/check_workflow_permissions.py
 
       - name: Evaluate job results
         id: evaluate
