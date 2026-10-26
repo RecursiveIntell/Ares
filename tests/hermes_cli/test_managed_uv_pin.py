@@ -185,10 +185,30 @@ def test_resolve_uv_admitted_hides_out_of_range_but_falls_back_when_absent(manag
     assert managed_uv.resolve_uv_admitted() is None
 
 
-def test_resolve_uv_admitted_uses_path_uv_only_when_managed_absent(managed_home, monkeypatch):
+def test_resolve_uv_admitted_path_fallback_is_itself_admitted(managed_home, monkeypatch):
+    """Round-6 verifier HIGH: the PATH fallback must also pass the version
+    check — an unadmitted PATH uv is never returned."""
+    calls = {"which": 0}
+
+    def fake_which(name):
+        calls["which"] += 1
+        return "/usr/bin/uv"
+
     monkeypatch.setattr(managed_uv, "resolve_uv", lambda: None)
-    monkeypatch.setattr(managed_uv.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(managed_uv.shutil, "which", fake_which)
+    # PATH uv reports out-of-range -> suppressed.
+    monkeypatch.setattr(
+        managed_uv.subprocess, "run",
+        lambda argv, **kw: _run_result(0, "uv 0.13.5\n") if argv[-1] == "--version" else _run_result(0),
+    )
+    assert managed_uv.resolve_uv_admitted() is None
+    # PATH uv reports in-range -> returned.
+    monkeypatch.setattr(
+        managed_uv.subprocess, "run",
+        lambda argv, **kw: _run_result(0, "uv 0.12.24\n") if argv[-1] == "--version" else _run_result(0),
+    )
     assert managed_uv.resolve_uv_admitted() == "/usr/bin/uv"
+    assert calls["which"] >= 1
 
 
 def test_lazy_deps_uses_admitted_lookup(monkeypatch, managed_home, tmp_path):

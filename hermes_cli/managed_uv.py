@@ -99,23 +99,29 @@ def resolve_uv_admitted(*, fallback: bool = True) -> Optional[str]:
     """Range-aware managed-uv lookup for callers that must not trigger
     installs (no side effects) but must never run an out-of-range binary.
 
-    Returns the managed path only when its version is inside the reviewed
-    range; a managed uv that is present but out-of-range/unreadable is NOT
-    returned and NOT silently replaced here (the caller decides: sync
-    refusal or explicit repair). With ``fallback=True`` a PATH uv is
-    returned only when the managed binary is absent — never when it is
-    present but unadmitted.
+    Returns a uv path ONLY when its version is inside the reviewed range —
+    the managed binary when admitted, else (with ``fallback=True``) a PATH
+    uv that is itself version-admitted. A managed uv that is present but
+    out-of-range/unreadable suppresses the PATH fallback entirely (the
+    caller decides: sync refusal or explicit repair), so an unvetted binary
+    can never be returned.
     """
     existing = resolve_uv()
     if existing:
         version_tuple = _uv_version_tuple(existing)
         if version_tuple is not None and _UV_RANGE_MIN <= version_tuple < _UV_RANGE_MAX_EXCLUSIVE:
             return existing
-        return None  # present but unadmitted
+        return None  # present but unadmitted: suppress the PATH fallback
     if fallback:
         import shutil
 
-        return shutil.which("uv")
+        path_uv = shutil.which("uv")
+        if not path_uv:
+            return None
+        path_tuple = _uv_version_tuple(path_uv)
+        if path_tuple is not None and _UV_RANGE_MIN <= path_tuple < _UV_RANGE_MAX_EXCLUSIVE:
+            return path_uv
+        return None  # PATH uv present but unadmitted
     return None
 
 
