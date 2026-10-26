@@ -89,7 +89,9 @@ else
         # failures (sh exits 0 on empty stdin under no pipefail).
         _uv_log="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-install.$$.log")"
         _uv_installer="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-installer.$$.sh")"
-        if ! curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>"$_uv_log"; then
+        # Reviewed uv pin (OD-1): versioned installer URL, never "latest".
+        UV_PIN="0.12.24"
+        if ! curl -LsSf "https://astral.sh/uv/${UV_PIN}/install.sh" -o "$_uv_installer" 2>"$_uv_log"; then
             echo -e "${RED}✗${NC} Failed to download uv installer."
             sed 's/^/    /' "$_uv_log" >&2
             echo -e "${CYAN}→${NC} Install manually: https://docs.astral.sh/uv/"

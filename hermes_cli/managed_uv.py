@@ -449,23 +449,26 @@ def update_managed_uv(
             target = managed_uv_path()
             target.parent.mkdir(parents=True, exist_ok=True)
             _install_uv(target)
+            # Validate the replacement actually landed in range before the
+            # caller proceeds with any dependency sync (verifier finding:
+            # a failed replacement must not hand back the stale binary).
+            new_version = _uv_version_tuple(existing)
+            if new_version is None or not (_UV_RANGE_MIN <= new_version < _UV_RANGE_MAX_EXCLUSIVE):
+                logger.error(
+                    "Managed uv at %s is still outside the reviewed range after pin reinstall; "
+                    "refusing to proceed with dependency sync (re-run install or update to repair)",
+                    existing,
+                )
+                print("  ✗ Managed uv is outside the reviewed range and could not be repaired; "
+                      "dependency sync refused")
+                return None
             print(f"  ✓ Managed uv replaced with reviewed pin {UV_PIN}")
         except Exception as exc:
-            # Non-fatal: the old binary still runs, but the out-of-range state
-            # is logged loudly — a locked sync against it is not attempted here.
-            logger.warning("Managed uv pin reinstall failed: %s", exc)
+            # Fail closed: hand back None so callers treat uv as missing and
+            # refuse the sync, instead of proceeding with the stale binary.
+            logger.warning("Managed uv pin reinstall failed: %s; dependency sync refused", exc)
             print(f"  ⚠ Managed uv is outside the reviewed range and pin reinstall failed: {exc}")
-        # Keep this hook inside the long-standing API (see tail of function).
-        try:
-            repair = repair_vulnerable_runtime(existing)
-            if repair_observer is not None:
-                repair_observer(repair)
-            if repair.status == "failed":
-                _report_runtime_repair_failure(repair)
-        except Exception as exc:
-            logger.warning("Managed Python runtime repair failed: %s", exc)
-            print(f"  ⚠ Managed Python runtime repair skipped: {exc}")
-        return existing
+            return None
 
     if force or not _uv_self_update_is_fresh():
         try:

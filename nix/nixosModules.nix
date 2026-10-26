@@ -147,7 +147,7 @@
 
         # uv (Python manager) — not in Ubuntu repos, retry-safe outside the sentinel
         if ! command -v uv >/dev/null 2>&1 && [ ! -x "$TARGET_HOME/.local/bin/uv" ] && command -v curl >/dev/null 2>&1; then
-          su -s /bin/sh "$TARGET_USER" -c 'curl -LsSf https://astral.sh/uv/install.sh | sh' || true
+          su -s /bin/sh "$TARGET_USER" -c 'curl -LsSf https://astral.sh/uv/0.12.24/install.sh | sh' || true
         fi
 
         # Python 3.12 venv — gives the agent a writable Python with pip.

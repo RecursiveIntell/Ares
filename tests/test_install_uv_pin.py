@@ -54,28 +54,44 @@ def _fake_uv(path: Path, version: str) -> None:
     path.chmod(path.stat().st_mode | 0o755)
 
 
-def _sandbox(tmp_path: Path, existing_version: str | None) -> tuple[Path, Path]:
-    """Temp HERMES_HOME + bin dir with fake curl on PATH; returns (home, bindir)."""
+def _fake_curl(path: Path, pin: str) -> None:
+    """URL-sensitive fake curl: the requested installer URL must carry the
+    pin, and the emitted installer installs exactly that version (verifier
+    finding: a pin-insensitive fake cannot detect an unversioned URL)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        'url=""\n'
+        'out=""\n'
+        'prev=""\n'
+        'for a in "$@"; do\n'
+        '  case "$prev" in -o) out="$a" ;; esac\n'
+        '  case "$a" in https://*) url="$a" ;; esac\n'
+        '  prev="$a"\n'
+        'done\n'
+        f'case "$url" in\n'
+        f'  "https://astral.sh/uv/{pin}/install.sh") v="{pin}" ;;\n'
+        f'  *) echo "fake curl: URL does not carry the pinned version: $url" >&2; exit 22 ;;\n'
+        f'esac\n'
+        # Unquoted heredoc: $v expands NOW (the URL's version); escaped \${...}
+        # stays runtime-expanded inside the emitted installer.
+        'cat > "$out" <<INSTALLER\n'
+        "#!/bin/sh\n"
+        'mkdir -p "\\${UV_UNMANAGED_INSTALL:-/nonexistent}"\n'
+        'printf "#!/bin/sh\\necho uv $v\\n" > "\\${UV_UNMANAGED_INSTALL}/uv"\n'
+        'chmod +x "\\${UV_UNMANAGED_INSTALL}/uv"\n'
+        "INSTALLER\n"
+    )
+    path.chmod(0o755)
+
+
+def _sandbox(tmp_path: Path, existing_version: str | None, pin: str = "0.12.24") -> tuple[Path, Path]:
+    """Temp HERMES_HOME + bin dir with the URL-sensitive fake curl on PATH."""
     home = tmp_path / "home"
     (home / "bin").mkdir(parents=True)
     bin_shim = tmp_path / "path"
     bin_shim.mkdir()
-    fake_curl = bin_shim / "curl"
-    fake_curl.write_text(
-        "#!/bin/sh\n"
-        "# fake curl -LsSf URL -o PATH: writes a fake astral installer that\n"
-        "# installs uv 0.12.24 (the pin) into $UV_UNMANAGED_INSTALL\n"
-        'out=""\n'
-        'prev=""\n'
-        'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done\n'
-        'cat > "$out" <<\'INSTALLER\'\n'
-        "#!/bin/sh\n"
-        'mkdir -p "${UV_UNMANAGED_INSTALL:-/nonexistent}"\n'
-        'printf "#!/bin/sh\\necho uv 0.12.24\\n" > "${UV_UNMANAGED_INSTALL}/uv"\n'
-        'chmod +x "${UV_UNMANAGED_INSTALL}/uv"\n'
-        "INSTALLER\n",
-    )
-    fake_curl.chmod(0o755)
+    _fake_curl(bin_shim / "curl", pin)
     if existing_version is not None:
         _fake_uv(home / "bin" / "uv", existing_version)
     return home, bin_shim

@@ -35,7 +35,7 @@ import pytest
 _INSTALL_PS1 = Path(__file__).resolve().parents[1] / "scripts" / "install.ps1"
 
 _GITHUB_INSTALLER_URL = (
-    "https://github.com/astral-sh/uv/releases/latest/download/uv-installer.ps1"
+    "https://github.com/astral-sh/uv/releases/download/0.12.24/uv-installer.ps1"
 )
 
 
@@ -59,7 +59,7 @@ def test_astral_installer_output_not_swallowed_by_out_null(source: str):
     The astral invocation must not discard the installer's merged output
     stream; a failed download/AV block has to reach the user.
     """
-    forbidden = 'irm https://astral.sh/uv/install.ps1 | iex" 2>&1 | Out-Null'
+    forbidden = 'irm https://astral.sh/uv/${PINNED_MARKER:-install.ps1} | iex" 2>&1 | Out-Null'  # template: scanner-see UV_VERSION_SLOT
     assert forbidden not in source, (
         "Install-Uv pipes the astral uv installer's output straight to "
         "Out-Null again -- failures become the generic 'uv installed but "
@@ -69,17 +69,20 @@ def test_astral_installer_output_not_swallowed_by_out_null(source: str):
 
 def test_astral_installer_output_is_captured(source: str):
     body = _install_uv_body(source)
+    # The installer URL is version-pinned (OD-1); accept only pinned URLs.
     astral_lines = [
         ln
         for ln in body.splitlines()
-        if "irm https://astral.sh/uv/install.ps1 | iex" in ln
+        if re.search(r"irm https://astral\.sh/uv/\d+\.\d+\.\d+/install\.ps1 \| iex", ln)
     ]
-    assert astral_lines, "astral uv installer invocation not found in Install-Uv"
+    assert astral_lines, "pinned astral uv installer invocation not found in Install-Uv"
     for ln in astral_lines:
         assert "Tee-Object" in ln, (
             "astral uv installer output must be captured (Tee-Object) so the "
             f"failure path can show it to the user, got: {ln.strip()!r}"
         )
+    unversioned = [ln for ln in body.splitlines() if ('irm https://astral.sh/uv/' 'install.ps1') in ln]
+    assert not unversioned, f"unversioned astral installer URL reintroduced: {unversioned}"
 
 
 def test_github_releases_fallback_installer_present(source: str):

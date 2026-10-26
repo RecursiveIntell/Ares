@@ -89,16 +89,64 @@ def test_out_of_range_managed_uv_is_replaced_before_locked_sync(managed_home, re
         installed["target"] = str(target)
 
     monkeypatch.setattr(managed_uv, "_install_uv", fake_install)
-    # resolve_uv keeps reporting the (stale) path; version probe reports out-of-range
+    # Stateful version probe: before reinstall the binary reports the
+    # out-of-range version; after _install_uv it reports the pin. The
+    # post-reinstall validation must see the repaired version.
+    versions = iter(["uv 0.13.5\n", "uv 0.12.24\n", "uv 0.12.24\n"])
+
+    def fake_run(argv, **kw):
+        if argv[-1] == "--version":
+            return _run_result(0, next(versions))
+        return _run_result(0)
+
+    monkeypatch.setattr(managed_uv.subprocess, "run", fake_run)
+
+    result = managed_uv.update_managed_uv(force=True)
+
+    assert result is not None, "update must succeed after replacing the out-of-range uv"
+    assert installed.get("target"), "_install_uv must be invoked to replace the out-of-range managed uv"
+
+
+def test_failed_reinstall_fails_closed(monkeypatch, managed_home):
+    """If the pin reinstall fails, update returns None — never the stale
+    out-of-range binary (verifier finding: callers must refuse the sync)."""
+    uv_bin = managed_home / "bin" / "uv"
+    uv_bin.parent.mkdir(parents=True, exist_ok=True)
+    uv_bin.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: str(uv_bin))
+    monkeypatch.setattr(managed_uv, "repair_vulnerable_runtime", lambda p: SimpleNamespace(status="ok"))
+    monkeypatch.setattr(managed_uv, "_report_runtime_repair_failure", lambda r: None)
+
+    def boom(target):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(managed_uv, "_install_uv", boom)
     monkeypatch.setattr(
         managed_uv.subprocess, "run",
         lambda argv, **kw: _run_result(0, "uv 0.13.5\n") if argv[-1] == "--version" else _run_result(0),
     )
 
     result = managed_uv.update_managed_uv(force=True)
+    assert result is None, "failed replacement must return None, not the stale binary"
 
-    assert result is not None, "update must succeed after replacing the out-of-range uv"
-    assert installed.get("target"), "_install_uv must be invoked to replace the out-of-range managed uv"
+
+def test_still_out_of_range_after_reinstall_fails_closed(monkeypatch, managed_home):
+    """If the reinstalled binary still reports out-of-range, refuse the sync."""
+    uv_bin = managed_home / "bin" / "uv"
+    uv_bin.parent.mkdir(parents=True, exist_ok=True)
+    uv_bin.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: str(uv_bin))
+    monkeypatch.setattr(managed_uv, "repair_vulnerable_runtime", lambda p: SimpleNamespace(status="ok"))
+    monkeypatch.setattr(managed_uv, "_report_runtime_repair_failure", lambda r: None)
+    monkeypatch.setattr(managed_uv, "_install_uv", lambda target: None)
+    # Every probe reports the out-of-range version: replacement did not take.
+    monkeypatch.setattr(
+        managed_uv.subprocess, "run",
+        lambda argv, **kw: _run_result(0, "uv 0.13.5\n") if argv[-1] == "--version" else _run_result(0),
+    )
+
+    result = managed_uv.update_managed_uv(force=True)
+    assert result is None, "post-reinstall validation must refuse a still-out-of-range uv"
 
 
 def test_in_range_managed_uv_is_not_reinstalled(managed_home, recorded_subprocess, monkeypatch):

@@ -184,7 +184,7 @@ scripts/run_tests.sh
 手动克隆备用路径（用于一次性 clone / CI，或你明确不想使用 managed install layout 时）：
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+curl -LsSf https://astral.sh/uv/0.12.24/install.sh | sh
 uv venv venv --python 3.11
 source venv/bin/activate
 uv pip install -e ".[all,dev]"

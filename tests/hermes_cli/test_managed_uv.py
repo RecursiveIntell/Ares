@@ -357,6 +357,13 @@ class TestUpdateManagedUv:
                  "hermes_cli.managed_uv.repair_vulnerable_runtime",
                  return_value=RuntimeRepairResult("skipped"),
              ) as mock_repair:
+            # Version probe must report an in-range uv for the reviewed-range
+            # admission check to pass without a reinstall.
+            def _run(argv, **kwargs):
+                if argv[-1] == "--version":
+                    return MagicMock(returncode=0, stdout="uv 0.12.10")
+                return MagicMock(returncode=0, stdout="")
+            mock_run.side_effect = _run
             result = update_managed_uv()
 
         assert result == str(uv)
