@@ -552,6 +552,30 @@ detect_os() {
 # Dependency checks
 # ============================================================================
 
+# Reviewed uv pin + admission range (OD-1). UV_MIN/UV_MAX mirror
+# scripts/install_uv_policy.py (UV_MIN_VERSION/UV_MAX_EXCLUSIVE); cross-surface
+# agreement is enforced by tests/test_uv_pin_consistency.py.
+UV_PIN="0.12.24"
+
+# $1: "uv X.Y.Z" or "X.Y.Z" — true when inside the reviewed range [0.9.28, 0.13.0)
+_uv_version_in_range() {
+    local v="${1#uv }" major minor patch
+    case "$v" in
+        [0-9]*.[0-9]*.[0-9]*) ;;
+        *) return 1 ;;
+    esac
+    IFS='.' read -r major minor patch <<<"$v"
+    patch="${patch%%[!0-9]*}"
+    [ -z "$major" ] || [ -z "$minor" ] || [ -z "$patch" ] && return 1
+    if [ "$major" -eq 0 ] && [ "$minor" -eq 9 ]; then
+        [ "$patch" -ge 28 ] && return 0 || return 1
+    fi
+    if [ "$major" -eq 0 ] && [ "$minor" -ge 10 ] && [ "$minor" -le 12 ]; then
+        return 0
+    fi
+    return 1
+}
+
 install_uv() {
     if [ "$DISTRO" = "termux" ]; then
         log_info "Termux detected — using Python's stdlib venv + pip instead of uv"
@@ -562,17 +586,21 @@ install_uv() {
     # Hermes owns its own uv at $HERMES_HOME/bin/uv.  Always install there —
     # no PATH probing, no conda guards, no multi-location resolution chains.
     # The runtime update path (hermes_cli/managed_uv.py) looks in the same
-    # place, so install.sh and `hermes update` stay in sync.
+    # place, so install.sh and the runtime updater stay in sync.
     local _managed_uv="$HERMES_HOME/bin/uv"
 
     if [ -x "$_managed_uv" ]; then
         UV_CMD="$_managed_uv"
         UV_VERSION=$($UV_CMD --version 2>/dev/null)
-        log_success "Managed uv found ($UV_VERSION)"
-        return 0
+        if _uv_version_in_range "$UV_VERSION"; then
+            log_success "Managed uv found ($UV_VERSION)"
+            return 0
+        fi
+        log_info "Managed uv ($UV_VERSION) is outside the reviewed range; replacing with pinned uv $UV_PIN"
+        # Fall through: reinstall at the reviewed pin.
     fi
 
-    log_info "Installing managed uv into $HERMES_HOME/bin ..."
+    log_info "Installing managed uv $UV_PIN into $HERMES_HOME/bin ..."
     mkdir -p "$HERMES_HOME/bin"
 
     # Two-stage: download the installer, then run it.  Piping
@@ -581,8 +609,8 @@ install_uv() {
     local _uv_install_log _uv_installer
     _uv_install_log="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-install.$$.log")"
     _uv_installer="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-installer.$$.sh")"
-    if ! curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>"$_uv_install_log"; then
-        log_error "Failed to download uv installer from https://astral.sh/uv/install.sh"
+    if ! curl -LsSf "https://astral.sh/uv/${UV_PIN}/install.sh" -o "$_uv_installer" 2>"$_uv_install_log"; then
+        log_error "Failed to download uv ${UV_PIN} installer from https://astral.sh/uv/${UV_PIN}/install.sh"
         log_info "curl output:"
         sed 's/^/    /' "$_uv_install_log" >&2
         log_info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"

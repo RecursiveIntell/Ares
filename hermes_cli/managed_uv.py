@@ -37,6 +37,26 @@ from typing import Callable, Optional
 from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import SQLiteRuntimeInfo, probe_sqlite_runtime
 
+# Reviewed uv pin (OD-1). Single source of truth: `.github/uv-version`;
+# cross-surface agreement is enforced by tests/test_uv_pin_consistency.py.
+# Installs and self-updates must stay inside the reviewed range
+# [0.9.28, 0.13.0) — an untargeted `uv self update` drifts to unreviewed
+# releases (uv 0.13 broke the reviewed install contract).
+UV_PIN = "0.12.24"
+_UV_RANGE_MIN = (0, 9, 28)
+_UV_RANGE_MAX_EXCLUSIVE = (0, 13, 0)
+
+
+def _uv_version_tuple(uv_bin: str) -> Optional[tuple[int, int, int]]:
+    """Parse ``uv --version`` into a comparable tuple; None when unreadable."""
+    version_string = _uv_version_string(uv_bin)
+    import re as _re
+
+    match = _re.fullmatch(r"uv (\d+)\.(\d+)\.(\d+)(?: \S.*)?", version_string)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -408,10 +428,49 @@ def update_managed_uv(
         # Not installed yet — ensure_uv() will handle that elsewhere.
         return None
 
+    # Reviewed-range admission check: a managed uv outside [0.9.28, 0.13.0)
+    # (e.g. one that drifted via an older untargeted self update) is replaced
+    # with the reviewed pin before any locked sync runs against it.
+    version_tuple = _uv_version_tuple(existing)
+    if version_tuple is None:
+        logger.warning("Managed uv version unreadable (%s); reinstalling reviewed pin %s", existing, UV_PIN)
+        self_update_allowed = False
+    elif not (_UV_RANGE_MIN <= version_tuple < _UV_RANGE_MAX_EXCLUSIVE):
+        logger.warning(
+            "Managed uv %s is outside the reviewed range %s..<%s; replacing with pin %s",
+            ".".join(map(str, version_tuple)), _UV_RANGE_MIN, _UV_RANGE_MAX_EXCLUSIVE, UV_PIN,
+        )
+        self_update_allowed = False
+    else:
+        self_update_allowed = True
+
+    if not self_update_allowed:
+        try:
+            target = managed_uv_path()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _install_uv(target)
+            print(f"  ✓ Managed uv replaced with reviewed pin {UV_PIN}")
+        except Exception as exc:
+            # Non-fatal: the old binary still runs, but the out-of-range state
+            # is logged loudly — a locked sync against it is not attempted here.
+            logger.warning("Managed uv pin reinstall failed: %s", exc)
+            print(f"  ⚠ Managed uv is outside the reviewed range and pin reinstall failed: {exc}")
+        # Keep this hook inside the long-standing API (see tail of function).
+        try:
+            repair = repair_vulnerable_runtime(existing)
+            if repair_observer is not None:
+                repair_observer(repair)
+            if repair.status == "failed":
+                _report_runtime_repair_failure(repair)
+        except Exception as exc:
+            logger.warning("Managed Python runtime repair failed: %s", exc)
+            print(f"  ⚠ Managed Python runtime repair skipped: {exc}")
+        return existing
+
     if force or not _uv_self_update_is_fresh():
         try:
             result = subprocess.run(
-                [existing, "self", "update"],
+                [existing, "self", "update", UV_PIN],
                 capture_output=True,
                 text=True, encoding='utf-8', errors='replace',
                 check=False,
@@ -1466,7 +1525,7 @@ def _install_uv_posix(env: dict[str, str]) -> None:
 
     try:
         subprocess.run(
-            ["curl", "-LsSf", "https://astral.sh/uv/install.sh", "-o", installer_path],
+            ["curl", "-LsSf", f"https://astral.sh/uv/{UV_PIN}/install.sh", "-o", installer_path],
             check=True,
             capture_output=True,
         )
@@ -1485,7 +1544,7 @@ def _install_uv_posix(env: dict[str, str]) -> None:
 
 def _install_uv_windows(env: dict[str, str]) -> None:
     """Invoke the PowerShell installer."""
-    cmd = "irm https://astral.sh/uv/install.ps1 | iex"
+    cmd = f"irm https://astral.sh/uv/{UV_PIN}/install.ps1 | iex"
     subprocess.run(
         ["powershell", "-ExecutionPolicy", "Bypass", "-c", cmd],
         env=env,

@@ -1,0 +1,25 @@
+name: 'Setup pinned uv'
+description: >
+  Install the reviewed uv version (OD-1 pin; single source .github/uv-version,
+  consistency-tested by tests/test_uv_pin_consistency.py). Two-stage download;
+  never fetches an unreviewed "latest" uv.
+inputs:
+  uv-version:
+    description: 'Reviewed uv version to install'
+    required: false
+    default: '0.12.24'
+runs:
+  using: 'composite'
+  steps:
+    - name: Install pinned uv
+      shell: bash
+      run: |
+        set -euo pipefail
+        tmp="$(mktemp /tmp/uv-install.XXXXXX.sh)"
+        curl -LsSf "https://astral.sh/uv/${{ inputs.uv-version }}/install.sh" -o "$tmp"
+        sh "$tmp"
+        rm -f "$tmp"
+        if ! command -v uv >/dev/null 2>&1; then
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        fi
+        uv --version

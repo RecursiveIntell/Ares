@@ -360,7 +360,13 @@ class TestUpdateManagedUv:
             result = update_managed_uv()
 
         assert result == str(uv)
-        assert mock_run.call_count == 0, "fresh stamp must skip the network self-update"
+        # The stamp skips the *network* self-update; a local --version probe
+        # for the reviewed-range admission check is allowed.
+        network_self_update_calls = [
+            c for c in mock_run.call_args_list
+            if len(c[0][0]) >= 4 and c[0][0][1:3] == ["self", "update"]
+        ]
+        assert not network_self_update_calls, "fresh stamp must skip the network self-update"
         mock_repair.assert_called_once_with(str(uv))
 
 
@@ -382,10 +388,23 @@ class TestUpdateManagedUv:
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
              patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")), \
              patch("hermes_cli.managed_uv.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.2.0")
+            # --version probes must report an in-range uv so the reviewed-range
+            # admission check passes; self update is targeted at the reviewed
+            # pin (OD-1) and must never drift to an unreviewed release.
+            def _run(argv, **kwargs):
+                if argv[-1] == "--version":
+                    return MagicMock(returncode=0, stdout="uv 0.12.10")
+                return MagicMock(returncode=0, stdout="")
+            mock_run.side_effect = _run
             update_managed_uv()
 
-        assert mock_run.call_args_list[0][0][0] == [str(uv), "self", "update"]
+        self_update_calls = [
+            c[0][0] for c in mock_run.call_args_list
+            if len(c[0][0]) >= 4 and c[0][0][1:3] == ["self", "update"]
+        ]
+        assert [str(uv), "self", "update", "0.12.24"] in self_update_calls, (
+            "self update must target the reviewed pin"
+        )
         assert stamp.stat().st_mtime > old + 30, "successful self-update must refresh the stamp"
 
 
