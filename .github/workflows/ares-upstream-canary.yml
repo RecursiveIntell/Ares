@@ -1,0 +1,46 @@
+name: Ares upstream merge canary
+
+# Plan Task 6.3 (A-14): nightly, read-only measurement of upstream sync cost.
+# git merge-tree --write-tree of NousResearch/hermes-agent main against Ares
+# main: conflict count and paths, Ares-owned vs inherited. No build, no push.
+# Conflicts are the expected finding, not a failure; the canary fails only
+# when it cannot measure. A scheduled failure still opens a tracked issue.
+
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: Upstream merge canary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          filter: blob:none
+
+      - name: Run merge-tree canary
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/upstream_merge_canary.py --out canary-report
+
+      - name: Upload report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: upstream-merge-canary
+          path: canary-report.*
+          retention-days: 90
+
+  report-failures:
+    name: Report failures (issue)
+    needs: [canary]
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/ares-report-scheduled.yml
+    with:
+      workflow-name: Ares upstream merge canary
+    secrets: inherit
