@@ -22,6 +22,8 @@ Behavior contracts (not snapshots):
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -118,3 +120,82 @@ class TestRunAgentGate:
 
         out = AIAgent._summarize_api_error(ValueError("key must be a string at line 1 column 28"))
         assert out.startswith("Malformed provider streaming response:")
+
+
+class TestIncidentStreamParseRetriesThroughRealPath:
+    """Real-path regression for the 2026-10-26 incident.
+
+    Injects the exact incident ValueError through
+    ``AIAgent._interruptible_streaming_api_call`` with a failing-then-healthy
+    mock stream pair, exercising the production retry gate
+    (``chat_completion_helpers`` → ``AIAgent._is_provider_stream_parse_error``)
+    rather than a mirrored predicate. Without the fix the error is not
+    recognized as transient and propagates; with it the call recovers on
+    the second stream.
+    """
+
+    @patch("run_agent.AIAgent._rebuild_anthropic_client")
+    @patch("run_agent.AIAgent._replace_primary_openai_client")
+    def test_incident_jiter_error_retries_before_delivery(
+        self, mock_replace, mock_rebuild, monkeypatch
+    ) -> None:
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://api.anthropic.com",
+            provider="anthropic",
+            model="claude-opus-5-5",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "anthropic_messages"
+        agent._interrupt_requested = False
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+
+        class _BadStream:
+            response = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                raise ValueError("key must be a string at line 1 column 28")
+
+        final_message = SimpleNamespace(content=[], stop_reason="end_turn")
+        good_stream = MagicMock()
+        good_stream.__enter__ = MagicMock(return_value=good_stream)
+        good_stream.__exit__ = MagicMock(return_value=False)
+        good_stream.__iter__ = MagicMock(return_value=iter([]))
+        good_stream.get_final_message.return_value = final_message
+
+        agent._anthropic_client = MagicMock()
+        agent._anthropic_client.messages.stream.side_effect = [
+            _BadStream(),
+            good_stream,
+        ]
+        agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client  # noqa: E731
+
+        # Spy the silent-retry signal: the fixed gate takes the in-stream
+        # retry (emits one drop, mid_tool_call=False); without the fix the
+        # error bypasses the streaming retry entirely, so no drop is emitted
+        # and recovery — if any — comes from a different layer.
+        drops = []
+        orig_emit_drop = agent._emit_stream_drop
+
+        def _spy_drop(**kwargs):
+            drops.append(kwargs)
+            return orig_emit_drop(**kwargs)
+
+        monkeypatch.setattr(agent, "_emit_stream_drop", _spy_drop)
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response is final_message
+        assert agent._anthropic_client.messages.stream.call_count == 2
+        assert len(drops) == 1
+        assert drops[0].get("mid_tool_call") is False
