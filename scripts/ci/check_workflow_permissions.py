@@ -154,9 +154,9 @@ def check(workflow_dir: Path = WF_DIR) -> list[str]:
 
         # Job-level: effective write scopes (job map overrides workflow level;
         # no map = inherited workflow scopes). PR-code jobs may hold only the
-        # SARIF write — in the producer file, or in a job that invokes the
-        # reusable osv-scanner flow (the caller cap GitHub requires; the
-        # write executes in the callee's job).
+        # SARIF write — in the producer file's scan job, or in a job that
+        # invokes the reusable osv-scanner flow (the caller cap GitHub
+        # requires; the write executes in the callee's job).
         sarif_caller_jobs = {
             n for n, j in (doc.get("jobs") or {}).items()
             if isinstance(j, dict) and "workflows/osv-scanner.yml" in str(j.get("uses") or "")
@@ -164,7 +164,8 @@ def check(workflow_dir: Path = WF_DIR) -> list[str]:
         for job_name, writes in _effective_job_write_scopes(doc).items():
             for scope in writes:
                 if scope == "security-events" and (
-                    path.name in SECURITY_EVENTS_ALLOWED or job_name in sarif_caller_jobs
+                    job_name in sarif_caller_jobs
+                    or (path.name in SECURITY_EVENTS_ALLOWED and job_name == "scan")
                 ):
                     continue
                 if scope in ("write-all", "read-all") or scope.startswith("'"):
