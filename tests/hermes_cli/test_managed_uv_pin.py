@@ -181,12 +181,13 @@ def test_update_cmd_refuses_sync_on_unrepairable_uv():
     import hermes_cli.update_cmd as uc
 
     src = inspect.getsource(uc)
-    # Both call sites guard on the None return before ensure_uv().
+    # All update_managed_uv() call sites guard on the None return before
+    # ensure_uv() / dependency sync (direct form and repair_observer form).
     guards = re.findall(
-        r"if update_managed_uv\(\) is None and resolve_uv\(\):", src
+        r"if update_managed_uv\([^)]*\) is None and resolve_uv\(\):", src
     )
-    assert len(guards) >= 2, (
-        f"expected the fail-closed sync guard at both update call sites, found {len(guards)}"
+    assert len(guards) >= 3, (
+        f"expected the fail-closed sync guard at all three update call sites, found {len(guards)}"
     )
     # No call site may call ensure_uv() unguarded right after update_managed_uv().
     for m in re.finditer(r"update_managed_uv\(\)\n", src):
@@ -195,3 +196,47 @@ def test_update_cmd_refuses_sync_on_unrepairable_uv():
                "update_managed_uv() is None" in tail, (
             "an update_managed_uv() call site ignores the fail-closed contract:\n" + tail[:200]
         )
+
+
+def test_ensure_uv_admits_only_in_range_managed_uv(managed_home, monkeypatch):
+    """ensure_uv()/the shared resolution point must apply the reviewed-range
+    admission itself (round-3 verifier HIGH: callers reaching a sync via
+    ensure_uv() without update_managed_uv() were unguarded)."""
+    uv_bin = managed_home / "bin" / "uv"
+    uv_bin.parent.mkdir(parents=True, exist_ok=True)
+    uv_bin.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: str(uv_bin))
+
+    versions = iter(["uv 0.13.5\n", "uv 0.12.24\n", "uv 0.12.24\n"])
+
+    def fake_run(argv, **kw):
+        if argv[-1] == "--version":
+            return _run_result(0, next(versions))
+        return _run_result(0)
+
+    monkeypatch.setattr(managed_uv.subprocess, "run", fake_run)
+
+    def fake_install(target):
+        pass
+
+    monkeypatch.setattr(managed_uv, "_install_uv", fake_install)
+
+    result = managed_uv.ensure_uv()
+    assert result is not None, "in-range-after-repair must be admitted"
+
+
+def test_ensure_uv_fails_closed_when_repair_leaves_out_of_range(managed_home, monkeypatch):
+    uv_bin = managed_home / "bin" / "uv"
+    uv_bin.parent.mkdir(parents=True, exist_ok=True)
+    uv_bin.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: str(uv_bin))
+    monkeypatch.setattr(
+        managed_uv.subprocess, "run",
+        lambda argv, **kw: _run_result(0, "uv 0.13.5\n") if argv[-1] == "--version" else _run_result(0),
+    )
+    monkeypatch.setattr(managed_uv, "_install_uv", lambda target: None)
+
+    result = managed_uv.ensure_uv()
+    # POSIX ensure_uv wraps the path in _UvResult; None becomes '' (falsy).
+    # Callers treat falsy as "no usable uv" and fall back / refuse.
+    assert not result, "ensure_uv must hand back no usable path for an unrepairable out-of-range uv"

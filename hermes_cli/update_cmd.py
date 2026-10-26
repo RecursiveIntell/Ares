@@ -8953,10 +8953,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # uv can retain the same CPython patch while python-build-standalone
             # refreshes the embedded SQLite underneath it. Keep the existing
             # update-boundary hook active on this retry path too.
-            from hermes_cli.managed_uv import ensure_uv, update_managed_uv
+            from hermes_cli.managed_uv import ensure_uv, resolve_uv, update_managed_uv
 
             runtime_repairs = []
-            update_managed_uv(repair_observer=runtime_repairs.append)
+            # Fail-closed (uv-pin contract): None + existing binary = out of
+            # range and unrepairable; refuse the sync on this retry path too.
+            if update_managed_uv(repair_observer=runtime_repairs.append) is None and resolve_uv():
+                print("  ✗ Managed uv is outside the reviewed range and could not be repaired; "
+                      "skipping the Python dependency sync (re-run the installer to repair)")
+                return 1
             ensure_uv(repair_observer=runtime_repairs.append)
             runtime_repaired = next(
                 (result for result in runtime_repairs if result.repaired),

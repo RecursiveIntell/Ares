@@ -291,10 +291,39 @@ def _ensure_uv_path(
     *,
     repair_observer: Callable[[RuntimeRepairResult], None] | None = None,
 ) -> Optional[str]:
-    """Resolve the managed uv path, installing it if necessary (plain ``str``/``None``)."""
+    """Resolve the managed uv path, installing it if necessary (plain ``str``/``None``).
+
+    Reviewed-range admission (uv-pin fail-closed contract): an existing
+    managed uv outside [0.9.28, 0.13.0) — or with an unreadable version — is
+    replaced with the pin before being handed to any caller; if the
+    replacement fails, this returns None so callers refuse the operation
+    instead of running it on a stale binary.
+    """
     existing = resolve_uv()
     if existing:
-        return existing
+        version_tuple = _uv_version_tuple(existing)
+        if version_tuple is not None and _UV_RANGE_MIN <= version_tuple < _UV_RANGE_MAX_EXCLUSIVE:
+            return existing
+        # Out of range (or unreadable): repair in place before any use.
+        logger.warning(
+            "Managed uv %s at %s is outside the reviewed range %s..<%s; replacing with pin %s",
+            ".".join(map(str, version_tuple)) if version_tuple else "?",
+            existing, _UV_RANGE_MIN, _UV_RANGE_MAX_EXCLUSIVE, UV_PIN,
+        )
+        try:
+            target = managed_uv_path()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _install_uv(target)
+        except Exception as exc:
+            logger.warning("Managed uv pin reinstall failed: %s", exc)
+            return None
+        repaired = resolve_uv()
+        repaired_tuple = _uv_version_tuple(repaired) if repaired else None
+        if not repaired_tuple or not (_UV_RANGE_MIN <= repaired_tuple < _UV_RANGE_MAX_EXCLUSIVE):
+            logger.error("Managed uv still outside the reviewed range after pin reinstall at %s", repaired)
+            return None
+        print(f"  ✓ Managed uv replaced with reviewed pin {UV_PIN}")
+        return repaired
 
     target = managed_uv_path()
     target.parent.mkdir(parents=True, exist_ok=True)
