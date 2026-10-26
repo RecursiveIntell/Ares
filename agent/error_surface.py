@@ -254,6 +254,17 @@ def build_error_surface_from_exception(
             exc, "status_code"
         )
 
+        # Deterministic context failures must stay non-retryable on EVERY
+        # path — including the API-like branch below, where the classifier's
+        # verdict previously overwrote the veto's retryable=False for
+        # statuses like 429/500 (verifier F1, 2026-10-26). A resend cannot
+        # fix an exact-prefix veto or an exhausted-over-window request, no
+        # matter which exception type carried it out of the turn.
+        context_veto = (
+            "lineage_integrity_mismatch" in message
+            or "CONTEXT_PREFLIGHT_EXHAUSTED" in message
+        )
+
         if not api_like or not isinstance(exc, Exception):
             # Same non-retryable rule for the raised form: an exhausted
             # preflight after a failed/no-progress compaction must not be
@@ -287,6 +298,13 @@ def build_error_surface_from_exception(
         )
         if surface is not None:
             surface["retryable"] = bool(classified.retryable)
+        if context_veto:
+            # The deterministic context verdict outranks the classifier's
+            # HTTP-status-based retry guess (F1): keep the surface's layer
+            # and code, but the resend answer is always "no".
+            surface = dict(surface or {})
+            surface["retryable"] = False
+            surface["context_veto"] = True
         return surface
     except Exception:  # pragma: no cover — never break the error path
         logger.debug("error_surface: exception classification failed", exc_info=True)
