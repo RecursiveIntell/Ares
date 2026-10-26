@@ -62,17 +62,43 @@ def _triggers(doc: dict) -> set[str]:
 
 
 def _has_real_code_execution(doc: dict) -> bool:
-    """True when any job runs foreign code — run-steps with a `uses:` action
-    or reusable-workflow jobs. Comment-only mentions don't count."""
+    """True when any job runs foreign code — run-steps with a `uses:` action,
+    reusable-workflow jobs, or run-steps that clone/curl-pipe external code.
+    Comment-only mentions don't count."""
     for job in (doc.get("jobs") or {}).values():
         if not isinstance(job, dict):
             continue
         if isinstance(job.get("uses"), str) and job["uses"].strip():
             return True  # reusable workflow job
         for step in (job.get("steps") or []):
-            if isinstance(step, dict) and isinstance(step.get("uses"), str) and step["uses"].strip():
+            if not isinstance(step, dict):
+                continue
+            if isinstance(step.get("uses"), str) and step["uses"].strip():
+                return True
+            run_text = str(step.get("run") or "")
+            if "git clone" in run_text or "curl" in run_text and ("| sh" in run_text or "| bash" in run_text):
                 return True
     return False
+
+
+def _effective_job_write_scopes(doc: dict) -> dict[str, list[str]]:
+    """Job name -> write scopes in effect. Job-level permissions override the
+    workflow level entirely (GitHub semantics); jobs without an explicit map
+    inherit the workflow-level scopes, which must therefore be counted."""
+    wf = doc.get("permissions")
+    wf_write = sorted(s for s, l in (wf or {}).items() if l == "write") if isinstance(wf, dict) else []
+    result: dict[str, list[str]] = {}
+    for name, job in (doc.get("jobs") or {}).items():
+        if not isinstance(job, dict):
+            continue
+        jperms = job.get("permissions")
+        if jperms is None:
+            result[name] = list(wf_write)  # inherited
+        elif isinstance(jperms, dict):
+            result[name] = sorted(s for s, l in jperms.items() if l == "write")
+        else:
+            result[name] = [str(jperms)]  # 'write-all' / 'read-all' string
+    return result
 
 
 def check(workflow_dir: Path = WF_DIR) -> list[str]:
@@ -126,26 +152,29 @@ def check(workflow_dir: Path = WF_DIR) -> list[str]:
                 f"workflow (PR code must run read-only; writes belong in workflow_run flows)"
             )
 
-        # Job-level: no write scope on PR-code jobs outside the SARIF exception.
-        for job_name, job in (doc.get("jobs") or {}).items():
-            if not isinstance(job, dict):
-                continue
-            jperms = job.get("permissions")
-            if jperms == "write-all" or jperms == "read-all":
-                findings.append(
-                    f"{path.name}: job '{job_name}' uses '{jperms}' — explicit minimal maps only"
-                )
-                continue
-            if not isinstance(jperms, dict):
-                continue
-            for scope, level in sorted(jperms.items()):
-                if level != "write":
+        # Job-level: effective write scopes (job map overrides workflow level;
+        # no map = inherited workflow scopes). PR-code jobs may hold only the
+        # SARIF write — in the producer file, or in a job that invokes the
+        # reusable osv-scanner flow (the caller cap GitHub requires; the
+        # write executes in the callee's job).
+        sarif_caller_jobs = {
+            n for n, j in (doc.get("jobs") or {}).items()
+            if isinstance(j, dict) and "workflows/osv-scanner.yml" in str(j.get("uses") or "")
+        }
+        for job_name, writes in _effective_job_write_scopes(doc).items():
+            for scope in writes:
+                if scope == "security-events" and (
+                    path.name in SECURITY_EVENTS_ALLOWED or job_name in sarif_caller_jobs
+                ):
                     continue
-                if scope == "security-events" and path.name in SECURITY_EVENTS_ALLOWED:
+                if scope in ("write-all", "read-all") or scope.startswith("'"):
+                    findings.append(
+                        f"{path.name}: job '{job_name}' uses '{scope}' — explicit minimal maps only"
+                    )
                     continue
                 findings.append(
-                    f"{path.name}: job '{job_name}' holds '{scope}: write' on a PR-triggered "
-                    f"workflow (only security-events: write on the SARIF job is allowed)"
+                    f"{path.name}: job '{job_name}' holds '{scope}: write' (effective) on a "
+                    f"PR-triggered workflow (only security-events: write on the SARIF job is allowed)"
                 )
     return findings
 

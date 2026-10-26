@@ -43,6 +43,11 @@ jobs:
     name: Detect affected areas
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Task 4.2: explicit minimal — without this the job inherits the
+    # workflow-level security-events: write (caller cap for the reusable
+    # SARIF flow) while running PR-controlled classifier code.
+    permissions:
+      contents: read
     outputs:
       python: ${{ steps.classify.outputs.python }}
       python_prod: ${{ steps.classify.outputs.python_prod }}
@@ -75,6 +80,10 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   tests:
     name: Python tests
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/tests.yml
@@ -87,12 +96,20 @@ jobs:
   # Same `python` lane gate: if no Python changed, neither runs.
   tests-os:
     name: OS-specific tests
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/tests-os.yml
 
   lint:
     name: Python lints
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/lint.yml
@@ -101,12 +118,20 @@ jobs:
 
   js-tests:
     name: JS & TS checks
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     if: needs.detect.outputs.frontend == 'true'
     uses: ./.github/workflows/js-tests.yml
 
   installer-tests:
     name: Installer tests
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     # Windows-only, and only for PRs that touch install.ps1 or its tests.
     if: needs.detect.outputs.installer == 'true'
@@ -114,6 +139,10 @@ jobs:
 
   rust-tests:
     name: Rust tests
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     # Only for PRs that touch a Rust crate. `.rs` is under apps/, so these
     # changes used to run the TypeScript matrix and nothing that compiles them.
@@ -140,6 +169,10 @@ jobs:
 
   e2e-desktop:
     name: Desktop E2E
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     # python_prod (not python): the Playwright suite exercises the built app
     # + `hermes serve` backend, which never import anything under tests/.
@@ -159,24 +192,40 @@ jobs:
 
   docs-site:
     name: Docs Site
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     if: needs.detect.outputs.site == 'true'
     uses: ./.github/workflows/docs-site-checks.yml
 
   history-check:
     name: Deny unrelated histories
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     if: needs.detect.outputs.event_name == 'pull_request'
     uses: ./.github/workflows/history-check.yml
 
   contributor-check:
     name: Check contributors
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/contributor-check.yml
 
   uv-lockfile:
     name: Check uv.lock
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     # Gated: `uv lock --check` re-resolves the whole dependency graph against
     # PyPI, so on every PR it spent a network round-trip — and, on a registry
@@ -188,23 +237,39 @@ jobs:
 
   infographic-check:
     name: Check no committed infographics
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     uses: ./.github/workflows/infographic-check.yml
 
   lockfile-diff:
     name: package-lock.json diff
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     if: needs.detect.outputs.event_name == 'pull_request' && needs.detect.outputs.npm_lock == 'true'
     uses: ./.github/workflows/lockfile-diff.yml
 
   docker-lint:
     name: Lint Docker scripts
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     if: needs.detect.outputs.docker_meta == 'true'
     uses: ./.github/workflows/docker-lint.yml
 
   supply-chain:
     name: Supply-chain scan
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: detect
     if: needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps == 'true')
     uses: ./.github/workflows/supply-chain-audit.yml
@@ -215,6 +280,10 @@ jobs:
 
   review-labels:
     name: Review label gate
+    # Task 4.2: explicit minimal map - no inherited write scopes.
+    permissions:
+      contents: read
+
     needs: [detect, supply-chain]
     if: always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')
     uses: ./.github/workflows/review-labels.yml
@@ -347,6 +416,9 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Task 4.2: explicit minimal — no inherited write scopes on PR-checkout jobs.
+    permissions:
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
