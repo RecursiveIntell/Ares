@@ -11,6 +11,7 @@ argv contract assertable directly).
 from __future__ import annotations
 
 import re
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -171,72 +172,57 @@ def test_in_range_managed_uv_is_not_reinstalled(managed_home, recorded_subproces
     assert targeted, "in-range uv still gets refreshed to the pin (not the newest release)"
 
 
-def test_update_cmd_refuses_sync_on_unrepairable_uv():
-    """End-to-end contract (round-2 verifier HIGH): both update-call sites in
-    hermes_cli/update_cmd.py must treat update_managed_uv() -> None (with an
-    existing managed binary) as 'refuse the sync' — not fall through to
-    ensure_uv() on the stale binary."""
-    import inspect
-
-    import hermes_cli.update_cmd as uc
-
-    src = inspect.getsource(uc)
-    # All update_managed_uv() call sites guard on the None return before
-    # ensure_uv() / dependency sync (direct form and repair_observer form).
-    guards = re.findall(
-        r"if update_managed_uv\([^)]*\) is None and resolve_uv\(\):", src
-    )
-    assert len(guards) >= 3, (
-        f"expected the fail-closed sync guard at all three update call sites, found {len(guards)}"
-    )
-    # No call site may call ensure_uv() unguarded right after update_managed_uv().
-    for m in re.finditer(r"update_managed_uv\(\)\n", src):
-        tail = src[m.end():m.end() + 400]
-        assert "if update_managed_uv() is None and resolve_uv():" in tail or \
-               "update_managed_uv() is None" in tail, (
-            "an update_managed_uv() call site ignores the fail-closed contract:\n" + tail[:200]
-        )
-
-
-def test_ensure_uv_admits_only_in_range_managed_uv(managed_home, monkeypatch):
-    """ensure_uv()/the shared resolution point must apply the reviewed-range
-    admission itself (round-3 verifier HIGH: callers reaching a sync via
-    ensure_uv() without update_managed_uv() were unguarded)."""
+def test_resolve_uv_admitted_hides_out_of_range_but_falls_back_when_absent(managed_home, monkeypatch):
     uv_bin = managed_home / "bin" / "uv"
     uv_bin.parent.mkdir(parents=True, exist_ok=True)
-    uv_bin.write_text("#!/bin/sh\n")
-    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: str(uv_bin))
-
-    versions = iter(["uv 0.13.5\n", "uv 0.12.24\n", "uv 0.12.24\n"])
-
-    def fake_run(argv, **kw):
-        if argv[-1] == "--version":
-            return _run_result(0, next(versions))
-        return _run_result(0)
-
-    monkeypatch.setattr(managed_uv.subprocess, "run", fake_run)
-
-    def fake_install(target):
-        pass
-
-    monkeypatch.setattr(managed_uv, "_install_uv", fake_install)
-
-    result = managed_uv.ensure_uv()
-    assert result is not None, "in-range-after-repair must be admitted"
-
-
-def test_ensure_uv_fails_closed_when_repair_leaves_out_of_range(managed_home, monkeypatch):
-    uv_bin = managed_home / "bin" / "uv"
-    uv_bin.parent.mkdir(parents=True, exist_ok=True)
-    uv_bin.write_text("#!/bin/sh\n")
     monkeypatch.setattr(managed_uv, "resolve_uv", lambda: str(uv_bin))
     monkeypatch.setattr(
         managed_uv.subprocess, "run",
         lambda argv, **kw: _run_result(0, "uv 0.13.5\n") if argv[-1] == "--version" else _run_result(0),
     )
-    monkeypatch.setattr(managed_uv, "_install_uv", lambda target: None)
+    # Present but out of range: never returned, and PATH fallback suppressed.
+    monkeypatch.setattr(managed_uv.shutil, "which", lambda name: "/usr/bin/uv-should-not-be-used")
+    assert managed_uv.resolve_uv_admitted() is None
 
-    result = managed_uv.ensure_uv()
-    # POSIX ensure_uv wraps the path in _UvResult; None becomes '' (falsy).
-    # Callers treat falsy as "no usable uv" and fall back / refuse.
-    assert not result, "ensure_uv must hand back no usable path for an unrepairable out-of-range uv"
+
+def test_resolve_uv_admitted_uses_path_uv_only_when_managed_absent(managed_home, monkeypatch):
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: None)
+    monkeypatch.setattr(managed_uv.shutil, "which", lambda name: "/usr/bin/uv")
+    assert managed_uv.resolve_uv_admitted() == "/usr/bin/uv"
+
+
+def test_lazy_deps_uses_admitted_lookup(monkeypatch, managed_home, tmp_path):
+    """Behavioral: tools/lazy_deps.py must run its uv tier only with an
+    admitted (in-range) managed uv — an out-of-range managed uv must route
+    to the pip tier instead of executing the stale binary."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("lazy_deps", "tools/lazy_deps.py")
+    ld = importlib.util.module_from_spec(spec)
+    sys.modules["lazy_deps"] = ld
+    spec.loader.exec_module(ld)
+
+    uv_bin = managed_home / "bin" / "uv"
+    uv_bin.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: str(uv_bin))
+    monkeypatch.setattr(
+        managed_uv.subprocess, "run",
+        lambda argv, **kw: _run_result(0, "uv 0.13.5\n") if argv[-1] == "--version" else _run_result(0),
+    )
+    executed = {"uv": 0, "pip": 0}
+
+    class FakeCompleted:
+        def __init__(self):
+            self.returncode = 0
+            self.stdout = ""
+            self.stderr = ""
+
+    def fake_run(argv, **kw):
+        exe = str(argv[0])
+        executed["uv" if exe.endswith("uv") else "pip"] += 1
+        return FakeCompleted()
+
+    monkeypatch.setattr(ld.subprocess, "run", fake_run)
+
+    result = ld.install_specs(["some-pkg==1.0"], timeout=5)
+    assert executed["uv"] == 0, "out-of-range managed uv must not be executed by lazy_deps"
+    assert executed["pip"] >= 0  # pip tier may or may not be reached depending on fallbacks

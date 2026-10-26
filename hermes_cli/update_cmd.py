@@ -3516,15 +3516,15 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
     (e.g. ``pkg install uv``); only if there is none do we fall back to a
     wheel-only ``pip install uv`` so we never source-build the Rust crate.
     """
-    from hermes_cli.managed_uv import resolve_uv
+    from hermes_cli.managed_uv import resolve_uv_admitted
 
-    existing = resolve_uv()
+    existing = resolve_uv_admitted()
     if existing:
         return existing
     if not _m()._is_termux_env():
         return None
     # A Termux-packaged uv lands on PATH but not in the managed bin dir, so
-    # resolve_uv() misses it. Use it before pip, which has no Android wheel and
+    # the managed lookup misses it. Use it before pip, which has no Android wheel and
     # would otherwise build uv from source on a low-memory device.
     system_uv = shutil.which("uv")
     if system_uv:
@@ -3541,7 +3541,7 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
     except Exception:
         pass
     # After pip install, check managed path first, then PATH
-    return resolve_uv() or shutil.which("uv")
+    return resolve_uv_admitted() or shutil.which("uv")
 
 def _npm_manifest_paths() -> tuple[Path, ...]:
     """Manifests whose changes must defeat the update-skip.

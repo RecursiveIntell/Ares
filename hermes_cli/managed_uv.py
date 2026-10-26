@@ -95,6 +95,30 @@ def resolve_uv() -> Optional[str]:
     return None
 
 
+def resolve_uv_admitted(*, fallback: bool = True) -> Optional[str]:
+    """Range-aware managed-uv lookup for callers that must not trigger
+    installs (no side effects) but must never run an out-of-range binary.
+
+    Returns the managed path only when its version is inside the reviewed
+    range; a managed uv that is present but out-of-range/unreadable is NOT
+    returned and NOT silently replaced here (the caller decides: sync
+    refusal or explicit repair). With ``fallback=True`` a PATH uv is
+    returned only when the managed binary is absent — never when it is
+    present but unadmitted.
+    """
+    existing = resolve_uv()
+    if existing:
+        version_tuple = _uv_version_tuple(existing)
+        if version_tuple is not None and _UV_RANGE_MIN <= version_tuple < _UV_RANGE_MAX_EXCLUSIVE:
+            return existing
+        return None  # present but unadmitted
+    if fallback:
+        import shutil
+
+        return shutil.which("uv")
+    return None
+
+
 def managed_python_install_dir(project_root: Path | None = None) -> Path:
     """Return the checkout-scoped Python store shared by all profiles."""
     root = Path(project_root) if project_root is not None else _PROJECT_ROOT

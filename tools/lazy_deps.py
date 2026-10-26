@@ -749,9 +749,11 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         # migrating the Python runtime as a side effect of that is a far bigger
         # action than the caller asked for. Tier 2 pip covers the no-uv case.
         try:
-            from hermes_cli.managed_uv import resolve_uv
+            from hermes_cli.managed_uv import resolve_uv_admitted
 
-            uv_bin = resolve_uv() or shutil.which("uv")
+            # Reviewed-range admission: a managed uv outside the policy range
+            # is never run here (no silent side-effect install either).
+            uv_bin = resolve_uv_admitted()
         except Exception:
             uv_bin = shutil.which("uv")
         if uv_bin:
