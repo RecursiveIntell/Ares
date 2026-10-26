@@ -1175,6 +1175,7 @@ def _build_child_system_prompt(
     context: Optional[str] = None,
     *,
     workspace_path: Optional[str] = None,
+    context_length: Optional[int] = None,
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
@@ -1215,7 +1216,9 @@ def _build_child_system_prompt(
             from agent.prompt_builder import build_context_files_prompt
 
             _ctx_files = build_context_files_prompt(
-                cwd=str(workspace_path), skip_soul=True
+                cwd=str(workspace_path),
+                skip_soul=True,
+                context_length=context_length,
             )
         except Exception:
             logger.debug(
@@ -1727,23 +1730,53 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
+    # Resolve the child's effective route before reading project context. The
+    # context-file cap is model-window-aware, and using the parent's window for
+    # a differently routed child silently truncates binding repository law.
+    parent_api_key = getattr(parent_agent, "api_key", None)
+    if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
+        parent_api_key = parent_agent._client_kwargs.get("api_key")
+    effective_model_for_cb = model or getattr(parent_agent, "model", None)
+    prompt_provider = override_provider or getattr(parent_agent, "provider", None)
+    prompt_base_url = override_base_url or getattr(parent_agent, "base_url", None)
+    if not override_base_url:
+        prompt_base_url = _inherit_parent_base_url(parent_agent, prompt_base_url)
+    prompt_api_key = override_api_key or parent_api_key
+    parent_route_matches = (
+        effective_model_for_cb == getattr(parent_agent, "model", None)
+        and prompt_provider == getattr(parent_agent, "provider", None)
+    )
+    prompt_config_context_length = (
+        getattr(parent_agent, "_config_context_length", None)
+        if parent_route_matches
+        else None
+    )
+    try:
+        from agent.model_metadata import get_model_context_length
+
+        child_context_length = get_model_context_length(
+            effective_model_for_cb or "",
+            base_url=prompt_base_url or "",
+            api_key=prompt_api_key or "",
+            provider=prompt_provider or "",
+            config_context_length=prompt_config_context_length,
+        )
+    except Exception:
+        logger.debug(
+            "subagent: child context-window resolution failed", exc_info=True
+        )
+        child_context_length = None
+
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,
         context,
         workspace_path=workspace_hint,
+        context_length=child_context_length,
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
     )
-    # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
-    parent_api_key = getattr(parent_agent, "api_key", None)
-    if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
-        parent_api_key = parent_agent._client_kwargs.get("api_key")
-
-    # Resolve the child's effective model early so it can ride on every event.
-    effective_model_for_cb = model or getattr(parent_agent, "model", None)
-
     # Build progress callback to relay tool calls to parent display.
     # Identity kwargs thread the subagent_id through every emitted event so the
     # TUI can reconstruct the spawn tree and route per-branch controls.

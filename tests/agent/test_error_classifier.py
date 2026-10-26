@@ -47,6 +47,12 @@ class ServerDisconnectedError(MockTransportError):
     pass
 
 
+class GoUsageLimitError(MockAPIError):
+    """Structured opencode-go account-period quota exhaustion."""
+
+    pass
+
+
 # ── Test: FailoverReason enum ──────────────────────────────────────────
 
 class TestFailoverReason:
@@ -57,6 +63,7 @@ class TestFailoverReason:
     def test_enum_members_exist(self):
         expected = {
             "auth", "auth_permanent", "billing", "rate_limit",
+            "hard_quota",
             "upstream_rate_limit",
             "overloaded", "server_error", "timeout",
             "ssl_cert_verification",
@@ -395,6 +402,35 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="openai-codex", model="gpt-5-codex")
         assert result.reason == FailoverReason.rate_limit
         assert result.retryable is True
+
+    def test_go_weekly_usage_limit_is_terminal_even_with_reset_metadata(self):
+        e = GoUsageLimitError(
+            "Go usage limit exceeded",
+            status_code=429,
+            body={
+                "error": {
+                    "type": "GoUsageLimitError",
+                    "message": "Go usage limit exceeded",
+                    "details": {
+                        "limitName": "weekly",
+                        "resetAfterSeconds": 604800,
+                    },
+                }
+            },
+        )
+
+        result = classify_api_error(
+            e,
+            provider="opencode-go",
+            model="glm-5.3-flash",
+        )
+
+        assert result.reason == FailoverReason.hard_quota
+        assert result.retryable is False
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is True
+        assert result.provider == "opencode-go"
+        assert result.model == "glm-5.3-flash"
 
     @pytest.mark.parametrize(
         "phrase",

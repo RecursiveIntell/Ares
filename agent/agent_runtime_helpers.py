@@ -1103,6 +1103,13 @@ def recover_with_credential_pool(
         elif status_code in {401, 403}:
             effective_reason = FailoverReason.auth
 
+    if effective_reason == FailoverReason.hard_quota:
+        _ra().logger.info(
+            "Account-period quota exhausted — skipping credential rotation and "
+            "deferring to the configured fallback chain"
+        )
+        return False, has_retried_429
+
     if effective_reason == FailoverReason.upstream_rate_limit:
         # An upstream provider (e.g. DeepSeek behind OpenRouter) is
         # rate-limiting the aggregator's traffic — the user's credential is
