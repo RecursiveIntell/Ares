@@ -105,6 +105,7 @@ import {
   WS_HEARTBEAT_DEAD_MS,
   WS_HEARTBEAT_INTERVAL_MS
 } from '../gatewayClient.js'
+import type { GatewayRpcError } from '../gatewayClient.js'
 
 describe('spawned gateway command', () => {
   it('uses Python safe-path mode before importing the gateway module', () => {
@@ -163,6 +164,46 @@ describe('GatewayClient websocket attach mode', () => {
 
     gatewaySocket.message(JSON.stringify({ id: frame.id, jsonrpc: '2.0', result: { ok: true } }))
     await expect(req).resolves.toEqual({ ok: true })
+
+    gw.kill()
+  })
+
+  it('preserves redacted typed Stop failure evidence from a JSON-RPC error', async () => {
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+
+    gw.start()
+    const gatewaySocket = FakeWebSocket.instances[0]!
+    gatewaySocket.open()
+    const req = gw.request('session.interrupt', { session_id: 's1' })
+    await vi.waitFor(() => expect(gatewaySocket.sent).toHaveLength(1))
+    const frame = JSON.parse(gatewaySocket.sent[0] ?? '{}') as { id: string }
+
+    gatewaySocket.message(JSON.stringify({
+      id: frame.id,
+      jsonrpc: '2.0',
+      error: {
+        code: 5019,
+        message: 'Stop application could not be confirmed',
+        data: {
+          effect_disposition: 'indeterminate',
+          failure_code: 'interrupt_application_failed',
+          owner_reconciliation_required: true,
+          prompt: 'must not cross the client boundary',
+          token: 'must not cross the client boundary'
+        }
+      }
+    }))
+
+    await expect(req).rejects.toMatchObject({
+      name: 'GatewayRpcError',
+      code: 5019,
+      data: {
+        effect_disposition: 'indeterminate',
+        failure_code: 'interrupt_application_failed',
+        owner_reconciliation_required: true
+      }
+    } satisfies Partial<GatewayRpcError>)
 
     gw.kill()
   })

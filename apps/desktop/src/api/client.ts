@@ -28,12 +28,13 @@ const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 export const PROMPT_SUBMIT_REQUEST_TIMEOUT_MS = 1_800_000
 
 export class HermesGateway extends JsonRpcGatewayClient {
-  constructor(options: Pick<GatewayClientOptions, 'socketFactory'> = {}) {
+  constructor(options: Pick<GatewayClientOptions, 'onSocketClose' | 'socketFactory'> = {}) {
     super({
       closedErrorMessage: 'Hermes gateway connection closed',
       connectErrorMessage: 'Could not connect to Hermes gateway',
       createRequestId: nextId => nextId,
       notConnectedErrorMessage: 'Hermes gateway is not connected',
+      onSocketClose: options.onSocketClose,
       requestTimeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS,
       socketFactory:
         options.socketFactory ??

@@ -5741,6 +5741,7 @@ def run_conversation(
                 is_rate_limited = classified.reason in {
                     FailoverReason.rate_limit,
                     FailoverReason.billing,
+                    FailoverReason.hard_quota,
                     FailoverReason.upstream_rate_limit,
                 }
                 # Relay-wrapped output-cap errors: some gateways wrap an
@@ -5815,6 +5816,10 @@ def run_conversation(
                                 agent._buffer_status(
                                     "⚠️ Billing or credits exhausted — switching to fallback provider..."
                                 )
+                        elif classified.reason == FailoverReason.hard_quota:
+                            agent._buffer_status(
+                                "⚠️ Account-period quota exhausted — switching to an authorized fallback provider..."
+                            )
                         elif _is_transport_failure:
                             agent._buffer_status(
                                 "⚠️ Provider unreachable — switching to fallback provider..."

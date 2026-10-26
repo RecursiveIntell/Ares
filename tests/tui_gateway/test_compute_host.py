@@ -4,11 +4,24 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
-from tui_gateway.compute_host import ComputeHost, HostSession
+from tui_gateway.compute_host import ComputeHost, HostSession, SpikeAgent
+
+
+class _BrokenStdout:
+    def __init__(self):
+        self.attempts = 0
+
+    def write(self, _value):
+        self.attempts += 1
+        raise BrokenPipeError(32, "peer closed")
+
+    def flush(self):
+        raise AssertionError("flush must not run after the failed write")
 
 
 def _stdout_queue(proc: subprocess.Popen) -> queue.Queue[dict]:
@@ -126,3 +139,25 @@ def test_compute_host_interrupt_uses_explicit_stop_compatibility(kind):
 
     assert calls == ["hard" if kind == "hard-only" else "legacy"]
     assert emitted[-1]["applied"] is True
+
+
+def test_compute_host_peer_loss_transitions_once_and_interrupts_active_work():
+    stdout = _BrokenStdout()
+    host = ComputeHost(stdout=stdout, heartbeat_secs=0)
+    host_agent = SpikeAgent("s1")
+    spike = HostSession(sid="s1", agent=host_agent)
+    host._sessions["s1"] = spike
+
+    assert host.emit({"type": "delta", "sid": "s1"}) is False
+    assert host.emit({"type": "turn.end", "sid": "s1"}) is False
+
+    deadline = time.monotonic() + 2
+    while not host_agent._interrupt.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert host._peer_loss_settled.wait(2)
+
+    assert host._transport_dead.is_set()
+    assert host._closed.is_set()
+    assert host_agent._interrupt.is_set()
+    assert stdout.attempts == 1

@@ -5656,7 +5656,7 @@ class AIAgent:
             return
         self._close_openai_client(client, reason=reason, shared=False)
 
-    def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:
+    def _abort_request_openai_client(self, client: Any, *, reason: str) -> int:
         """Cross-thread abort: shut sockets down without releasing FDs.
 
         Companion to :meth:`_close_request_openai_client` for stranger-thread
@@ -5671,7 +5671,7 @@ class AIAgent:
         — which is where the FD release belongs.
         """
         if client is None:
-            return
+            return 0
         # A pool whose sockets were shut down from a stranger thread must
         # never be reused: poison the cache slot so the owner-thread close
         # discards it and the next create builds a fresh client.
@@ -5681,24 +5681,18 @@ class AIAgent:
                 cache["poisoned"] = True
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
-            # tcp_force_closed=0 means the stranger-thread abort found no
-            # sockets to shut down — the worker stays blocked in recv and the
-            # provider keeps the slot (#72975). Surface that as WARNING so it
-            # cannot be mistaken for a successful abort in the logs.
-            _log = logger.warning if shutdown_count == 0 else logger.info
-            _log(
-                "OpenAI client aborted (%s, shared=False, tcp_force_closed=%d, "
-                "deferred_close=stranger_thread) %s%s",
+            # Zero sockets is a transport-attempt observation, not the request
+            # outcome. The worker owner resolves it after a bounded settlement
+            # grace; logging a warning here made successful cooperative Stops
+            # look unsuccessful before the worker had time to unwind.
+            logger.info(
+                "OpenAI client abort requested (%s, shared=False, tcp_force_closed=%d, "
+                "deferred_close=stranger_thread, outcome=pending) %s",
                 reason,
                 shutdown_count,
                 self._client_log_context(),
-                (
-                    " — no sockets found; in-flight request may keep running "
-                    "until the provider finishes"
-                    if shutdown_count == 0
-                    else ""
-                ),
             )
+            return shutdown_count
         except Exception as exc:
             logger.debug(
                 "OpenAI client abort failed (%s, shared=False) %s error=%s",
@@ -5706,6 +5700,7 @@ class AIAgent:
                 self._client_log_context(),
                 exc,
             )
+            return -1
 
     def _request_anthropic_client_cache_ref(self) -> dict:
         # Lazy init — tests build agents via AIAgent.__new__ without __init__.
