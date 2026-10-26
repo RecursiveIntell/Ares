@@ -41,7 +41,7 @@ BAD_CONCLUSIONS = ("failure", "timed_out", "cancelled", "startup_failure", "acti
 def gh_json(args: list[str], attempts: int = 2) -> dict | list:
     """Run `gh` and parse stdout as JSON; retry transient 5xx."""
     for i in range(attempts):
-        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=120)
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
         if out.returncode == 0:
             return json.loads(out.stdout)
         transient = "HTTP 5" in out.stderr or "Server Error" in out.stderr
@@ -52,7 +52,7 @@ def gh_json(args: list[str], attempts: int = 2) -> dict | list:
 
 
 def gh_raw(args: list[str]) -> str:
-    out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=120)
+    out = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
     if out.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args[:3])}… failed: {out.stderr.strip()[:200]}")
     return out.stdout
@@ -130,7 +130,7 @@ def ensure_label(repo: str) -> None:
         out = subprocess.run(
             ["gh", "label", "list", "--repo", repo, "--json", "name",
              "--limit", "100", "--page", str(page)],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
         )
         if out.returncode != 0:
             break
@@ -148,7 +148,7 @@ def ensure_label(repo: str) -> None:
         ["gh", "label", "create", LABEL, "--repo", repo,
          "--description", "A scheduled CI run failed (auto-managed by ares-scheduled-failure-watch)",
          "--color", "D73A4A"],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
     )
     if proc.returncode != 0 and "already_exists" not in (proc.stderr or ""):
         raise RuntimeError(f"label create failed: {(proc.stderr or '')[:200]}")
@@ -230,7 +230,7 @@ def sweep(repo: str, watched: list[str], dry_run: bool = False) -> int:
                 ensure_label(repo)
                 if existing:
                     proc = subprocess.run(["gh", "issue", "edit", existing, "--repo", repo,
-                                           "--body-file", "-"], input=body, text=True, capture_output=True, timeout=120)
+                                           "--body-file", "-"], input=body, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=120)
                     if proc.returncode != 0:
                         raise RuntimeError(f"issue edit failed: {proc.stderr[:200]}")
                     print(f"{wf}: updated issue #{existing}")
@@ -239,7 +239,7 @@ def sweep(repo: str, watched: list[str], dry_run: bool = False) -> int:
                         ["gh", "issue", "create", "--repo", repo,
                          "--title", f"[{LABEL}] {wf_name}",
                          "--body-file", "-", "--label", LABEL],
-                        input=body, text=True, capture_output=True, timeout=120)
+                        input=body, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=120)
                     if proc.returncode != 0:
                         raise RuntimeError(f"issue create failed: {proc.stderr[:200]}")
                     print(f"{wf}: opened new failure issue")
