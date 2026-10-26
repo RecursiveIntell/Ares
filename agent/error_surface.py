@@ -189,6 +189,19 @@ def build_error_surface_from_result(
         if error_text.startswith("session_turn_lease_timeout:"):
             return _surface(LAYER_RUNTIME, "session_turn_lease_timeout", True)
 
+        # A governor lineage-integrity veto is NOT retryable: an unchanged
+        # resend deterministically re-fails the same exact-prefix check
+        # (observed 2026-10-26: the desktop surfaced retryable=true while
+        # the same session re-vetoed 5 times in 5 minutes). Recovery is a
+        # context-recovery action (restore through the corrected prefix
+        # path or a fresh session), not a resend.
+        if "lineage_integrity_mismatch" in error_text or reason == (
+            "lineage_integrity_mismatch"
+        ):
+            return _surface(
+                LAYER_RUNTIME, "lineage_integrity_mismatch", False, provider, model
+            )
+
         if not reason:
             # Failed result without a classified reason (legacy paths).
             if _looks_like_stream_drop(error_text):
@@ -242,6 +255,22 @@ def build_error_surface_from_exception(
         )
 
         if not api_like or not isinstance(exc, Exception):
+            # Same non-retryable rule for the raised form: an exhausted
+            # preflight after a failed/no-progress compaction must not be
+            # offered as a resend — the resend deterministically repeats
+            # the over-window request (or the same veto beneath it).
+            if type(exc).__name__ == "ContextDispatchError" and "CONTEXT_PREFLIGHT_EXHAUSTED" in message:
+                return _surface(
+                    LAYER_RUNTIME,
+                    "context_preflight_exhausted",
+                    False,
+                    provider,
+                    model,
+                )
+            if "lineage_integrity_mismatch" in message:
+                return _surface(
+                    LAYER_RUNTIME, "lineage_integrity_mismatch", False, provider, model
+                )
             return _surface(LAYER_GATEWAY, type(exc).__name__, True, provider, model)
 
         from agent.error_classifier import classify_api_error
