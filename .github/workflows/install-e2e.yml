@@ -108,17 +108,3 @@ jobs:
     with:
       route: installer
       install-ref: ${{ matrix.install-ref }}
-
-  # Plan Task 1.5 + A-03/A-07: this matrix is a cross-grade canary (it installs
-  # NousResearch Hermes tags with the inherited installer), not the Ares install
-  # signal. It is advisory; scheduled failures must still never be silent.
-  report-failures:
-    name: Report failures (issue)
-    needs: [pick-releases, update, installer]
-    # schedule = the alerting duty; workflow_dispatch = the plan's gate proof
-    # path (a dispatch can open/close the tracked issue without waiting for
-    # a cron tick). Push/PR runs never write issues.
-    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    uses: ./.github/workflows/ares-report-scheduled.yml
-    with:
-      workflow-name: Hermes cross-grade canary (advisory)

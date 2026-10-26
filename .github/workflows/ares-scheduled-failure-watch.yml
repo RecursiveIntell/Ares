@@ -1,0 +1,47 @@
+name: Ares scheduled-failure watch
+
+# Plan Task 1.5 (D-04): scheduled failures must never be silent. This
+# workflow runs OUTSIDE the PR gate (top-level, no pull_request trigger), so
+# its jobs may hold issues: write — the nested reusable-workflow design was
+# rejected by GitHub: a job nested under the PR orchestrator cannot be
+# granted a scope the root workflow does not have ("The nested job 'report'
+# is requesting 'issues: write', but is only allowed 'issues: none'").
+#
+# After each watch tick it inspects the most recent scheduled run of every
+# watched workflow and opens/updates/closes ONE tracked issue per workflow
+# (label ci-scheduled-failure). Green scheduled run closes the issue; red
+# opens or updates it. Startup-level failures with zero job records render
+# an explicit row instead of an empty table. If the issue API path fails,
+# this job fails (no silent gap, X-11).
+
+on:
+  schedule:
+    # After both watched schedules: install-e2e 07:20/19:20, osv 09:00 Mon.
+    - cron: '40 7,19 * * *'
+    - cron: '10 9 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  actions: read
+  issues: write
+
+concurrency:
+  group: ares-scheduled-failure-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: Watch scheduled runs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Sweep watched workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/scheduled_failure_issue.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --watch install-e2e.yml,osv-scanner.yml
