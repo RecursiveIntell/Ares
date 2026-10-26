@@ -364,6 +364,19 @@ def _ensure_uv_path(
     # Verify
     result = resolve_uv()
     if result:
+        # Fresh-install admission (uv-pin contract): the just-installed
+        # binary must be inside the reviewed range before it is handed to
+        # any caller; an installer that delivered a wrong/unreadable version
+        # fails closed here instead of reaching a dependency sync.
+        fresh_tuple = _uv_version_tuple(result)
+        if not fresh_tuple or not (_UV_RANGE_MIN <= fresh_tuple < _UV_RANGE_MAX_EXCLUSIVE):
+            logger.error(
+                "Freshly installed managed uv at %s is outside the reviewed range %s..<%s; refusing",
+                result, _UV_RANGE_MIN, _UV_RANGE_MAX_EXCLUSIVE,
+            )
+            print("  ✗ Installed uv is outside the reviewed range; dependency operations refused "
+                  "(re-run the installer to repair)")
+            return None
         version = subprocess.run(
             [result, "--version"],
             capture_output=True,

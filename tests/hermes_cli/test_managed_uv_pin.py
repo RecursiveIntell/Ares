@@ -226,3 +226,21 @@ def test_lazy_deps_uses_admitted_lookup(monkeypatch, managed_home, tmp_path):
     result = ld.install_specs(["some-pkg==1.0"], timeout=5)
     assert executed["uv"] == 0, "out-of-range managed uv must not be executed by lazy_deps"
     assert executed["pip"] >= 0  # pip tier may or may not be reached depending on fallbacks
+
+
+def test_ensure_uv_fresh_install_fails_closed_when_out_of_range(managed_home, monkeypatch):
+    """Fresh bootstrap must also pass admission (round-4 public HIGH): an
+    installer that delivers a wrong/unreadable version returns falsy, not a
+    usable path."""
+    uv_bin = managed_home / "bin" / "uv"
+    uv_bin.parent.mkdir(parents=True, exist_ok=True)
+    uv_bin.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: str(uv_bin))
+    monkeypatch.setattr(
+        managed_uv.subprocess, "run",
+        lambda argv, **kw: _run_result(0, "uv 0.13.9\n") if argv[-1] == "--version" else _run_result(0),
+    )
+    monkeypatch.setattr(managed_uv, "_install_uv", lambda target: None)
+
+    result = managed_uv.ensure_uv()
+    assert not result, "fresh-install admission must refuse an out-of-range binary"

@@ -17,9 +17,10 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _make_executable(path: Path) -> None:
-    """Create a minimal fake uv binary at *path*."""
+    """Create a minimal fake uv binary at *path* (in the reviewed range so
+    the fresh-install admission check admits it)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/bin/sh\necho uv 0.1.2\n")
+    path.write_text("#!/bin/sh\necho uv 0.12.10\n")
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
 
 
