@@ -266,12 +266,13 @@ jobs:
 
   supply-chain:
     name: Supply-chain scan
-    # Task 4.2: explicit minimal map - no inherited write scopes.
-    permissions:
-      contents: read
-
     needs: detect
     if: needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps == 'true')
+    # The callee requests pull-requests: read (label/status reads); the
+    # caller cap must grant at least that. Read-only on PR code — Task 4.2.
+    permissions:
+      contents: read
+      pull-requests: read
     uses: ./.github/workflows/supply-chain-audit.yml
     with:
       event_name: ${{ needs.detect.outputs.event_name }}
@@ -280,9 +281,11 @@ jobs:
 
   review-labels:
     name: Review label gate
-    # Task 4.2: explicit minimal map - no inherited write scopes.
+    # Task 4.2: explicit minimal map - no inherited write scopes. The callee
+    # reads PR labels, so the caller cap must grant pull-requests: read.
     permissions:
       contents: read
+      pull-requests: read
 
     needs: [detect, supply-chain]
     if: always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')
@@ -296,6 +299,13 @@ jobs:
   osv-scanner:
     name: OSV scan
     uses: ./.github/workflows/osv-scanner.yml
+    # Caller cap: GitHub requires the calling job to grant every scope the
+    # callee requests. security-events: write executes in the callee's SARIF
+    # upload job, not on PR code (Task 4.2; verified 2026-10-26 round 3).
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
