@@ -43,4 +43,3 @@ jobs:
     uses: ./.github/workflows/ares-report-scheduled.yml
     with:
       workflow-name: Ares upstream merge canary
-    secrets: inherit
