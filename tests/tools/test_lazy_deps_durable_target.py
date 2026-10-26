@@ -199,7 +199,11 @@ class TestInstallArgConstruction:
 
     def test_uv_resolution_failure_does_not_fall_through_to_pip(self, monkeypatch):
         monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
-        monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: "uv")
+        # The uv tier runs only with a version-admitted binary (uv-pin
+        # contract, PR #206): stub the admitted lookup to an in-range uv.
+        monkeypatch.setattr(
+            "hermes_cli.managed_uv.resolve_uv_admitted", lambda *a, **k: "uv"
+        )
         calls = []
 
         def fake_run(cmd, *args, **kwargs):
