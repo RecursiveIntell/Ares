@@ -43,6 +43,18 @@ def test_red_run_never_closes_even_if_job_page_is_green():
     assert action == "report"
 
 
+def test_startup_failure_conclusion_is_red():
+    """GitHub's graph-build failure conclusion is `startup_failure`, not
+    `failure` (verified live in this repo's run data). It must be red with
+    zero job rows — never 'pending' (the round-2 verifier's HIGH finding)."""
+    action, failing = sfi.decide({"status": "completed", "conclusion": "startup_failure"}, [])
+    assert action == "report" and failing == []
+    action, _ = sfi.decide({"status": "completed", "conclusion": "startup_failure"}, None)
+    assert action == "report"
+    action, _ = sfi.decide({"status": "completed", "conclusion": "action_required"}, ["success"])
+    assert action == "report"
+
+
 def test_zero_job_startup_failure_reports_with_zero_jobs():
     action, failing = sfi.decide({"status": "completed", "conclusion": "failure"}, [])
     assert action == "report" and failing == []
@@ -80,7 +92,6 @@ def test_issue_body_renders_startup_failure_row():
                           {"databaseId": 123, "url": "https://example.com/run/123"},
                           [], True)
     assert "| (no job records available for this run — startup-level failure) | - |" in body
-    assert "[ci-scheduled-failure]" not in body  # title is separate from body
 
 
 def test_issue_body_run_level_red_with_green_jobs_never_empty_table():

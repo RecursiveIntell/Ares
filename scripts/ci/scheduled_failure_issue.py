@@ -31,7 +31,11 @@ import sys
 from pathlib import Path
 
 LABEL = "ci-scheduled-failure"
-BAD_CONCLUSIONS = ("failure", "timed_out", "cancelled")
+# Run-level conclusions treated as red. startup_failure is GitHub's
+# conclusion when the workflow graph itself fails to build (verified live in
+# this repo's run data); action_required flags runs blocked on approval —
+# both must open/keep the tracked issue, never close it.
+BAD_CONCLUSIONS = ("failure", "timed_out", "cancelled", "startup_failure", "action_required")
 
 
 def gh_json(args: list[str], attempts: int = 2) -> dict | list:
@@ -142,17 +146,24 @@ def ensure_label(repo: str) -> None:
 def find_open_issue(repo: str, workflow_name: str) -> str:
     """Deterministic open-issue lookup: REST list by label (NOT the
     eventually-consistent search index, which can miss a just-created issue
-    and cause duplicates or missed closes), exact-title match client-side."""
+    and cause duplicates or missed closes), exact-title match client-side.
+    Paginated past the first 100 open labelled issues. NOTE: list-then-create
+    is still not atomic across concurrent actors; the watch workflow's own
+    concurrency group serializes its runs, which is the practical guard."""
     title = f"[{LABEL}] {workflow_name}"
-    out = gh_raw(["api", f"/repos/{repo}/issues?labels={LABEL}&state=open&per_page=100"])
-    try:
-        issues = json.loads(out) if out.strip() else []
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"issue list parse failed: {exc}") from exc
-    for issue in issues:
-        if issue.get("title") == title and "pull_request" not in issue:
-            return str(issue.get("number"))
-    return ""
+    page = 1
+    while True:
+        out = gh_raw(["api", f"/repos/{repo}/issues?labels={LABEL}&state=open&per_page=100&page={page}"])
+        try:
+            issues = json.loads(out) if out.strip() else []
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"issue list parse failed: {exc}") from exc
+        for issue in issues:
+            if issue.get("title") == title and "pull_request" not in issue:
+                return str(issue.get("number"))
+        if len(issues) < 100:
+            return ""
+        page += 1
 
 
 def sweep(repo: str, watched: list[str], dry_run: bool = False) -> int:
