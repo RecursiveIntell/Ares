@@ -77,17 +77,31 @@ def _has_real_code_execution(doc: dict) -> bool:
             if isinstance(step.get("uses"), str) and step["uses"].strip():
                 return True
             run_text = str(step.get("run") or "")
-            # Fetching external code: clone, or fetch+checkout of PR heads
-            # (git fetch refs/pull/N/head, gh pr checkout, gh repo clone).
-            if re.search(r"\bgit\s+(clone|fetch)\b", run_text):
+            # Fetching external code — any git verb that pulls a remote tree,
+            # with flags/config that may precede the verb:
+            #   git clone/fetch/pull, git -C <dir> fetch, git -c k=v clone,
+            #   gh pr checkout, gh repo clone.
+            if re.search(r"\bgit\b[\w\-= \"']*\s(?:clone|fetch|pull)\b", run_text):
                 return True
             if "gh pr checkout" in run_text or "gh repo clone" in run_text:
                 return True
-            # Remote execution: curl/wget piping into a shell interpreter…
-            if re.search(r"\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b", run_text):
+            # Remote execution:
+            #   <fetcher> piped into any interpreter (sh/bash/zsh/dash/env bash/
+            #   python*), process substitution (bash <(curl), source <(curl)),
+            #   download-then-run (curl -o x.sh && sh x.sh), and command
+            #   substitution via combined flags (bash -lc "$(curl …)").
+            if re.search(
+                r"\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:env\s+)?(?:ba|z|da)?sh\b|\b(?:curl|wget)\b[^|]*\|\s*python[\d.]*\b",
+                run_text,
+            ):
                 return True
-            # …or bash/sh -c "$(curl …)"
-            if re.search(r"\b(?:ba|z)?sh\s+-c\s+['\"]?\$\(", run_text):
+            if re.search(r"\b(?:ba|z|da)?sh\s+(?:-\w+\s+)*<(?:\(|<)\s*(?:curl|wget)\b", run_text):
+                return True
+            if re.search(r"\b(?:source|\.)\s*<(?:\(|<)\s*(?:curl|wget)\b", run_text):
+                return True
+            if re.search(r"\b(?:ba|z|da)?sh\s+(?:-\w+\s+)*-c\s+['\"]?\$\(\s*(?:curl|wget)\b", run_text):
+                return True
+            if re.search(r"\b(?:curl|wget)\b[^|;&]*-o\s*\S+\s*[^|;&]*&&\s*(?:sudo\s+)?(?:ba|z|da)?sh\b", run_text):
                 return True
             # Legacy literal shapes (kept for robustness)
             if "curl" in run_text and ("| sh" in run_text or "| bash" in run_text):
@@ -144,11 +158,12 @@ def check(workflow_dir: Path = WF_DIR) -> list[str]:
         if not isinstance(perms, dict):
             findings.append(f"{path.name}: workflow-level permissions '{perms}' is not an explicit minimal map")
             continue
-        # The SARIF caller-cap exception must reference the reusable flow
-        # structurally (a job `uses:` the osv-scanner workflow), not merely
-        # mention the name in a comment.
+        # The SARIF caller-cap exception must reference the LOCAL reusable
+        # flow exactly (./.github/workflows/osv-scanner.yml) — a substring
+        # match would let a foreign fork's osv-scanner.yml exempt writes.
+        _local_osv = re.compile(r"\./\.github/workflows/osv-scanner\.yml(?:@.*)?$")
         sarif_caller = any(
-            isinstance(j, dict) and "workflows/osv-scanner.yml" in str(j.get("uses", ""))
+            isinstance(j, dict) and _local_osv.fullmatch(str(j.get("uses", "")).strip())
             for j in (doc.get("jobs") or {}).values()
         )
         for scope, level in sorted(perms.items()):

