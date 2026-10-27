@@ -82,6 +82,8 @@ export function submitPrompt(
     deps.gw
       .request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText })
       .then(r => {
+        turnController.recordAcceptedTurn(r?.accepted_turn)
+
         // The gateway consumed a typed voice stop phrase server-side (voice
         // chat ended, no turn started) — release the busy latch; the
         // voice.transcript {stop_phrase} event handles the mode flags + notice.

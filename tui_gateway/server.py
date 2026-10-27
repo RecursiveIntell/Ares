@@ -16713,84 +16713,91 @@ def _run_prompt_submit(
             reset_transport(transport_token)
             # Clear the per-turn interim callback so a stale closure from
             # this turn can't fire during a later turn on the same agent.
-            with session["history_lock"]:
-                if ((not owns_admission() and not owns_stopped_admission())
-                        or (registered and _sessions.get(sid) is not session)
-                        or session.get("agent") is not agent
-                        or (one_turn_runtime is not None and one_turn_runtime.get("agent") is not agent)):
-                    return
-                agent.interim_assistant_callback = None
-                session["running"] = False
-                session["last_active"] = time.time()
-                if not turn_error_retained:
-                    _clear_inflight_turn(session)
-                _retire_turn_marker(session, marker_key)
-                session.pop("_auto_continue_scheduled", None)
-            # Closing bookend of the "tui prompt accepted" record above —
-            # fires on every path (success, returned error, exception,
-            # interrupt), so one accepted prompt always produces exactly one
-            # finished record. agent.session_id is re-read here because
-            # compression may have rotated it mid-turn: an accepted/finished
-            # pair whose agent_session_id changed IS a rotation trace
-            # (#86647). A missing finished record means the turn thread died
-            # without reaching this finally.
-            logger.info(
-                "tui turn finished: ui_session=%s session_key=%s "
-                "agent_session_id=%s status=%s error_retained=%s duration=%.1fs",
-                sid,
-                session.get("session_key") or "",
-                getattr(agent, "session_id", "") or "",
-                (
-                    result.get("interrupted")
-                    and "interrupted"
-                    or result.get("error")
-                    and "error"
-                    or "complete"
+            def settle_owned_turn_cleanup() -> bool:
+                with session["history_lock"]:
+                    if ((not owns_admission() and not owns_stopped_admission())
+                            or (registered and _sessions.get(sid) is not session)
+                            or session.get("agent") is not agent
+                            or (one_turn_runtime is not None and one_turn_runtime.get("agent") is not agent)):
+                        return False
+                    agent.interim_assistant_callback = None
+                    session["running"] = False
+                    session["last_active"] = time.time()
+                    if not turn_error_retained:
+                        _clear_inflight_turn(session)
+                    _retire_turn_marker(session, marker_key)
+                    session.pop("_auto_continue_scheduled", None)
+                # Closing bookend of the "tui prompt accepted" record above —
+                # fires on every path (success, returned error, exception,
+                # interrupt), so one accepted prompt always produces exactly one
+                # finished record. agent.session_id is re-read here because
+                # compression may have rotated it mid-turn: an accepted/finished
+                # pair whose agent_session_id changed IS a rotation trace
+                # (#86647). A missing finished record means the turn thread died
+                # without reaching this finally.
+                logger.info(
+                    "tui turn finished: ui_session=%s session_key=%s "
+                    "agent_session_id=%s status=%s error_retained=%s duration=%.1fs",
+                    sid,
+                    session.get("session_key") or "",
+                    getattr(agent, "session_id", "") or "",
+                    (
+                        result.get("interrupted")
+                        and "interrupted"
+                        or result.get("error")
+                        and "error"
+                        or "complete"
+                    )
+                    if isinstance(result, dict)
+                    else ("error" if turn_error_retained else "complete"),
+                    turn_error_retained,
+                    time.monotonic() - _turn_started_monotonic,
                 )
-                if isinstance(result, dict)
-                else ("error" if turn_error_retained else "complete"),
-                turn_error_retained,
-                time.monotonic() - _turn_started_monotonic,
-            )
-            # Backstop for turns that never reached a terminal frame (the
-            # frame paths retire the marker as they emit).
-            with session["history_lock"]:
-                if (_sessions.get(sid) not in (None, session) or session.get("agent") is not agent
-                        or (int(session.get("_queued_prompt_generation", 0)) != settlement_generation
-                            and not owns_stopped_admission())
-                        or (session.get("inflight_turn") is not None and not turn_error_retained)
-                        or session.get("running")):
-                    return
-                # Preserve settled-cwd semantics while separating snapshot
-                # custody from transport I/O on this non-reentrant lock.
+                # Backstop for turns that never reached a terminal frame (the
+                # frame paths retire the marker as they emit).
+                with session["history_lock"]:
+                    if (_sessions.get(sid) not in (None, session) or session.get("agent") is not agent
+                            or (int(session.get("_queued_prompt_generation", 0)) != settlement_generation
+                                and not owns_stopped_admission())
+                            or (session.get("inflight_turn") is not None and not turn_error_retained)
+                            or session.get("running")):
+                        return False
+                    # Preserve settled-cwd semantics while separating snapshot
+                    # custody from transport I/O on this non-reentrant lock.
+                    try:
+                        _reconcile_session_cwd_from_terminal(session)
+                    except Exception:
+                        logger.debug("failed to reconcile settled session cwd", exc_info=True)
+                    settled_info = _session_info(agent, session, lock_held=True)
+                    projection_owner = _capture_lifecycle_projection_owner(session, sid)
+                settled_execution_token = _turn_outcome_execution.set((session, sid,
+                    execution[2] if execution is not None else None))
+                projection_token = _lifecycle_projection_owner.set(projection_owner)
+                settled_transport_token = bind_transport(admission_transport)
                 try:
-                    _reconcile_session_cwd_from_terminal(session)
-                except Exception:
-                    logger.debug("failed to reconcile settled session cwd", exc_info=True)
-                settled_info = _session_info(agent, session, lock_held=True)
-                projection_owner = _capture_lifecycle_projection_owner(session, sid)
-            settled_execution_token = _turn_outcome_execution.set((session, sid,
-                execution[2] if execution is not None else None))
-            projection_token = _lifecycle_projection_owner.set(projection_owner)
-            settled_transport_token = bind_transport(admission_transport)
-            try:
-                _emit("session.info", sid, settled_info)
-            finally:
-                reset_transport(settled_transport_token)
-                _lifecycle_projection_owner.reset(projection_token)
-                _turn_outcome_execution.reset(settled_execution_token)
-            with session["history_lock"]:
-                if (_sessions.get(sid) not in (None, session) or session.get("agent") is not agent
-                        or int(session.get("_queued_prompt_generation", 0)) != settlement_generation
-                        or session.get("running")
-                        or (session.get("inflight_turn") is not None and not turn_error_retained)):
-                    return
-                deferred_teardown = session.pop("_run_checkpoint_teardown_deferred", None)
-                deferred_finalize = session.pop("_run_checkpoint_finalize_deferred", None)
-            if deferred_teardown:
-                _teardown_session(session, end_reason=deferred_teardown)
-            elif deferred_finalize:
-                _finalize_session(session, end_reason=deferred_finalize)
+                    _emit("session.info", sid, settled_info)
+                finally:
+                    reset_transport(settled_transport_token)
+                    _lifecycle_projection_owner.reset(projection_token)
+                    _turn_outcome_execution.reset(settled_execution_token)
+                with session["history_lock"]:
+                    if (_sessions.get(sid) not in (None, session) or session.get("agent") is not agent
+                            or int(session.get("_queued_prompt_generation", 0)) != settlement_generation
+                            or session.get("running")
+                            or (session.get("inflight_turn") is not None and not turn_error_retained)):
+                        return False
+                    deferred_teardown = session.pop("_run_checkpoint_teardown_deferred", None)
+                    deferred_finalize = session.pop("_run_checkpoint_finalize_deferred", None)
+                if deferred_teardown:
+                    _teardown_session(session, end_reason=deferred_teardown)
+                elif deferred_finalize:
+                    _finalize_session(session, end_reason=deferred_finalize)
+                return True
+
+            turn_cleanup_completed = settle_owned_turn_cleanup()
+
+        if not turn_cleanup_completed:
+            return
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
