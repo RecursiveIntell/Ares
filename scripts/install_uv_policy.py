@@ -132,8 +132,7 @@ def run(root, uv, python, *, dry_run=False, check=False):
     except (ValueError, TypeError, AttributeError, UnicodeError):
         raise PolicyError("Malformed reviewed project policy") from None
     version = subprocess.run([uv, "--version"], env=env, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="strict")
-    match = re.fullmatch(r"uv (\d+)\.(\d+)\.(\d+)(?: [^\n]*)?\n?", version.stdout)
-    if version.returncode or not match or not ( (0, 9, 28) <= tuple(map(int, match.groups())) < (0, 13, 0)):
+    if version.returncode or not uv_version_supported(parse_uv_version(version.stdout)):
         raise PolicyError("Unsupported uv version; reviewed range is 0.9.28 through 0.12.x")
     filename = None
     child = None
@@ -214,15 +213,43 @@ def run(root, uv, python, *, dry_run=False, check=False):
     return code
 
 
+UV_VERSION_RANGE = ((0, 9, 28), (0, 13, 0))
+UV_VERSION_RANGE_TEXT = "0.9.28 through 0.12.x"
+
+
+def parse_uv_version(stdout):
+    """Parse ``uv --version`` output into a (major, minor, patch) tuple, or None."""
+    match = re.fullmatch(r"uv (\d+)\.(\d+)\.(\d+)(?: [^\n]*)?\n?", stdout or "")
+    if not match:
+        return None
+    return tuple(map(int, match.groups()))
+
+
+def uv_version_supported(version):
+    """True when ``version`` (a parsed tuple, or None) is inside the reviewed range."""
+    return version is not None and UV_VERSION_RANGE[0] <= version < UV_VERSION_RANGE[1]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", required=True)
+    parser.add_argument("--root")
     parser.add_argument("--uv", required=True)
-    parser.add_argument("--python", required=True)
+    parser.add_argument("--python")
+    parser.add_argument("--check-uv-version", action="store_true",
+                        help="Only validate the managed uv version against the reviewed range")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--check", action="store_true")
     args = parser.parse_args()
+    if args.check_uv_version:
+        version = subprocess.run([args.uv, "--version"], capture_output=True,
+                                 text=True, encoding="utf-8", errors="strict")
+        if version.returncode or not uv_version_supported(parse_uv_version(version.stdout)):
+            print(f"Unsupported uv version; reviewed range is {UV_VERSION_RANGE_TEXT}", file=sys.stderr)
+            return 2
+        return 0
+    if not args.root or not args.python:
+        parser.error("--root and --python are required unless --check-uv-version is given")
     try:
         return run(args.root, args.uv, args.python, dry_run=args.dry_run, check=args.check)
     except PolicyError as error:

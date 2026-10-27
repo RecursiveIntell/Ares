@@ -552,6 +552,22 @@ detect_os() {
 # Dependency checks
 # ============================================================================
 
+# True when the managed uv at $1 is inside the reviewed version range.
+# The authoritative range lives in scripts/install_uv_policy.py; this invokes
+# that same script (a sibling of this one) so the two can never drift. When
+# python3 or the policy script is unavailable at this stage, fall through to
+# "valid" — the locked-install policy step still enforces the range.
+_managed_uv_in_reviewed_range() {
+    local _py3 _policy
+    _py3="$(command -v python3 2>/dev/null || true)"
+    _policy="$(dirname "$0")/install_uv_policy.py"
+    if [ -n "$_py3" ] && [ -f "$_policy" ]; then
+        "$_py3" "$_policy" --uv "$1" --check-uv-version >/dev/null 2>&1
+    else
+        return 0
+    fi
+}
+
 install_uv() {
     if [ "$DISTRO" = "termux" ]; then
         log_info "Termux detected — using Python's stdlib venv + pip instead of uv"
@@ -568,8 +584,15 @@ install_uv() {
     if [ -x "$_managed_uv" ]; then
         UV_CMD="$_managed_uv"
         UV_VERSION=$($UV_CMD --version 2>/dev/null)
-        log_success "Managed uv found ($UV_VERSION)"
-        return 0
+        if _managed_uv_in_reviewed_range "$UV_CMD"; then
+            log_success "Managed uv found ($UV_VERSION)"
+            return 0
+        fi
+        # A user on an older release carries a managed uv outside the reviewed
+        # range; reusing it would make the locked install below fail with no
+        # recovery path, stranding them on that release forever. Replace it.
+        log_info "Managed uv ($UV_VERSION) is outside the reviewed range — replacing it"
+        rm -f "$_managed_uv"
     fi
 
     log_info "Installing managed uv into $HERMES_HOME/bin ..."
