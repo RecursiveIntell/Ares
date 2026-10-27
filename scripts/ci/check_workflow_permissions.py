@@ -34,7 +34,10 @@ WF_DIR = REPO / ".github" / "workflows"
 # SARIF-upload producers allowed workflow-level security-events: write.
 SECURITY_EVENTS_ALLOWED = {"osv-scanner.yml"}
 
-PR_EVENTS = {"pull_request", "pull_request_target", "pull_request_review", "workflow_call"}
+PR_EVENTS = {
+    "pull_request", "pull_request_target", "pull_request_review",
+    "pull_request_review_comment", "workflow_call",
+}
 WORKFLOW_OK = {"contents", "actions", "pull-requests"}  # read levels only
 JOB_WRITE_ALLOWED = {"security-events"}  # only in SECURITY_EVENTS_ALLOWED files
 
@@ -81,7 +84,7 @@ def _has_real_code_execution(doc: dict) -> bool:
             # with flags/config that may precede the verb:
             #   git clone/fetch/pull, git -C <dir> fetch, git -c k=v clone,
             #   gh pr checkout, gh repo clone.
-            if re.search(r"\bgit\b[\w\-.=\"' ]*?\s(?:clone|fetch|pull)\b", run_text):
+            if re.search(r"\bgit\b[\w\-.=/\"'${} ]*?\s(?:clone|fetch|pull)\b", run_text):
                 return True
             if "gh pr checkout" in run_text or "gh repo clone" in run_text:
                 return True
@@ -93,7 +96,7 @@ def _has_real_code_execution(doc: dict) -> bool:
             #   download-then-run (…&& sh x.sh, …; sh x.sh, including across lines);
             #   and command substitution via combined flags (bash -lc "$(curl …)").
             _interp = (
-                r"(?:sudo\s+)?(?:env\s+)?(?:[\"']?[\w./-]+/)?(?:ba|z|da|k)?sh\b"
+                r"(?:sudo\s+(?:--?\S+(?:\s+\S+)?)\s+)*(?:env\s+)*(?:[\"']?[\w./-]+/)?(?:ba|z|da|k)?sh\b"
                 r"|(?:[\"']?[\w./-]+/)?python[\d.]*\b|(?:[\"']?[\w./-]+/)?(?:node|ruby|perl|deno|bun)\b"
             )
             if re.search(rf"\b(?:curl|wget)\b[^|]*\|\s*(?:(?:sudo|env)(?:\s+-{{1,2}}[\w-]+)*\s+)?{_interp}", run_text):
@@ -107,11 +110,13 @@ def _has_real_code_execution(doc: dict) -> bool:
             if re.search(r"\b(?:ba|z|da|k)?sh\s+(?:-\w+\s+)*-\w*c\b\s*['\"]?\$\(\s*(?:curl|wget)\b", run_text):
                 return True
             # download-then-run: the fetcher appears anywhere in the command and
-            # the interpreter follows a separator (; or &&) — greedy so the URL
-            # may sit between the -o target and the separator.
+            # the interpreter follows a separator (&&, ;) or a bare newline —
+            # greedy + re.S so multi-line run blocks are covered.
             if re.search(r"\b(?:curl|wget)\b.*&&\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", run_text, re.S):
                 return True
             if re.search(r"\b(?:curl|wget)\b.*;\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", run_text, re.S):
+                return True
+            if re.search(r"\b(?:curl|wget)\b.*\n\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", run_text, re.S):
                 return True
             # Arbitrary package execution: npx -y / pnpm dlx / yarn dlx / bunx /
             # uvx / pipx run fetch and execute a package; pip/uv-pip installs
@@ -122,9 +127,14 @@ def _has_real_code_execution(doc: dict) -> bool:
                 return True
             if re.search(r"\b(?:pnpm|yarn)\s+dlx\b|\bbunx\b|\buvx\b(?:\s+--from\b)?|\bpipx\s+run\b", run_text):
                 return True
-            if re.search(r"\b(?:pip3?|uv\s+pip)\s+install\b[^&|;]*['\"]?\s*(?:git\+(?:https?|ssh|git)://|https?://)", run_text):
+            if re.search(r"\b(?:pip[0-9.]*|uv\s+pip)\s+install\b[^&|;]*['\"]?\s*(?:git\+(?:https?|ssh|git)://|https?://)", run_text):
                 return True
-            if re.search(r"\bnpm\s+(?:i|install)\b[^&|;]*(?:github:|https?://|git\+)", run_text):
+            if re.search(r"\bnpm\s+(?:i|install)\b[^&|;\n]*(?:github:|https?://|git\+|[\w.-]+/[\w.-]+)", run_text):
+                return True
+            # eval "$(curl …)" / gh api piped to a shell
+            if re.search(r"\beval\s+['\"]?\$\(\s*(?:curl|wget)\b", run_text):
+                return True
+            if re.search(r"\bgh\s+api\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", run_text):
                 return True
             # Legacy literal shapes (kept for robustness)
             if "curl" in run_text and ("| sh" in run_text or "| bash" in run_text):
@@ -181,6 +191,15 @@ def check(workflow_dir: Path = WF_DIR) -> list[str]:
         if not isinstance(perms, dict):
             findings.append(f"{path.name}: workflow-level permissions '{perms}' is not an explicit minimal map")
             continue
+        # Scope-key allowlist: the body's contract is an explicit minimal map
+        # within {contents, actions, pull-requests} (+ security-events under
+        # its own exception). Unknown read-only scope keys are refused too.
+        for scope in sorted(perms):
+            if scope not in (WORKFLOW_OK | JOB_WRITE_ALLOWED):
+                findings.append(
+                    f"{path.name}: workflow-level scope '{scope}' is outside the minimal map "
+                    f"{sorted(WORKFLOW_OK | JOB_WRITE_ALLOWED)}"
+                )
         # The SARIF caller-cap exception must reference the LOCAL reusable
         # flow exactly (./.github/workflows/osv-scanner.yml) — a substring
         # match would let a foreign fork's osv-scanner.yml exempt writes.

