@@ -824,17 +824,14 @@ def _journal_append(home: str, record: Dict[str, Any]) -> bool:
 
 
 def _process_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists, owned by someone else
-    except OSError:
-        return False
-    return True
+    """Return True if the process ``pid`` is alive (footgun-safe).
+
+    Delegates to :func:`_pid_alive` — the canonical cross-platform liveness
+    check — instead of ``os.kill(pid, 0)``, which is NOT a no-op on Windows:
+    it routes to ``CTRL_C_EVENT`` and hard-kills the target's console process
+    group (bpo-14484).
+    """
+    return _pid_alive(pid)
 
 
 def _parse_journal_lines(path: str) -> List[Tuple[str, Dict[str, Any]]]:

@@ -25,8 +25,8 @@ import {
   stopBackgroundProcess
 } from '@/store/composer-status'
 import { refreshSessionGoal } from '@/store/goals'
-import { $sessionStates } from '@/store/session-states'
 import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview-status'
+import { $sessionStates } from '@/store/session-states'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { openSessionInNewWindow } from '@/store/windows'
 
