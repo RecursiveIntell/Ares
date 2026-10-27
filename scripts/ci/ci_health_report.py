@@ -236,7 +236,7 @@ def to_markdown(reports: list[dict], alert_counts: dict | None) -> str:
 
 def gh_json(args: list[str], attempts: int = 2) -> dict | list:
     for i in range(attempts):
-        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=120)
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
         if out.returncode == 0:
             return json.loads(out.stdout)
         transient = "HTTP 5" in out.stderr or "Server Error" in out.stderr
