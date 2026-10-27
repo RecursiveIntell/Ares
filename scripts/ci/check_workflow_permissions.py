@@ -18,6 +18,7 @@ Exit 1 with a findings list on violation; exit 0 when clean.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -76,7 +77,20 @@ def _has_real_code_execution(doc: dict) -> bool:
             if isinstance(step.get("uses"), str) and step["uses"].strip():
                 return True
             run_text = str(step.get("run") or "")
-            if "git clone" in run_text or "curl" in run_text and ("| sh" in run_text or "| bash" in run_text):
+            # Fetching external code: clone, or fetch+checkout of PR heads
+            # (git fetch refs/pull/N/head, gh pr checkout, gh repo clone).
+            if re.search(r"\bgit\s+(clone|fetch)\b", run_text):
+                return True
+            if "gh pr checkout" in run_text or "gh repo clone" in run_text:
+                return True
+            # Remote execution: curl/wget piping into a shell interpreter…
+            if re.search(r"\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b", run_text):
+                return True
+            # …or bash/sh -c "$(curl …)"
+            if re.search(r"\b(?:ba|z)?sh\s+-c\s+['\"]?\$\(", run_text):
+                return True
+            # Legacy literal shapes (kept for robustness)
+            if "curl" in run_text and ("| sh" in run_text or "| bash" in run_text):
                 return True
     return False
 
@@ -159,7 +173,7 @@ def check(workflow_dir: Path = WF_DIR) -> list[str]:
         # requires; the write executes in the callee's job).
         sarif_caller_jobs = {
             n for n, j in (doc.get("jobs") or {}).items()
-            if isinstance(j, dict) and "workflows/osv-scanner.yml" in str(j.get("uses") or "")
+            if isinstance(j, dict) and re.fullmatch(r"\./\.github/workflows/osv-scanner\.yml(?:@.*)?", str(j.get("uses") or "").strip())
         }
         for job_name, writes in _effective_job_write_scopes(doc).items():
             for scope in writes:

