@@ -505,18 +505,22 @@ async function stop() {
   )
 }
 
+const evidenceDir = process.env.P1A_EVIDENCE_DIR || '/evidence'
+
 run()
   .then(async receipt => {
     await stop()
     assert.equal(effects.reaped, 2)
-    fs.writeFileSync('/evidence/native-ipc-actual.json', JSON.stringify(receipt, null, 2))
+    fs.mkdirSync(evidenceDir, { recursive: true })
+    fs.writeFileSync(path.join(evidenceDir, 'native-ipc-actual.json'), JSON.stringify(receipt, null, 2))
     app.exit(0)
   })
   .catch(async error => {
     console.error('NativeIPCActual1 failed:', error.message)
     await stop()
+    fs.mkdirSync(evidenceDir, { recursive: true })
     fs.writeFileSync(
-      '/evidence/native-ipc-actual-failure.json',
+      path.join(evidenceDir, 'native-ipc-actual-failure.json'),
       JSON.stringify({ error: error.message, effects, frames, workerRequests }, null, 2)
     )
     app.exit(1)
