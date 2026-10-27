@@ -81,7 +81,7 @@ def _has_real_code_execution(doc: dict) -> bool:
             # with flags/config that may precede the verb:
             #   git clone/fetch/pull, git -C <dir> fetch, git -c k=v clone,
             #   gh pr checkout, gh repo clone.
-            if re.search(r"\bgit\b[\w\-= \"']*\s(?:clone|fetch|pull)\b", run_text):
+            if re.search(r"\bgit\b[\w\-.=\"' ]*?\s(?:clone|fetch|pull)\b", run_text):
                 return True
             if "gh pr checkout" in run_text or "gh repo clone" in run_text:
                 return True
@@ -91,7 +91,7 @@ def _has_real_code_execution(doc: dict) -> bool:
             #   download-then-run (curl -o x.sh && sh x.sh), and command
             #   substitution via combined flags (bash -lc "$(curl …)").
             if re.search(
-                r"\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:env\s+)?(?:ba|z|da)?sh\b|\b(?:curl|wget)\b[^|]*\|\s*python[\d.]*\b",
+                r"\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:env\s+)?(?:ba|z|da)?sh\b|\b(?:curl|wget)\b[^|]*\|\s*(?:python[\d.]*|node|ruby|perl|deno|bun)\b",
                 run_text,
             ):
                 return True
@@ -99,9 +99,17 @@ def _has_real_code_execution(doc: dict) -> bool:
                 return True
             if re.search(r"\b(?:source|\.)\s*<(?:\(|<)\s*(?:curl|wget)\b", run_text):
                 return True
-            if re.search(r"\b(?:ba|z|da)?sh\s+(?:-\w+\s+)*-c\s+['\"]?\$\(\s*(?:curl|wget)\b", run_text):
+            # -\w*c\b also matches combined flag clusters whose last letter is
+            # c (bash -lc "$(curl …)").
+            if re.search(r"\b(?:ba|z|da)?sh\s+(?:-\w+\s+)*-\w*c\b\s*['\"]?\$\(\s*(?:curl|wget)\b", run_text):
                 return True
-            if re.search(r"\b(?:curl|wget)\b[^|;&]*-o\s*\S+\s*[^|;&]*&&\s*(?:sudo\s+)?(?:ba|z|da)?sh\b", run_text):
+            if re.search(r"\b(?:curl|wget)\b[^|;&]*[-oO]\s*\S+\s*[^|;&]*&&\s*(?:sudo\s+)?(?:ba|z|da)?sh\b", run_text):
+                return True
+            # Arbitrary package execution: npx -y runs a fetched package; pip/uv
+            # installs from a remote VCS or URL execute setup code.
+            if re.search(r"\bnpx\b(?:\s+-\w+)*\s+(?:-y\b|--yes\b)", run_text):
+                return True
+            if re.search(r"\b(?:pip3?|uv\s+pip)\s+install\b[^&|;]*(?:\bgit\+https?:|https?://)", run_text):
                 return True
             # Legacy literal shapes (kept for robustness)
             if "curl" in run_text and ("| sh" in run_text or "| bash" in run_text):
