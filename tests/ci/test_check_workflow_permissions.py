@@ -90,3 +90,33 @@ def test_current_repo_workflows_are_clean():
     """GREEN condition: after Task 4.2 edits, the live workflows pass."""
     findings = cwp.check()
     assert findings == [], findings
+
+
+def test_bypass_fixtures_scalar_on_job_writeall_comment_mention_no_checkout(tmp_path):
+    """Round-2 verifier bypasses (panel-211): each crafted fixture must yield
+    findings. Scalar `on:`, job-level write-all, comment-mention SARIF
+    exemption, and git-clone-without-checkout are all refused."""
+    (tmp_path / "a.yml").write_text(
+        "on: pull_request\n"
+        "permissions:\n  contents: read\n  pull-requests: write\n"
+        "jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n"
+    )
+    (tmp_path / "b.yml").write_text(
+        "on: [pull_request]\npermissions:\n  contents: read\n"
+        "jobs:\n  j:\n    runs-on: ubuntu-latest\n    permissions: write-all\n"
+        "    steps:\n      - uses: actions/checkout@v4\n"
+    )
+    (tmp_path / "c.yml").write_text(
+        "on: [pull_request]\n# see also osv-scanner.yml\n"
+        "permissions:\n  contents: read\n  security-events: write\n"
+        "jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n"
+    )
+    (tmp_path / "d.yml").write_text(
+        "on: [pull_request]\n"
+        "jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - run: git clone --depth 1 https://github.com/example/repo.git\n"
+        "      - run: python3 do_things.py\n"
+    )
+    findings = cwp.check(tmp_path)
+    caught = {f.split(":")[0] for f in findings}
+    assert {"a.yml", "b.yml", "c.yml", "d.yml"} <= caught, findings
