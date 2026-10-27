@@ -1360,14 +1360,11 @@ class AIAgent:
         is provider wire-format trouble, not local request validation, so it
         should follow the same retry path as a truncated JSON body.
         """
-        if getattr(self, "api_mode", None) != "anthropic_messages":
-            return False
-        if not isinstance(error, ValueError):
-            return False
-        if isinstance(error, (UnicodeEncodeError, json.JSONDecodeError)):
-            return False
-        message = str(error).strip().lower()
-        return "expected ident at line" in message
+        from agent.stream_diag import is_provider_stream_parse_error
+
+        return getattr(self, "api_mode", None) == "anthropic_messages" and is_provider_stream_parse_error(
+            error
+        )
 
     def _log_stream_retry(
         self,
@@ -2772,6 +2769,8 @@ class AIAgent:
         translated into an offline hint, including when an SDK wraps the
         original OS error. Falls back to a truncated str(error) otherwise.
         """
+        from agent.stream_diag import is_provider_stream_parse_error
+
         raw = str(error)
 
         # Linux, macOS, and Windows use different low-level messages when DNS
@@ -2800,10 +2799,7 @@ class AIAgent:
                 )
             current = current.__cause__ or current.__context__
 
-        if (
-            isinstance(error, ValueError)
-            and "expected ident at line" in raw.lower()
-        ):
+        if is_provider_stream_parse_error(error):
             return f"Malformed provider streaming response: {raw[:300]}"
 
         # Cloudflare / proxy HTML pages: grab the <title> for a clean summary
