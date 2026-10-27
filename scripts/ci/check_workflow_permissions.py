@@ -126,11 +126,26 @@ def _has_real_code_execution(doc: dict) -> bool:
                         return True
             if re.search(r"\b(?:ba|z|da|k)?sh\s+(?:-\w+\s+)*<\s*[(<]\s*\(?\s*(?:curl|wget)\b", run_text):
                 return True
+            # Process substitution into any interpreter, incl. leading-dot
+            # source (". <(curl …)") and python3 <(curl …).
+            if re.search(
+                r"(?:(?:^|[\s;&|(])(?:[\w./-]+/)?(?:ba|z|da|k)?sh\b|(?:^|[\s;&|(])(?:[\w./-]+/)?python[\d.]*\b|(?:^|[\s;&|(])(?:[\w./-]+/)?(?:node|ruby|perl|php|lua|deno|bun)\b|(?:^|[\s;&|(])\.\s)"
+                r"[^\n]*<\s*[(<]\s*\(?\s*(?:curl|wget)\b",
+                run_text,
+            ):
+                return True
             if re.search(r"\b(?:source|\.)\s*<(?:\(|<)\s*(?:curl|wget)\b", run_text):
                 return True
             # -\w*c\b also matches combined flag clusters whose last letter is
-            # c (bash -lc "$(curl …)").
-            if re.search(r"\b(?:ba|z|da|k)?sh\s+(?:-\w+\s+)*-\w*c\b\s*['\"]?\$\(\s*(?:curl|wget)\b", run_text):
+            # c (bash -lc "$(curl …)"). Generalized to any interpreter's -c/-e
+            # (python3 -c "$(curl …)", node -e, ruby -e, …), with flag
+            # clusters (bash --norc -c …).
+            if re.search(
+                r"\b(?:[\w./-]+/)?(?:ba|z|da|k)?sh\s+(?:--?\S+\s+)*-c\b\s*['\"]?\$\(\s*(?:curl|wget)\b"
+                r"|\bpython[\d.]*\s+(?:--?\S+\s+)*-c\b\s*['\"]?\$\(\s*(?:curl|wget)\b"
+                r"|\b(?:node|ruby|perl|php|deno|bun)\s+(?:--?\S+\s+)*-[ec]\b\s*['\"]?\$\(\s*(?:curl|wget)\b",
+                run_text,
+            ):
                 return True
             # download-then-run: the fetcher appears anywhere in the command and
             # the interpreter follows a separator (&&, ;) or a bare newline —
@@ -142,7 +157,7 @@ def _has_real_code_execution(doc: dict) -> bool:
                 return True
             if re.search(r"\b(?:curl|wget)\b.*\n\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", run_text, re.S):
                 return True
-            if re.search(r"\b(?:curl|wget)\b.*(&&|;|\n).*(?:\./[\w.-]+|chmod\s+\+x)", run_text, re.S):
+            if re.search(r"\b(?:curl|wget)\b.*(?:&&|;|\n).*(?:\./[\w.-]+|chmod\s+\+x|\bsource\s)", run_text, re.S):
                 return True
             # Arbitrary package execution: npx -y / pnpm dlx / yarn dlx / bunx /
             # uvx / pipx run fetch and execute a package; pip/uv-pip installs
@@ -153,7 +168,7 @@ def _has_real_code_execution(doc: dict) -> bool:
                 return True
             if re.search(r"\b(?:pnpm|yarn)\s+dlx\b|\bbunx\b|\buvx\b(?:\s+--from\b)?|\bpipx\s+run\b", run_text):
                 return True
-            if re.search(r"\b(?:pip[0-9.]*|uv\s+pip)\s+install\b[^&|;]*['\"]?\s*(?:git\+(?:https?|ssh|git)://|https?://)", run_text):
+            if re.search(r"\b(?:pip[0-9.]*|uv\s+pip)\s+install\b[^&|;]*['\"]?\s*(?:git\+(?:https?|ssh|git)://|git\+git@|https?://)", run_text):
                 return True
             if re.search(r"\bnpm\s+(?:i|install)\b[^&|;\n]*(?:github:|https?://|git\+|[\w.-]+/[\w.-]+)", run_text):
                 return True

