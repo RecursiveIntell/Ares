@@ -334,6 +334,7 @@ async function stop() {
   for (const timer of fixtureTimers) {
     clearTimeout(timer)
   }
+
   await Promise.all(
     children.map(
       child =>

@@ -166,6 +166,7 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
 
   it('reports a typed Stop disposition for a rejected tile Stop', async () => {
     clearNotifications()
+
     let state: Record<string, unknown> = {
       attachedImages: [],
       busy: true,

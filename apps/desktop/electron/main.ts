@@ -6984,7 +6984,11 @@ const nativeSocketTransport = new NativeSocketTransport({
       followRedirects: false,
       rejectUnauthorized: true
     }),
-  emit: (owner, event) => owner.senderFrame.send('hermes:transport:event', event)
+  emit: (owner, event) => owner.senderFrame.send('hermes:transport:event', event),
+  diagnostic: info =>
+    rememberLog(
+      `[native-socket] retired reason=${info.reason} channel=${info.channel} queued=${info.queued} bytes=${info.bytes} sends=${info.sends}`
+    )
 })
 
 // Bind the resolved endpoint to its actual owning cache generation, including
@@ -7031,6 +7035,7 @@ async function resolveNativeTransportBackend(route, currentDocument) {
   if (connection.mode === 'local' && !localProof?.alive()) {
     throw new Error('Owned local backend admission unavailable')
   }
+
   const sshOwner = [...sshConnections.entries()].find(([, state]) => state.localPort === Number(base.port))
 
   if (connection.remoteKind === 'ssh' && !sshOwner) {
@@ -12350,6 +12355,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     if (backendPool.get(poolKey) === entry) {
       backendPool.delete(poolKey)
     }
+
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {

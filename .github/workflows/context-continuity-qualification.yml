@@ -24,7 +24,10 @@ jobs:
     outputs:
       qualification_result: ${{ job.status }}
     name: Native external owner paired source
-    runs-on: ubuntu-latest
+    # Pinned: on ubuntu-26.04 /usr/bin/printf is a symlink into the Rust coreutils
+    # dir and the pinned native sandbox rejects it ("sandbox path must be absolute
+    # and canonicalizable"). Unpin once the pinned native repo accepts it.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     # These are the native repository's existing hosted-CI settings at the
     # pinned base (.github/workflows/ci.yml). Local guarded execution is not

@@ -267,7 +267,9 @@ class ContextDispatchPhysicalScope:
             from ares_runtime.physical_dispatch import _restore_call, bind_deferred_result
             # A new callback may be a changed request or fallback route. Only
             # SDK-internal physical retries share this logical materialization.
-            self._model_call_basis = produce_dispatch_materialization(self.agent, payload, purpose="conversation")
+            self._model_call_basis = produce_dispatch_materialization(
+                self.agent, payload, purpose="conversation", execution_id=self.attempt_id
+            )
             with _restore_call(self._model_call_basis):
                 response = callback(payload)
                 return bind_deferred_result(response, self._model_call_basis)

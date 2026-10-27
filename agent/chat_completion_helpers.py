@@ -1358,6 +1358,38 @@ def direct_api_call(agent, api_kwargs: dict):
             )
 
 
+_REQUEST_ABORT_DIAGNOSTIC_GRACE_SECONDS = 0.5
+
+
+def _resolve_request_abort_outcome(
+    worker: threading.Thread,
+    *,
+    reason: str,
+    shutdown_count: int | None,
+    grace_seconds: float = _REQUEST_ABORT_DIAGNOSTIC_GRACE_SECONDS,
+) -> str:
+    """Resolve a zero-socket abort against the owning worker's real outcome."""
+
+    if shutdown_count is None or shutdown_count < 0:
+        return "abort_unobserved"
+    if shutdown_count > 0:
+        return "socket_shutdown"
+    worker.join(timeout=max(0.0, grace_seconds))
+    if worker.is_alive():
+        logger.warning(
+            "Request abort unresolved after diagnostic grace "
+            "(reason=%s, tcp_force_closed=0, worker_settled=false)",
+            reason,
+        )
+        return "worker_still_running"
+    logger.info(
+        "Request abort resolved by cooperative worker settlement "
+        "(reason=%s, tcp_force_closed=0, worker_settled=true)",
+        reason,
+    )
+    return "worker_settled"
+
+
 def interruptible_api_call(agent, api_kwargs: dict):
     """
     Run the API call in a background thread so the main conversation loop
@@ -1412,7 +1444,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             request_client_holder["owner_tid"] = threading.get_ident()
         return client
 
-    def _close_request_client_once(reason: str) -> None:
+    def _close_request_client_once(reason: str) -> int | None:
         # #29507: dispatch on the calling thread.
         #
         # When ``_call`` (the worker) reaches its ``finally`` it owns the
@@ -1445,9 +1477,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     agent._abort_request_anthropic_client(
                         request_client, reason=reason
                     )
-                else:
-                    agent._abort_request_openai_client(request_client, reason=reason)
-                return
+                    return None
+                return agent._abort_request_openai_client(
+                    request_client, reason=reason
+                )
             # Owning thread (or no recorded owner) → pop and fully close.
             request_client_holder["client"] = None
             request_client_holder["owner_tid"] = None
@@ -1700,9 +1733,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     f"Reconnecting."
                 )
             try:
-                _close_request_client_once("codex_ttfb_kill")
+                _abort_count = _close_request_client_once("codex_ttfb_kill")
             except Exception:
-                pass
+                _abort_count = -1
             agent._emit_wait_notice(
                 f"⚠ no response from provider in {int(_elapsed)}s — "
                 f"reconnecting..."
@@ -1712,6 +1745,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
             )
             # Wait briefly for the worker to notice the closed connection.
             t.join(timeout=2.0)
+            _resolve_request_abort_outcome(
+                t,
+                reason="codex_ttfb_kill",
+                shutdown_count=_abort_count,
+                grace_seconds=0,
+            )
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
@@ -1750,13 +1789,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"Reconnecting."
             )
             try:
-                _close_request_client_once("codex_stream_idle_kill")
+                _abort_count = _close_request_client_once("codex_stream_idle_kill")
             except Exception:
-                pass
+                _abort_count = -1
             agent._touch_activity(
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
             t.join(timeout=2.0)
+            _resolve_request_abort_outcome(
+                t,
+                reason="codex_stream_idle_kill",
+                shutdown_count=_abort_count,
+                grace_seconds=0,
+            )
             if result["error"] is None and result["response"] is None:
                 result["error"] = TimeoutError(
                     f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
@@ -1781,15 +1826,21 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 # #67142: routes by client kind — anthropic now aborts the
                 # request-local client's sockets from this poll (stranger)
                 # thread instead of closing the shared _anthropic_client.
-                _close_request_client_once("stale_call_kill")
+                _abort_count = _close_request_client_once("stale_call_kill")
             except Exception:
-                pass
+                _abort_count = -1
             # Circuit breaker (#58962): count the stale kill.  See the
             # canonical comment block above ``_stale_streak()``.
             _bump_stale_streak(agent)
             _touch_stale_kill_activity(agent, _elapsed)
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
+            _resolve_request_abort_outcome(
+                t,
+                reason="stale_call_kill",
+                shutdown_count=_abort_count,
+                grace_seconds=0,
+            )
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
@@ -1828,15 +1879,20 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # rather than closing the shared _anthropic_client, which could
             # release a TLS FD mid-SSL-BIO and corrupt an unrelated SQLite DB.
             try:
-                _close_request_client_once("interrupt_abort")
+                _abort_count = _close_request_client_once("interrupt_abort")
             except Exception:
-                pass
+                _abort_count = -1
             # #81521 (sibling of the streaming-path fix): wait for the worker
             # to unwind Relay-managed scopes before surfacing
             # InterruptedError, so turn teardown cannot race a still-open
             # physical scope and corrupt the LIFO stack. No-op when Relay
             # managed execution is not live.
             _join_worker_for_relay_teardown(t, label="Non-streaming")
+            _resolve_request_abort_outcome(
+                t,
+                reason="interrupt_abort",
+                shutdown_count=_abort_count,
+            )
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
         raise result["error"]
@@ -2481,6 +2537,7 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
         FailoverReason.auth: "authentication failed",
         FailoverReason.auth_permanent: "authentication permanently failed",
         FailoverReason.billing: "billing or quota exhausted",
+        FailoverReason.hard_quota: "account quota exhausted",
         FailoverReason.rate_limit: "rate limit",
         FailoverReason.upstream_rate_limit: "upstream model rate limit",
         FailoverReason.overloaded: "provider overloaded",
@@ -2526,7 +2583,12 @@ def try_activate_fallback(
     # Restoring the primary after an inadmissible candidate must not turn the
     # internal chain walk into another originating provider failure. Separate
     # public calls still arm backoff even when the chain is already exhausted.
-    if not _continuing_chain and reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+    if not _continuing_chain and reason in {
+        FailoverReason.rate_limit,
+        FailoverReason.billing,
+        FailoverReason.hard_quota,
+        FailoverReason.upstream_rate_limit,
+    }:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
         # source of the 429 so the cooldown should not be reset/extended.
@@ -2557,7 +2619,12 @@ def try_activate_fallback(
         # provider again.  Guards the cross-turn replay storm in #24996.
         if (
             len(agent._fallback_chain) > 0
-            and reason not in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}
+            and reason not in {
+                FailoverReason.rate_limit,
+                FailoverReason.billing,
+                FailoverReason.hard_quota,
+                FailoverReason.upstream_rate_limit,
+            }
         ):
             _existing_cooldown = getattr(agent, "_rate_limited_until", 0) or 0
             agent._rate_limited_until = max(
@@ -3880,7 +3947,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 exc,
             )
 
-    def _close_request_client_once(reason: str) -> None:
+    def _close_request_client_once(reason: str) -> int | None:
         # See #29507 explanation in the non-streaming variant above. A
         # stranger thread (the interrupt-check / stale-stream detector loop)
         # only aborts sockets — never pops, never calls ``client.close()`` —
@@ -3907,9 +3974,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     agent._abort_request_anthropic_client(
                         request_client, reason=reason
                     )
-                else:
-                    agent._abort_request_openai_client(request_client, reason=reason)
-                return
+                    return None
+                return agent._abort_request_openai_client(
+                    request_client, reason=reason
+                )
             request_client_holder["client"] = None
             request_client_holder["owner_tid"] = None
         if request_client is None:

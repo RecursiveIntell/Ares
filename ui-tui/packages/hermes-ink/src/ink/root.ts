@@ -119,6 +119,11 @@ export const renderSync = (node: ReactNode, options?: NodeJS.WriteStream | Rende
   const instance: Ink = getInstance(inkOptions.stdout, () => new Ink(inkOptions))
 
   instance.render(node)
+  // `renderSync` promises a committed tree plus a synchronous handoff to a
+  // writable that accepts the frame. React's sync commit does not itself call
+  // Ink's frame writer, so drive the first frame here rather than relying on a
+  // later scheduled render.
+  instance.onRender()
 
   return {
     rerender: instance.render,

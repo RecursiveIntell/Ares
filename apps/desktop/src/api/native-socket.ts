@@ -47,6 +47,26 @@ export async function resolveDesktopGatewayDial(
   return resolveGatewayWsUrl(deps, conn)
 }
 
+export interface NativeSocketCloseDiagnostic {
+  channel: NativeSocketChannel['kind']
+  phase: string
+  sequence: number
+}
+
+export const nativeCloseDiagnostic = (event: CloseEvent): NativeSocketCloseDiagnostic | null => {
+  const detail = (event as CloseEvent & { nativeDiagnostic?: unknown }).nativeDiagnostic
+
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) {
+    return null
+  }
+
+  const value = detail as Partial<NativeSocketCloseDiagnostic>
+
+  return typeof value.channel === 'string' && typeof value.phase === 'string' && typeof value.sequence === 'number'
+    ? { channel: value.channel as NativeSocketChannel['kind'], phase: value.phase, sequence: value.sequence }
+    : null
+}
+
 /** DOM-shaped transport; RPC IDs, heartbeat and replay remain in the shared client. */
 export class NativeRendererSocket extends EventTarget {
   readonly CONNECTING = 0
@@ -94,21 +114,22 @@ export class NativeRendererSocket extends EventTarget {
   constructor(
     private bridge: NativeSocketBridge,
     route: NativeSocketRoute,
-    channel: NativeSocketChannel = { kind: 'gateway' }
+    private channel: NativeSocketChannel = { kind: 'gateway' }
   ) {
     super()
     this.unsubscribe = bridge.onEvent(this.correlation, event => this.receive(event))
-    this.timer = setTimeout(() => this.fail(), 15_000)
+    this.timer = setTimeout(() => this.fail('open_timeout'), 15_000)
     // Listener attachment always precedes the asynchronous bridge open.
     queueMicrotask(() => {
       if (this.readyState !== 0) {
         return
       }
+
       void bridge
         .open({ correlation: this.correlation, route, channel })
         .then(result => {
           if (this.handle && this.handle !== result.handle) {
-            this.fail()
+            this.fail('handle_mismatch')
 
             return
           }
@@ -119,7 +140,7 @@ export class NativeRendererSocket extends EventTarget {
             void this.cancel().catch(() => {})
           }
         })
-        .catch(() => this.fail())
+        .catch(() => this.fail('open_rejected'))
     })
   }
   private receive(event: NativeSocketEvent) {
@@ -128,7 +149,7 @@ export class NativeRendererSocket extends EventTarget {
     }
 
     if ((this.handle && event.handle !== this.handle) || event.sequence !== this.sequence + 1) {
-      this.fail()
+      this.fail('sequence_gap')
 
       return
     }
@@ -152,27 +173,29 @@ export class NativeRendererSocket extends EventTarget {
       if (this.readyState !== 1) {
         return
       }
+
       const message = new MessageEvent('message', { data: event.data })
 
       try {
         this.dispatchEvent(message)
         this.onmessage?.(message)
       } finally {
-        void this.bridge.ack({ handle: event.handle, sequence: event.sequence }).catch(() => this.fail())
+        void this.bridge.ack({ handle: event.handle, sequence: event.sequence }).catch(() => this.fail('ack_rejected'))
       }
     } else if (event.type === 'error') {
-      this.fail(event.needsOauthLogin)
+      this.fail('native_error', event.needsOauthLogin)
     } else {
-      this.finish(event.code ?? 1006, event.reason ?? '', event.wasClean === true)
+      this.finish(event.code ?? 1006, event.reason ?? '', event.wasClean === true, 'native_close')
     }
   }
   private cancel() {
     return this.bridge.close({ correlation: this.correlation, ...(this.handle ? { handle: this.handle } : {}) })
   }
-  private fail(oauth = false) {
+  private fail(phase: string, oauth = false) {
     if (this.readyState === 3) {
       return
     }
+
     const event = new Event('error')
 
     if (oauth) {
@@ -182,16 +205,21 @@ export class NativeRendererSocket extends EventTarget {
     this.dispatchEvent(event)
     this.onerror?.(event)
     void this.cancel().catch(() => {})
-    this.finish(1006, 'Native transport failed', false)
+    this.finish(1006, 'Native transport failed', false, phase)
   }
-  private finish(code: number, reason: string, wasClean: boolean) {
+  private finish(code: number, reason: string, wasClean: boolean, phase: string) {
     if (this.readyState === 3) {
       return
     }
+
     clearTimeout(this.timer)
     this.readyState = 3
     this.unsubscribe()
-    const event = new CloseEvent('close', { code, reason, wasClean })
+
+    const event = Object.assign(new CloseEvent('close', { code, reason, wasClean }), {
+      nativeDiagnostic: { channel: this.channel.kind, phase, sequence: this.sequence }
+    })
+
     this.dispatchEvent(event)
     this.onclose?.(event)
   }
@@ -199,12 +227,13 @@ export class NativeRendererSocket extends EventTarget {
     if (this.readyState !== 1 || !this.handle || typeof data !== 'string') {
       throw new Error('Native socket is not open')
     }
+
     // Bound in-flight IPC copies as well as main's queue. Exact byte accounting
     // is enforced in main; UTF-16 upper bound avoids another huge allocation.
     const bytes = data.length * 2
 
     if (this.sends >= 128 || this.sendBytes + bytes > 768 * 1024 * 1024) {
-      this.fail()
+      this.fail('send_overflow')
       throw new Error('Native send queue overflow')
     }
 
@@ -212,7 +241,7 @@ export class NativeRendererSocket extends EventTarget {
     this.sendBytes += bytes
     void this.bridge
       .send({ handle: this.handle, data })
-      .catch(() => this.fail())
+      .catch(() => this.fail('send_rejected'))
       .finally(() => {
         this.sends--
         this.sendBytes -= bytes
@@ -230,9 +259,10 @@ export class NativeRendererSocket extends EventTarget {
     if (reason && new TextEncoder().encode(reason).byteLength > 123) {
       throw new Error('Invalid close reason')
     }
+
     this.readyState = 2
     clearTimeout(this.timer)
-    this.timer = setTimeout(() => this.finish(1006, 'Close timed out', false), 2_500)
+    this.timer = setTimeout(() => this.finish(1006, 'Close timed out', false, 'close_timeout'), 2_500)
     void this.bridge
       .close({
         correlation: this.correlation,
@@ -242,10 +272,10 @@ export class NativeRendererSocket extends EventTarget {
       })
       .then(() => {
         if (!this.handle) {
-          this.finish(1000, '', true)
+          this.finish(1000, '', true, 'close_ack')
         }
       })
-      .catch(() => this.fail())
+      .catch(() => this.fail('close_rejected'))
   }
 }
 

@@ -114,7 +114,13 @@ def inference_call_scope(agent, payload, *, purpose="conversation", route=None):
     from ares_runtime.managed_calls import produce_dispatch_materialization
 
     token = _call.set(
-        produce_dispatch_materialization(agent, payload, purpose=purpose, route=route)
+        produce_dispatch_materialization(
+            agent,
+            payload,
+            purpose=purpose,
+            route=route,
+            execution_id=getattr(agent, "_current_dispatch_attempt_id", None),
+        )
     )
     try:
         yield _call.get()
@@ -275,11 +281,15 @@ def _begin_buffered(request):
     observation = {
         "schema": "ares.physical-send/v1",
         "dispatch_intent_ref": "ares-dispatch-intent:" + uuid.uuid4().hex,
+        "execution_id": None if basis is None else basis.get("execution_id"),
         "materialization": None if basis is None else basis["materialization"],
         "qualification_error": body_error or (
             "MATERIALIZATION_UNAVAILABLE" if basis is None else basis["qualification_error"]
         ),
         "provider_request_digest": blake3(body).hexdigest() if type(body) is bytes else None,
+        "provider_request_sha256": (
+            "sha256:" + hashlib.sha256(body).hexdigest() if type(body) is bytes else None
+        ),
         "provider_request_bytes": len(body) if type(body) is bytes else None,
         "request_body_schema": "ares.immutable-provider-body/v1+blake3",
         "started_monotonic": time.monotonic(),

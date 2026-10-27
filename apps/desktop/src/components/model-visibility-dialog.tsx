@@ -53,6 +53,7 @@ export function ModelVisibilityDialog({
   const collapsedProviders = useStore($collapsedProviders)
   const owner = knownOwnerForSession(sessionId)
   const catalogProfile = (typeof owner === 'string' ? owner : owner?.targetProfile || owner?.profile) || profile
+
   const connectionId =
     owner && typeof owner === 'object' ? owner.connectionId : owner ? 'local' : getApiRequestConnection()
 

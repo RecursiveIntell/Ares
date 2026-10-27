@@ -325,6 +325,31 @@ export interface SessionInterruptResponse {
   status?: 'interrupted'
 }
 
+export interface AcceptedTurn {
+  host_boot_id: null | string
+  request_id: string
+  route: 'compute_host' | 'inline'
+  session_id: string
+}
+
+export interface SessionTurnPollResponse {
+  running: boolean
+  session_id?: string
+  turn_outcomes?: unknown
+}
+
+export type StopEffectDisposition = 'indeterminate' | 'not_applied' | 'not_sent'
+
+export interface StopFailureData {
+  effect_disposition?: StopEffectDisposition
+  failure_code?: string
+  host_boot_id?: string
+  operation_id?: string
+  owner_reconciliation_required?: boolean
+  request_id?: string
+  target_request_id?: string
+}
+
 export interface SessionSteerResponse {
   status?: 'queued' | 'rejected'
   text?: string
@@ -333,6 +358,7 @@ export interface SessionSteerResponse {
 // ── Prompt / submission ──────────────────────────────────────────────
 
 export interface PromptSubmitResponse {
+  accepted_turn?: AcceptedTurn
   ok?: boolean
   /** Set when the submitted text was a bare voice stop phrase consumed
    *  server-side to end the voice chat instead of starting a turn. */

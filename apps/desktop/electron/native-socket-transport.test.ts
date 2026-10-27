@@ -206,11 +206,83 @@ test('ordered PCM/text events remain bounded until acknowledged; overflow is ter
   f.transport.ack(f.owner, { handle, sequence: 2 })
   f.transport.ack(f.owner, { handle, sequence: 3 })
 
-  for (let i = 0; i < 129; i++) {
+  for (let i = 0; i < 8193; i++) {
     f.wire.emit('message', Buffer.from('x'), false)
   }
+
   expect(f.events.at(-1).type).toBe('close')
   expect(f.wire.terminate).toHaveBeenCalledOnce()
+})
+test('a renderer stall of several hundred ms at streaming rates does not kill the socket', async () => {
+  const f = fixture()
+  const { handle } = await f.transport.open(f.owner, request())
+  await flush()
+  f.wire.readyState = 1
+  f.wire.emit('open')
+
+  // ~550 events/s for 2 s with the renderer acknowledging nothing.
+  for (let i = 0; i < 1100; i++) {
+    f.wire.emit('message', Buffer.from('{"jsonrpc":"2.0"}'), false)
+  }
+
+  expect(f.events.some(event => event.type === 'close' || event.type === 'error')).toBe(false)
+  expect(f.wire.terminate).not.toHaveBeenCalled()
+
+  // Once the renderer resumes, every queued event is acknowledged in order.
+  for (const event of f.events.filter(event => event.type === 'message')) {
+    f.transport.ack(f.owner, { handle, sequence: event.sequence })
+  }
+
+  f.wire.emit('message', Buffer.from('{"jsonrpc":"2.0"}'), false)
+  expect(f.events.at(-1).type).toBe('message')
+})
+test('a deep inbound backlog never blocks an outbound send such as Stop', async () => {
+  const f = fixture()
+  const { handle } = await f.transport.open(f.owner, request())
+  await flush()
+  f.wire.readyState = 1
+  f.wire.emit('open')
+
+  for (let i = 0; i < 1000; i++) {
+    f.wire.emit('message', Buffer.from('{}'), false)
+  }
+
+  await expect(f.transport.send(f.owner, { handle, data: '{"method":"session.interrupt"}' })).resolves.toBeUndefined()
+  expect(f.events.some(event => event.type === 'close')).toBe(false)
+})
+test('a wedged renderer is still retired by the congestion watchdog and the reason is reported', async () => {
+  const f = fixture()
+
+  const diagnostics: any[] = []
+
+  ;(f.transport as any).deps.diagnostic = (info: unknown) => diagnostics.push(info)
+  await f.transport.open(f.owner, request())
+  await flush()
+  f.wire.readyState = 1
+  f.wire.emit('open')
+  f.wire.emit('message', Buffer.from('{}'), false)
+  await vi.advanceTimersByTimeAsync(16_000)
+
+  expect(f.events.at(-1)).toMatchObject({ type: 'close' })
+  expect(diagnostics.at(-1)).toMatchObject({ reason: 'congestion_timeout', channel: 'gateway', queued: 1 })
+})
+test('inbound overflow past the finite bound is terminal and reported with its reason', async () => {
+  const f = fixture()
+
+  const diagnostics: any[] = []
+
+  ;(f.transport as any).deps.diagnostic = (info: unknown) => diagnostics.push(info)
+  await f.transport.open(f.owner, request())
+  await flush()
+  f.wire.readyState = 1
+  f.wire.emit('open')
+
+  for (let i = 0; i < 8193; i++) {
+    f.wire.emit('message', Buffer.from('x'), false)
+  }
+
+  expect(f.events.at(-1).type).toBe('close')
+  expect(diagnostics.at(-1)).toMatchObject({ reason: 'Native event queue overflow' })
 })
 test('backend retirement closes its pinned socket without admitting stale sends', async () => {
   const f = fixture()

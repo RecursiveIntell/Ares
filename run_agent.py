@@ -1360,14 +1360,11 @@ class AIAgent:
         is provider wire-format trouble, not local request validation, so it
         should follow the same retry path as a truncated JSON body.
         """
-        if getattr(self, "api_mode", None) != "anthropic_messages":
-            return False
-        if not isinstance(error, ValueError):
-            return False
-        if isinstance(error, (UnicodeEncodeError, json.JSONDecodeError)):
-            return False
-        message = str(error).strip().lower()
-        return "expected ident at line" in message
+        from agent.stream_diag import is_provider_stream_parse_error
+
+        return getattr(self, "api_mode", None) == "anthropic_messages" and is_provider_stream_parse_error(
+            error
+        )
 
     def _log_stream_retry(
         self,
@@ -2772,6 +2769,8 @@ class AIAgent:
         translated into an offline hint, including when an SDK wraps the
         original OS error. Falls back to a truncated str(error) otherwise.
         """
+        from agent.stream_diag import is_provider_stream_parse_error
+
         raw = str(error)
 
         # Linux, macOS, and Windows use different low-level messages when DNS
@@ -2800,10 +2799,7 @@ class AIAgent:
                 )
             current = current.__cause__ or current.__context__
 
-        if (
-            isinstance(error, ValueError)
-            and "expected ident at line" in raw.lower()
-        ):
+        if is_provider_stream_parse_error(error):
             return f"Malformed provider streaming response: {raw[:300]}"
 
         # Cloudflare / proxy HTML pages: grab the <title> for a clean summary
@@ -5656,7 +5652,7 @@ class AIAgent:
             return
         self._close_openai_client(client, reason=reason, shared=False)
 
-    def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:
+    def _abort_request_openai_client(self, client: Any, *, reason: str) -> int:
         """Cross-thread abort: shut sockets down without releasing FDs.
 
         Companion to :meth:`_close_request_openai_client` for stranger-thread
@@ -5671,7 +5667,7 @@ class AIAgent:
         — which is where the FD release belongs.
         """
         if client is None:
-            return
+            return 0
         # A pool whose sockets were shut down from a stranger thread must
         # never be reused: poison the cache slot so the owner-thread close
         # discards it and the next create builds a fresh client.
@@ -5681,24 +5677,18 @@ class AIAgent:
                 cache["poisoned"] = True
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
-            # tcp_force_closed=0 means the stranger-thread abort found no
-            # sockets to shut down — the worker stays blocked in recv and the
-            # provider keeps the slot (#72975). Surface that as WARNING so it
-            # cannot be mistaken for a successful abort in the logs.
-            _log = logger.warning if shutdown_count == 0 else logger.info
-            _log(
-                "OpenAI client aborted (%s, shared=False, tcp_force_closed=%d, "
-                "deferred_close=stranger_thread) %s%s",
+            # Zero sockets is a transport-attempt observation, not the request
+            # outcome. The worker owner resolves it after a bounded settlement
+            # grace; logging a warning here made successful cooperative Stops
+            # look unsuccessful before the worker had time to unwind.
+            logger.info(
+                "OpenAI client abort requested (%s, shared=False, tcp_force_closed=%d, "
+                "deferred_close=stranger_thread, outcome=pending) %s",
                 reason,
                 shutdown_count,
                 self._client_log_context(),
-                (
-                    " — no sockets found; in-flight request may keep running "
-                    "until the provider finishes"
-                    if shutdown_count == 0
-                    else ""
-                ),
             )
+            return shutdown_count
         except Exception as exc:
             logger.debug(
                 "OpenAI client abort failed (%s, shared=False) %s error=%s",
@@ -5706,6 +5696,7 @@ class AIAgent:
                 self._client_log_context(),
                 exc,
             )
+            return -1
 
     def _request_anthropic_client_cache_ref(self) -> dict:
         # Lazy init — tests build agents via AIAgent.__new__ without __init__.

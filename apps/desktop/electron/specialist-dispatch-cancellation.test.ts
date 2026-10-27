@@ -17,6 +17,7 @@ const request = (suffix = '1', profiles = ['explorer']) => ({
 function deferred<T>() {
   let resolve!: (value: T) => void
   let reject!: (reason: Error) => void
+
   const promise = new Promise<T>((yes, no) => {
     resolve = yes
     reject = no
@@ -116,12 +117,14 @@ test('a handle returned after cancel remains owned until confirmed cleanup', asy
 test('cleanup rejection retains child and capacity and reports uncertainty', async () => {
   const child = { pid: 19, exitCode: null as number | null, signalCode: null }
   const pool = new Map()
+
   const admission = createSpecialistDispatchAdmission({
     maxCapacity: 1,
     pool,
     spawnRunner: async () => child,
     stopRunner: actual => stopSpecialistRunner(actual, { stopChild: () => {}, waitForExit: async () => {} })
   })
+
   await admission.admit(request())
   await assert.rejects(admission.cancel(request().runId), /exit was not confirmed/)
   assert.equal(admission.status(request().runId), 'cleanup_failed')
@@ -140,6 +143,7 @@ test('cleanup rejection retains child and capacity and reports uncertainty', asy
 
 test('deadline stop preserves failure outcome after confirmed exit', async () => {
   const child = { exitCode: null as number | null, signalCode: null as string | null }
+
   const admission = createSpecialistDispatchAdmission({
     maxCapacity: 1,
     pool: new Map(),
@@ -152,6 +156,7 @@ test('deadline stop preserves failure outcome after confirmed exit', async () =>
         }
       })
   })
+
   await admission.admit(request())
   await admission.cancel(request().runId, 'runner_failed')
   assert.equal(admission.status(request().runId), 'runner_failed')
@@ -190,6 +195,7 @@ test('ordinary completion and duplicate admission retain existing semantics', as
 test('failed uncommitted startup frees capacity while invalid requests have no effect', async () => {
   let launches = 0
   const pool = new Map()
+
   const admission = createSpecialistDispatchAdmission({
     maxCapacity: 1,
     pool,
@@ -199,6 +205,7 @@ test('failed uncommitted startup frees capacity while invalid requests have no e
     },
     stopRunner: async () => {}
   })
+
   assert.equal((await admission.admit(request('1', []))).reasonCode, 'INVALID_REQUEST')
   assert.equal(launches, 0)
   assert.equal((await admission.admit(request())).reasonCode, 'RUNNER_START_FAILED')

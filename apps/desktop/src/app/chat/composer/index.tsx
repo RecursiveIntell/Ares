@@ -24,6 +24,7 @@ import { sessionBlockingPrompt } from '@/store/prompts'
 import { toggleReview } from '@/store/review'
 import { $gatewayState } from '@/store/session'
 import { $sessionStates } from '@/store/session-states'
+import { sessionStopUnsettled } from '@/store/session-stop'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { $autoSpeakReplies } from '@/store/voice-prefs'
 import { useTheme } from '@/themes'
@@ -166,6 +167,7 @@ export function ChatBar({
   const scope = useComposerScope()
   const attachments = useStore(scope.attachments.$attachments)
   const compacting = useStore(useMemo(() => sessionCompacting(sessionId ?? null), [sessionId]))
+  const stopUnsettled = useStore(useMemo(() => sessionStopUnsettled(sessionId ?? null), [sessionId]))
   const scrolledUp = useStore($threadScrolledUp)
   const autoSpeak = useStore($autoSpeakReplies)
   // The turn is parked on the user (clarify / approval / sudo / secret). Esc must
@@ -1009,6 +1011,7 @@ export function ChatBar({
       onToggleAutoSpeak={handleToggleAutoSpeak}
       state={state}
       steeringPending={steeringPending}
+      stopUnsettled={stopUnsettled}
       voiceStatus={voiceStatus}
     />
   )

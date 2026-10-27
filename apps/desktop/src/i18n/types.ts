@@ -194,6 +194,8 @@ export interface Translations {
       elevenLabsNeedsKey: string
       elevenLabsRejectedKey: string
       diskFull: string
+      sessionBusyRetry: string
+      sessionBusyQueued: string
       gatewayAuthFailed: string
       methodNotAllowed: string
       microphonePermission: string
@@ -1995,6 +1997,7 @@ export interface Translations {
     queueMessage: string
     steer: string
     stop: string
+      stopAgain: string
     send: string
     speaking: string
     transcribing: string
@@ -2037,6 +2040,8 @@ export interface Translations {
     attachments: (count: number) => string
     editingInComposer: string
     editingQueuedInComposer: string
+      queuedBehindPrompt: string
+      queuedBehindBusy: string
     queueEdit: string
     queueSendNext: string
     queueSend: string
@@ -2734,6 +2739,9 @@ export interface Translations {
       loadingSession: string
       showEarlier: string
       loadingResponse: string
+      activityBackground: string
+      activityGoalCheck: string
+      activityGoalStep: string
       resumeWhenBackgroundDone: (count: number) => string
       thinking: string
       thought: string
