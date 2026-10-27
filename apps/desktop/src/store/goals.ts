@@ -14,6 +14,23 @@ export interface SessionGoal {
   updatedAt: number
 }
 
+/** Structured goal state carried by `status.update.goal_state`.
+ *
+ * The backend owns goal state; the text line is a human-facing projection of
+ * it. Preferring this object keeps the composer pill correct even when the
+ * prose grammar changes (it previously missed every `⊙ Goal active · …` line
+ * and left a stale "Goal waiting" chip on screen indefinitely).
+ */
+export interface GoalStatePayload {
+  continuation_pending?: boolean
+  max_turns?: number
+  outcome?: string | null
+  status?: string
+  title?: string | null
+  turns_used?: number
+  waiting?: boolean
+}
+
 export const $goalsBySession = atom<Record<string, SessionGoal>>({})
 
 const DONE_LINGER_MS = 8_000
@@ -30,6 +47,51 @@ export function setSessionGoal(sid: string, goal: SessionGoal) {
   if (goal.status === 'done') {
     clearTimers.schedule(sid, DONE_LINGER_MS, () => clearSessionGoal(sid))
   }
+}
+
+/** Apply the authoritative structured state for one session.
+ *
+ * Unlike the text parser this is not a guess: `status`, `outcome`, and
+ * `waiting` come straight from `GoalManager`. `WAITING_FOR_AUTHORITY` is the
+ * one outcome that must read as "waiting" rather than "active" — the model
+ * judged the goal done but the operator has not supplied completion evidence.
+ */
+export function applyGoalState(sid: string, state: GoalStatePayload | null | undefined) {
+  if (!sid || !state) {
+    return
+  }
+
+  const title = (state.title ?? '').trim()
+  const status = (state.status ?? '').trim()
+
+  if (status === 'cleared' || (!title && status !== 'done')) {
+    clearSessionGoal(sid)
+
+    return
+  }
+
+  const now = Date.now()
+
+  if (status === 'done') {
+    setSessionGoal(sid, { status: 'done', title: title || 'Standing goal', updatedAt: now })
+
+    return
+  }
+
+  if (status === 'paused') {
+    setSessionGoal(sid, { status: 'paused', title: title || 'Standing goal', updatedAt: now })
+
+    return
+  }
+
+  const waiting = state.waiting === true || state.outcome === 'WAITING_FOR_AUTHORITY'
+
+  setSessionGoal(sid, {
+    ...(waiting ? { detail: 'waiting for authority' } : {}),
+    status: waiting ? 'waiting' : 'active',
+    title: title || 'Standing goal',
+    updatedAt: now
+  })
 }
 
 export function clearSessionGoal(sid: string) {
@@ -76,6 +138,28 @@ function nextGoalFromText(text: string, previous?: SessionGoal): SessionGoal | n
 
   if (fromSet || fromActive || fromResume) {
     return { status: 'active', title: fromSet || fromActive || fromResume, updatedAt: now }
+  }
+
+  // `⊙ Goal active · running (4/20 turns): <title>` and its siblings —
+  // waiting for authority, checkpointed/continuation pending, blocked,
+  // budget exhausted — plus the timed `⏳ Goal active · waiting (…)` form.
+  // These are what `GoalManager.status_line()` actually emits for an active
+  // goal; the parser above only matched the `⊙ Goal (…active…):` shape, so
+  // every real active/waiting line fell through and the chip kept whatever it
+  // last understood (typically "Goal waiting" forever).
+  if (/^[⊙⏳] Goal active\b/.test(line)) {
+    const title = goalTitleFromLine(line, /^[⊙⏳] Goal active\b[^:]*\([^)]*\):\s*(.+)$/)
+
+    if (title) {
+      const waiting = /waiting for authority|·\s*waiting\s*\(/i.test(line)
+
+      return {
+        ...(waiting ? { detail: 'waiting for authority' } : {}),
+        status: waiting ? 'waiting' : 'active',
+        title,
+        updatedAt: now
+      }
+    }
   }
 
   const fromWaiting = goalTitleFromLine(line, /^⏳ Goal\s*\([^)]*(?:parked|active)[^)]*\):\s*(.+)$/)

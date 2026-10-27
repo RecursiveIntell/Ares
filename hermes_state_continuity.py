@@ -1324,7 +1324,22 @@ class SessionContextContinuityMixin(SessionContextAuthorityMixin):
                       "task_binding_digest": snapshot.dispatch_task_digest,
                       "input_watermark": snapshot.input_watermark, "admitted_at": time.time()}
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (key, _canonical(record)))
-            self._bind_input_turn_dispatch_on_conn(conn, session_id, turn_lease_holder, attempt_id)
+            phase_id = self._bind_input_turn_dispatch_on_conn(conn, session_id, turn_lease_holder, attempt_id)
+            if phase_id is not None:
+                from ares_runtime.execution_record import ExecutionRecordV1
+
+                lineage = self._context_rebase_lineage_on_conn(conn, session_id)
+                execution = ExecutionRecordV1.create({
+                    "execution_id": attempt_id,
+                    "session_ref": session_id,
+                    "session_generation": max(0, len(lineage) - 1),
+                    "turn_ref": phase_id,
+                    "call_ref": "ares-call:" + attempt_id,
+                    "admission_ref": key,
+                    "state": "admitted",
+                    "recorded_at": record["admitted_at"],
+                })
+                self.create_execution_record_on_conn(conn, execution)
             return record
         return self._execute_write(write)
 

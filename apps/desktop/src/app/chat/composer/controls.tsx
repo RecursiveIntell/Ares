@@ -44,6 +44,7 @@ export function ComposerControls({
   minimal = false,
   interruptPending = false,
   steeringPending = false,
+  stopUnsettled = false,
   state,
   voiceStatus,
   onDictate,
@@ -63,6 +64,7 @@ export function ComposerControls({
   minimal?: boolean
   interruptPending?: boolean
   steeringPending?: boolean
+  stopUnsettled?: boolean
   state: ChatBarState
   voiceStatus: VoiceStatus
   onDictate: () => void
@@ -72,6 +74,9 @@ export function ComposerControls({
 }) {
   const { t } = useI18n()
   const c = t.composer
+  // A Stop ACK is not a settled turn. While the backend still owns the turn,
+  // the control must say so instead of presenting the session as stopped.
+  const stopLabel = stopUnsettled ? c.stopAgain : c.stop
   const hudMode = useStore($hudMode)
 
   if (conversation.active) {
@@ -134,10 +139,10 @@ export function ComposerControls({
         </Tip>
       ) : null}
       {showSecondaryStop ? (
-        <Tip label={c.stop}>
+        <Tip label={stopLabel}>
           <Button
             aria-busy={interruptPending || undefined}
-            aria-label={c.stop}
+            aria-label={stopLabel}
             className={GHOST_ICON_BTN}
             disabled={disabled || interruptPending}
             onClick={() => {
@@ -176,7 +181,7 @@ export function ComposerControls({
         <Tip
           label={
             showStop ? (
-              <TipKeybindLabel actionId="composer.send" text={c.stop} />
+              <TipKeybindLabel actionId="composer.send" text={stopLabel} />
             ) : (
               <TipKeybindLabel actionId="composer.send" text={c.send} />
             )
@@ -184,7 +189,7 @@ export function ComposerControls({
         >
           <Button
             aria-busy={showStop && interruptPending ? true : undefined}
-            aria-label={showStop ? c.stop : c.send}
+            aria-label={showStop ? stopLabel : c.send}
             className={PRIMARY_ICON_BTN}
             disabled={disabled || !canSubmit || interruptPending || steeringPending}
             type="submit"

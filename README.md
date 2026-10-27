@@ -511,13 +511,16 @@ garbage-collection rules are in [`docs/ares-candidate-custody.md`](docs/ares-can
 
 When enabled explicitly, `ARES_STRICT_EFFECT_TOOL_ARGS_V1=1` rejects unknown
 fields, missing required fields, and type coercion for effectful tool payloads.
-`ARES_RUNTIME_PERMITS_V1=1` requires the configured daemon permit bridge for
-effectful tools. The bridge checks an exact tool/argument binding, uses the
-daemon-owned canonical digest helper, requires a private same-user Unix socket
-and peer credentials, and returns daemon-derived evidence/preflight/receipt
-facts. It never mints permits or persists a local substitute receipt. Missing,
-malformed, stale, or denied bridge state fails closed. These flags are
-experimental/runtime-gated controls; they are not a security certification.
+`ares.permit_daemon` in `config.yaml` requires the configured daemon permit
+bridge for effectful tools, scoped to one explicitly configured canary session;
+the selected session, the explicit operator enablement, and the daemon verifier
+still decide whether an effect is admitted. The bridge checks an exact
+tool/argument binding, uses the daemon-owned canonical digest helper, requires a
+private same-user Unix socket and peer credentials, and returns daemon-derived
+evidence/preflight/receipt facts. It never mints permits or persists a local
+substitute receipt. Missing, malformed, stale, or denied bridge state fails
+closed. These controls are experimental/runtime-gated; they are not a security
+certification.
 
 ## Repository map
 

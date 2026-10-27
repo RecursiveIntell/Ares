@@ -208,6 +208,11 @@ export interface ClientSessionState {
   yolo: boolean
   personality: string
   busy: boolean
+  /** What the running turn is doing, from the backend's `session.info`
+   *  (`user` | `notification` | `goal_continuation` | `goal_judge`). Null when
+   *  unknown — an older gateway or an idle session. Never infer it from
+   *  `busy`: that conflation is what hid a background turn from the operator. */
+  activity?: null | string
   /** The runtime id was invalidated by reconnect/reap and the durable session is
    *  being rebound. This is unresolved activity, not confirmed idle. */
   reconnecting: boolean

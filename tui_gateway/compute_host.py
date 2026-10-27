@@ -91,7 +91,7 @@ class HostSession:
 
 
 class _HostTransport:
-    def __init__(self, emit: Callable[[dict[str, Any]], None]) -> None:
+    def __init__(self, emit: Callable[[dict[str, Any]], bool]) -> None:
         self._emit = emit
 
     def write(self, obj: dict) -> bool:
@@ -101,8 +101,7 @@ class _HostTransport:
                 sid = str(((obj.get("params") or {}).get("session_id")) or "")
         except Exception:
             sid = ""
-        self._emit({"type": "rpc", "sid": sid, "message": obj})
-        return True
+        return self._emit({"type": "rpc", "sid": sid, "message": obj})
 
     def close(self) -> None:
         return None
@@ -151,6 +150,9 @@ class ComputeHost:
             thread_name_prefix="compute-host-turn",
         )
         self._closed = threading.Event()
+        self._transport_dead = threading.Event()
+        self._peer_loss_settlement_started = threading.Event()
+        self._peer_loss_settled = threading.Event()
         self._parent_pid = os.getppid()
         self._boot_id = uuid.uuid4().hex
         self._progress_counter = 0
@@ -175,11 +177,71 @@ class ComputeHost:
             threading.Thread(target=self._heartbeat_loop, name="compute-host-heartbeat", daemon=True).start()
             threading.Thread(target=self._parent_guard_loop, name="compute-host-ppid-guard", daemon=True).start()
 
-    def emit(self, frame: dict[str, Any]) -> None:
+    def emit(self, frame: dict[str, Any]) -> bool:
+        if self._transport_dead.is_set():
+            return False
         frame.setdefault("host_ns", now_ns())
         data = json.dumps(frame, separators=(",", ":"), ensure_ascii=False)
         with self._write_lock:
-            print(data, file=self._stdout, flush=True)
+            if self._transport_dead.is_set():
+                return False
+            try:
+                print(data, file=self._stdout, flush=True)
+            except (BrokenPipeError, OSError, ValueError):
+                self._mark_peer_lost()
+                return False
+        return True
+
+    def _mark_peer_lost(self) -> None:
+        """Transition stdout peer loss once and settle active work off-writer."""
+
+        if self._transport_dead.is_set():
+            return
+        self._transport_dead.set()
+        self._closed.set()
+        if self._peer_loss_settlement_started.is_set():
+            return
+        self._peer_loss_settlement_started.set()
+        threading.Thread(
+            target=self._settle_after_peer_loss,
+            name="compute-host-peer-loss-settlement",
+            daemon=True,
+        ).start()
+
+    def _settle_after_peer_loss(self) -> None:
+        """Request hard cancellation, then use the bounded shutdown contract."""
+
+        for spike in list(self._sessions.values()):
+            try:
+                request_hard_interrupt(spike.agent)
+            except Exception:
+                pass
+        with self._turn_futures_lock:
+            active = list(self._active_request_ids.items())
+        if active:
+            try:
+                from tui_gateway import server
+
+                for sid, request_id in active:
+                    session = server._sessions.get(sid)
+                    if session is None:
+                        continue
+                    try:
+                        server._interrupt_session_turn(
+                            sid,
+                            session,
+                            request_id=f"peer-loss-{request_id}",
+                        )
+                        with session["history_lock"]:
+                            session["_turn_cancel_requested"] = True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        try:
+            self.shutdown(reason="peer_loss", wait=2.0)
+        finally:
+            self._peer_loss_settled.set()
 
     def close(self) -> None:
         self._closed.set()
@@ -414,8 +476,18 @@ class ComputeHost:
             return
         admitted, request_id = self._admit_real_turn(frame)
         if not admitted:
+            # A refusal is not a failed turn: no execution started. Carry the
+            # classification so clients can reconcile (queue / retry / explain)
+            # instead of painting a terminal error card for an attempt that was
+            # never made. `error_surface` is the field the desktop already
+            # parses; `reason` stays for older clients and logs.
             self.emit({"type": "turn.error", "sid": sid, "request_id": request_id,
-                       "message": "session busy", "reason": "admission_refused_busy"})
+                       "message": "session busy", "reason": "admission_refused_busy",
+                       "error_surface": {
+                           "layer": "admission",
+                           "code": "session_busy",
+                           "retryable": True,
+                       }})
 
     def admit_autonomous_turn(self, frame: dict[str, Any]) -> bool:
         """Admit an autonomously-initiated turn through the same registry as a
@@ -461,7 +533,13 @@ class ComputeHost:
             return
         with session.lock:
             if session.running:
-                self.emit({"type": "turn.error", "sid": sid, "request_id": frame.get("request_id"), "message": "session busy"})
+                self.emit({"type": "turn.error", "sid": sid, "request_id": frame.get("request_id"),
+                           "message": "session busy", "reason": "admission_refused_busy",
+                           "error_surface": {
+                               "layer": "admission",
+                               "code": "session_busy",
+                               "retryable": True,
+                           }})
                 return
             session.running = True
         future = self._executor.submit(self._run_spike_turn, session, dict(frame))
@@ -521,6 +599,14 @@ class ComputeHost:
                         previous_receipt = getattr(agent, "_context_stop_receipt", None)
                         server._interrupt_session_turn(sid, session, request_id=frame.get("request_id"),
                             **({"operation_id": frame["operation_id"]} if frame.get("operation_id") is not None else {}))
+                        # A user Stop ends the goal chain at this boundary even
+                        # when the run thread cannot observe the interrupt (a
+                        # provider read that never cancels). The post-turn goal
+                        # hook checks this flag; the next user-originated prompt
+                        # clears it. Without it, Stop ACKs while the judge
+                        # immediately re-fires the continuation.
+                        with session["history_lock"]:
+                            session["_goal_suppress_after_interrupt"] = True
                         receipt = getattr(agent, "_context_stop_receipt", None)
                         if isinstance(receipt, dict) and receipt is not previous_receipt:
                             ack["stop_receipt"] = {"session_key": receipt.get("session_key"),

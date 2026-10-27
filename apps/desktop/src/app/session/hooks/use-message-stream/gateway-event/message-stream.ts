@@ -16,6 +16,7 @@ import { providerWaitText, setSessionProviderWait } from '@/store/provider-wait'
 import { setCurrentUsage, setTurnStartedAt } from '@/store/session'
 import { pruneFinishedSessionSubagents } from '@/store/subagents'
 import { clearActiveSessionTodos } from '@/store/todos'
+import { clearUnadmittedSend } from '@/store/unadmitted-send'
 
 import type { GatewayEventContext } from './types'
 
@@ -85,6 +86,9 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
       return true
     }
 
+    // The turn is live: this send was admitted, so it is no longer a candidate
+    // for refusal recovery.
+    clearUnadmittedSend(sessionId)
     flushQueuedDeltas(sessionId)
     pruneFinishedSessionSubagents(sessionId)
     setSessionCompacting(sessionId, false)

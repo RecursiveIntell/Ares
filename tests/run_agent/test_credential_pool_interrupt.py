@@ -81,3 +81,28 @@ def test_rotate_on_second_429_when_not_exhausted():
     assert recovered is True
     assert retried is False
     pool.mark_exhausted_and_rotate.assert_called_once()
+
+
+def test_hard_quota_never_rotates_or_retries_the_credential_pool():
+    entries = [_make_entry(0, last_status=None), _make_entry(1)]
+    pool = _make_pool(entries)
+
+    from run_agent import AIAgent
+
+    with patch("run_agent.get_tool_definitions", return_value=[]), \
+         patch("run_agent.check_toolset_requirements", return_value={}), \
+         patch("run_agent.OpenAI"):
+        agent = MagicMock(spec=AIAgent)
+        agent._credential_pool = pool
+        agent._swap_credential = MagicMock()
+        recovered, retried = AIAgent._recover_with_credential_pool(
+            agent,
+            status_code=429,
+            has_retried_429=False,
+            classified_reason=FailoverReason.hard_quota,
+        )
+
+    assert recovered is False
+    assert retried is False
+    pool.mark_exhausted_and_rotate.assert_not_called()
+    agent._swap_credential.assert_not_called()
