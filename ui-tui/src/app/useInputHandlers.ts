@@ -65,21 +65,21 @@ export function handleIdleHotkeyExit(
 export type CtrlCComposerAction = 'clear' | 'interrupt' | 'exit'
 
 /**
- * Ctrl+C (and terminals that rewrite Cmd+C to it) is clear / interrupt / exit
- * in that order. A non-empty composer always wins — mid-stream, the chord
- * used to interrupt the turn even when the user was trying to dump a draft.
+ * Ctrl+C (and terminals that rewrite Cmd+C to it) is interrupt / clear / exit.
+ * During a running turn Stop is the explicit action and preserves the draft;
+ * the existing double-Esc gesture remains the deliberate draft-discard control.
  */
 export function resolveCtrlCComposerAction(opts: {
   busy: boolean
   hasDraft: boolean
   hasSession: boolean
 }): CtrlCComposerAction {
-  if (opts.hasDraft) {
-    return 'clear'
-  }
-
   if (opts.busy && opts.hasSession) {
     return 'interrupt'
+  }
+
+  if (opts.hasDraft) {
+    return 'clear'
   }
 
   return 'exit'
@@ -358,8 +358,8 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
 
   // Double-Esc discards the draft, matching Claude Code / Gemini CLI. It
   // sits above the isBlocked early-return so a prompt overlay cannot swallow
-  // it. Ctrl+C now clears a non-empty composer even mid-stream; Esc Esc is
-  // still the dedicated discard (pushes the draft to history so Up recalls it).
+  // it. During a busy turn Ctrl+C requests Stop and keeps the draft; Esc Esc
+  // remains the dedicated discard (pushes the draft to history so Up recalls it).
   const lastEscRef = useRef(0)
 
   useInput((ch, key) => {
@@ -643,6 +643,12 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       }
 
       if (ctrlC === 'interrupt' && live.sid) {
+        if (cState.input || cState.inputBuf.length) {
+          actions.sys('Stop requested — draft preserved')
+        } else {
+          actions.sys('Stop requested')
+        }
+
         return turnController.interruptTurn({
           appendMessage: actions.appendMessage,
           gw: gateway.gw,

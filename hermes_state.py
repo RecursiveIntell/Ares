@@ -97,6 +97,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_runs import SessionRunCustodyMixin
 from hermes_state_continuity import ContextContinuationError, SessionContextContinuityMixin
+from hermes_state_execution import SessionExecutionRecordMixin
 from hermes_state_inbox import SessionContextInboxMixin
 from hermes_state_schema import (
     SessionSchemaMixin, TODO_LIFECYCLE_SHAPE_SQL,
@@ -4317,7 +4318,7 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
-class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin, SessionRunCustodyMixin, SessionContextContinuityMixin, SessionContextInboxMixin):
+class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin, SessionRunCustodyMixin, SessionContextContinuityMixin, SessionContextInboxMixin, SessionExecutionRecordMixin):
     """
     SQLite-backed session storage with FTS5 search.
 
@@ -7915,6 +7916,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             return False
         now = time.time()
         expires_at = now + max(0.1, float(ttl_seconds))
+        # Only reclaim rows WELL past expiry. A lease that merely lapsed during
+        # a long tool call may still be refreshed by its holder; yanking it here
+        # would widen the mutual-exclusion window for no benefit.
+        prune_before = now - 3600.0
 
         def _do(conn):
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
@@ -7934,6 +7939,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                         "WHERE conversation_id = ? AND holder = ?",
                         (conversation_id, current_holder),
                     )
+            # Global hygiene: leases for conversations nobody has touched since
+            # (a compressed-away tip, an abandoned profile, a crashed host)
+            # otherwise accumulate forever — the cleanup above only ever sees
+            # the key being acquired. Observed: rows from two months earlier.
+            conn.execute(
+                "DELETE FROM session_turn_leases WHERE expires_at < ?",
+                (prune_before,),
+            )
             conn.execute(
                 "INSERT OR IGNORE INTO session_turn_leases "
                 "(conversation_id, holder, acquired_at, expires_at) "

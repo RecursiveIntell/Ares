@@ -1130,6 +1130,7 @@ def _teardown_popped_session(
     if session is None:
         return False
     run_thread = _get_run_thread(session)
+    still_alive = False
     if (
         end_reason != "tui_shutdown"
         and run_thread is not None
@@ -1139,12 +1140,25 @@ def _teardown_popped_session(
             if run_thread.is_alive():
                 run_thread.join(timeout=_TURN_SETTLE_BEFORE_CLOSE_SECONDS)
             if run_thread.is_alive():
+                still_alive = True
                 logger.warning(
                     "session turn thread still alive after %.1fs teardown grace",
                     _TURN_SETTLE_BEFORE_CLOSE_SECONDS,
                 )
         except Exception:
             logger.debug("failed waiting for session turn thread", exc_info=True)
+    if still_alive:
+        # The record is already detached, but the turn still owns it and is
+        # still appending history. Finalizing here stamped `ended_at` BEFORE
+        # messages the thread wrote afterwards — one observed session carried
+        # 53 rows later than its own `ended_at`. Hand the full teardown to the
+        # turn's settle path, which already runs a deferred teardown.
+        session["_run_checkpoint_teardown_deferred"] = end_reason
+        logger.info(
+            "session teardown deferred to live turn thread sid=%s",
+            session.get("_sid"),
+        )
+        return True
     _teardown_session(session, end_reason=end_reason)
     return True
 
@@ -5363,7 +5377,27 @@ def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[st
             _DASHBOARD_DETACHED_EXECUTION_MAX_S_DEFAULT,
             min_value=1.0,
         ),
+        # Dispatch-location requirement, not an isolation guarantee. Kept
+        # explicit rather than truthy-coerced so a malformed value can never
+        # read as "off" and silently authorize an inline fallback.
+        "require_compute_host": _require_compute_host_value(
+            dashboard.get("require_compute_host"),
+        ),
     }
+
+
+def _require_compute_host_value(value: Any) -> bool:
+    """Parse ``dashboard.require_compute_host`` fail-closed.
+
+    Only an absent or explicitly false value disables the requirement; any
+    other value (including an unrecognized string) enables it. A typo must not
+    silently downgrade the operator's dispatch-location requirement.
+    """
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return value != 0
 
 
 def _load_cfg_raw() -> dict:
@@ -9075,6 +9109,32 @@ def _custom_readiness_route(agent, identity: tuple, session: dict | None = None)
             reset_hermes_home_override(home_token)
 
 
+def _activity_fields(session: dict | None) -> dict:
+    """Describe what the running turn is doing, from the session's own record.
+
+    ``running: true`` alone cannot tell the operator whether the model is
+    generating, a tool is executing, or the post-turn goal judge is still
+    deciding. The judge runs *after* ``message.complete``, so the transcript
+    looks finished while admission is still owned — the exact window that made
+    a normal send collide with "session busy". Additive fields; older clients
+    ignore them.
+    """
+    if not isinstance(session, dict):
+        return {}
+    activity = session.get("turn_activity")
+    if not activity:
+        return {}
+    fields: dict = {"activity": str(activity)}
+    since = session.get("activity_since")
+    if isinstance(since, (int, float)) and since > 0:
+        fields["activity_since"] = float(since)
+    inflight = session.get("inflight_turn")
+    progress = inflight.get("updated_at") if isinstance(inflight, dict) else None
+    if isinstance(progress, (int, float)) and progress > 0:
+        fields["last_progress_at"] = float(progress)
+    return fields
+
+
 def _session_info(agent, session: dict | None = None, *, lock_held: bool = False) -> dict:
     if session is None:
         for candidate in _sessions.values():
@@ -9171,6 +9231,7 @@ def _session_info(agent, session: dict | None = None, *, lock_held: bool = False
         "running": bool((session or {}).get("running") or (session or {}).get("_host_turn_request_id")
                         or (session or {}).get("_stop_pending") or (session or {}).get("_stop_uncertain")),
         "turn_started_at": turn_started_at,
+        **_activity_fields(session),
         "title": _session_live_title(session or {}, session_key) if session_key else "",
         "stored_session_id": session_key or "",
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
@@ -12067,6 +12128,31 @@ def _drain_queued_prompt_claim(rid, sid: str, session: dict, *, recovery=None):
         session["running"] = False
         return (session, claim_agent, claim_inflight, claim_window, claim_nonce, queued, generation)
     use_compute_host = _session_uses_compute_host(session)
+    require_compute_host = (
+        bool(_load_dashboard_process_isolation_config().get("require_compute_host"))
+        and not _inside_compute_host_child()
+    )
+    if not use_compute_host and require_compute_host:
+        # Opt-in dispatch-location requirement: a queued envelope that cannot
+        # reach the compute host must fail visibly here. The claim above already
+        # advanced queued_prompt to the next envelope, so only this turn is
+        # settled as a failed snapshot and the follow-up stays queued.
+        message = "compute host required but queued session cannot route to it"
+        with session["history_lock"]:
+            session["running"] = False
+            session["last_active"] = time.time()
+            _start_inflight_turn(session, queued["text"])
+            _fail_inflight_turn(
+                session,
+                message,
+                error_surface={
+                    "layer": "runtime",
+                    "code": "compute_host_dispatch_failed",
+                    "retryable": True,
+                },
+            )
+        _emit("error", sid, {"message": message})
+        return True
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
             if int(session.get("_last_stop_queue_generation", 0)) > queue_generation:
@@ -12134,6 +12220,10 @@ def _drain_queued_prompt_claim(rid, sid: str, session: dict, *, recovery=None):
             if resp.get("error"):
                 error = resp.get("error") or {}
                 message = str(error.get("message") or "queued prompt failed")
+                require_compute_host = (
+                    bool(_load_dashboard_process_isolation_config().get("require_compute_host"))
+                    and not _inside_compute_host_child()
+                )
                 delivery = (error.get("data") or {}).get("delivery")
                 failed_request = (error.get("data") or {}).get("host_request_id")
                 settled = False
@@ -12164,6 +12254,27 @@ def _drain_queued_prompt_claim(rid, sid: str, session: dict, *, recovery=None):
                     return reanchored
                 if settled:
                     _emit("error", sid, {"message": message})
+                if require_compute_host:
+                    # Dispatch-location requirement: this envelope must never be
+                    # retried inline. Settle it as a resumable failed snapshot so
+                    # the follow-up queue survives and the user sees the failure.
+                    with session["history_lock"]:
+                        session["running"] = False
+                        session["last_active"] = time.time()
+                        if not isinstance(session.get("inflight_turn"), dict):
+                            _start_inflight_turn(session, queued["text"])
+                        _fail_inflight_turn(
+                            session,
+                            message,
+                            error_surface={
+                                "layer": "runtime",
+                                "code": "compute_host_dispatch_failed",
+                                "retryable": True,
+                            },
+                        )
+                    if not settled:
+                        _emit("error", sid, {"message": message})
+                    return True
                 dispatch_failed = True
         else:
             dispatch_failed = _run_prompt_submit(rid, sid, session, queued["text"],
@@ -14320,6 +14431,34 @@ def _dispatch_autonomous_turn(
 _COALESCE_MAX_EVENTS = 8
 _COALESCE_MAX_TEXT_CHARS = 48_000
 
+# A goal parked on operator authority cannot be satisfied by any automatic
+# event, so waking the session only spends a turn re-judging the same
+# "done without evidence" verdict (observed: 14 notification-driven turns in a
+# day on one session). Requeue and re-check rather than drop — the notification
+# must still arrive once the operator completes or clears the goal.
+_AUTHORITY_HOLD_POLL_S = 5.0
+
+
+def _authority_holds_notifications(session: dict) -> bool:
+    """True when a goal is parked on operator authority (not a barrier).
+
+    Barrier precedence matters: a goal parked on a pid/session/time *is* waiting
+    for an automatic event, and holding its wakeup would deadlock the loop.
+    """
+    sid_key = str(session.get("session_key") or "")
+    if not sid_key:
+        return False
+    try:
+        from hermes_cli.goals import WAITING_FOR_AUTHORITY, GoalManager
+
+        mgr = GoalManager(session_id=sid_key)
+        if not mgr.is_active() or mgr.is_waiting():
+            return False
+        state = mgr.state
+        return bool(state is not None and state.outcome == WAITING_FOR_AUTHORITY)
+    except Exception:
+        return False
+
 
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
@@ -14481,6 +14620,30 @@ def _notification_poller_loop(
         if _dedup_key not in _emitted:
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
+
+        # An authority-parked goal must not be woken by background traffic: no
+        # automatic event can supply the completion evidence it is waiting for,
+        # so the wakeup would only re-judge the same verdict and hold the
+        # session busy again. Requeue and re-check; the notification still
+        # arrives once the goal is completed or cleared.
+        if _authority_holds_notifications(session):
+            _hold_key = f"authority-held:{sid}"
+            if _hold_key not in _emitted:
+                _emit(
+                    "status.update",
+                    sid,
+                    {
+                        "kind": "goal",
+                        "text": (
+                            "⏸ Goal is waiting for completion evidence — "
+                            "background notifications are held until then."
+                        ),
+                    },
+                )
+                _emitted.add(_hold_key)
+            process_registry.completion_queue.put(evt)
+            time.sleep(_AUTHORITY_HOLD_POLL_S)
+            continue
 
         # ── Coalesce same-session delegation completions ──
         # A backlog (overnight disconnect, or a fan-out finishing together)
@@ -15149,6 +15312,29 @@ def _prepend_note(run_message: Any, note: str) -> Any:
 
 
 _GOAL_COMPRESSION_RECOVERY_ATTEMPTS = "_goal_compression_recovery_attempts"
+_GOAL_STOP_HOLD = "_goal_suppress_after_interrupt"
+
+
+def _clear_goal_stop_hold_for_user_turn(session: dict, display_kind: str | None) -> None:
+    """A user-originated turn lifts a Stop-era goal hold.
+
+    Synthetic turns (goal continuations, notification wakes) must NOT clear it:
+    they are exactly what the hold exists to suppress. Called under
+    ``session["history_lock"]`` at turn admission.
+    """
+    if display_kind != "internal_notification":
+        session.pop(_GOAL_STOP_HOLD, None)
+
+
+def _goal_held_after_stop(session: dict) -> bool:
+    """True when a user Stop should suppress the next goal continuation.
+
+    Set by the compute host when it applies ``session.interrupt``; covers the
+    case where the run thread never observes the interrupt (a provider read
+    that cannot cancel), which otherwise let the judge re-fire immediately and
+    made Stop look broken.
+    """
+    return bool(session.get(_GOAL_STOP_HOLD))
 _GOAL_COMPRESSION_RECOVERY_LIMIT = 1
 
 
@@ -15327,6 +15513,20 @@ def _run_prompt_submit(
     history_ready = session.get("resume_history_ready")
     registered = _sessions.get(sid) is session
     with session["history_lock"]:
+        _clear_goal_stop_hold_for_user_turn(session, display_kind)
+        # What this turn IS. The client cannot infer it from `running` alone,
+        # and a synthetic turn is precisely what makes a visible transcript
+        # coexist with a busy session.
+        _synthetic_source = (
+            display_metadata.get("synthetic_source")
+            if isinstance(display_metadata, dict)
+            else None
+        )
+        if display_kind == "internal_notification":
+            session["turn_activity"] = str(_synthetic_source or "notification")
+        else:
+            session["turn_activity"] = "user"
+        session["activity_since"] = time.time()
         inflight = session.get("inflight_turn")
         admission = inflight.get("started_at") if isinstance(inflight, dict) else None
         admission_generation = int(session.get("_queued_prompt_generation", 0))
@@ -16206,9 +16406,28 @@ def _run_prompt_submit(
 
             # Compression failures are never judge input: the error text is
             # not work toward the goal, and evaluating it would spend a turn.
-            if not compression_exhausted and _is_successful_goal_turn(
-                result, status, raw
-            ):
+            #
+            # A user Stop holds the chain even when the run thread never
+            # observed the interrupt (a provider read that cannot cancel). The
+            # host sets this flag when it applies `session.interrupt`; only the
+            # next user-originated turn clears it. Without this the judge
+            # re-fires immediately and Stop looks broken.
+            goal_held_after_stop = _goal_held_after_stop(session)
+            if goal_held_after_stop:
+                _emit(
+                    "status.update",
+                    sid,
+                    {
+                        "kind": "goal",
+                        "text": (
+                            "⏸ Goal held after Stop — send a message or "
+                            "/goal resume to continue."
+                        ),
+                    },
+                )
+
+            if (not goal_held_after_stop and not compression_exhausted
+                    and _is_successful_goal_turn(result, status, raw)):
                 try:
                     from hermes_cli.goals import GoalManager
 
@@ -16229,6 +16448,11 @@ def _run_prompt_submit(
                                 _bg_procs = _gather_bg()
                             except Exception:
                                 _bg_procs = None
+                            # The judge runs after `message.complete`, so the
+                            # transcript already looks finished. Naming this
+                            # phase is what explains the remaining busy window.
+                            session["turn_activity"] = "goal_judge"
+                            session["activity_since"] = time.time()
                             decision = goal_mgr.evaluate_after_turn(
                                 raw,
                                 user_initiated=True,
@@ -16236,11 +16460,18 @@ def _run_prompt_submit(
                             )
                             verdict_msg = decision.get("message") or ""
                             if verdict_msg:
-                                _emit(
-                                    "status.update",
-                                    sid,
-                                    {"kind": "goal", "text": verdict_msg},
-                                )
+                                _goal_status_event = {
+                                    "kind": "goal",
+                                    "text": verdict_msg,
+                                }
+                                # Structured twin of the text line. The desktop
+                                # must not infer goal state by parsing prose: it
+                                # missed every ``⊙ Goal active · …`` variant and
+                                # left a stale "Goal waiting" chip on screen.
+                                _goal_payload = goal_mgr.status_payload()
+                                if _goal_payload is not None:
+                                    _goal_status_event["goal_state"] = _goal_payload
+                                _emit("status.update", sid, _goal_status_event)
                             if decision.get("should_continue"):
                                 cont_prompt = decision.get("continuation_prompt") or ""
                                 if cont_prompt:
@@ -16482,84 +16713,91 @@ def _run_prompt_submit(
             reset_transport(transport_token)
             # Clear the per-turn interim callback so a stale closure from
             # this turn can't fire during a later turn on the same agent.
-            with session["history_lock"]:
-                if ((not owns_admission() and not owns_stopped_admission())
-                        or (registered and _sessions.get(sid) is not session)
-                        or session.get("agent") is not agent
-                        or (one_turn_runtime is not None and one_turn_runtime.get("agent") is not agent)):
-                    return
-                agent.interim_assistant_callback = None
-                session["running"] = False
-                session["last_active"] = time.time()
-                if not turn_error_retained:
-                    _clear_inflight_turn(session)
-                _retire_turn_marker(session, marker_key)
-                session.pop("_auto_continue_scheduled", None)
-            # Closing bookend of the "tui prompt accepted" record above —
-            # fires on every path (success, returned error, exception,
-            # interrupt), so one accepted prompt always produces exactly one
-            # finished record. agent.session_id is re-read here because
-            # compression may have rotated it mid-turn: an accepted/finished
-            # pair whose agent_session_id changed IS a rotation trace
-            # (#86647). A missing finished record means the turn thread died
-            # without reaching this finally.
-            logger.info(
-                "tui turn finished: ui_session=%s session_key=%s "
-                "agent_session_id=%s status=%s error_retained=%s duration=%.1fs",
-                sid,
-                session.get("session_key") or "",
-                getattr(agent, "session_id", "") or "",
-                (
-                    result.get("interrupted")
-                    and "interrupted"
-                    or result.get("error")
-                    and "error"
-                    or "complete"
+            def settle_owned_turn_cleanup() -> bool:
+                with session["history_lock"]:
+                    if ((not owns_admission() and not owns_stopped_admission())
+                            or (registered and _sessions.get(sid) is not session)
+                            or session.get("agent") is not agent
+                            or (one_turn_runtime is not None and one_turn_runtime.get("agent") is not agent)):
+                        return False
+                    agent.interim_assistant_callback = None
+                    session["running"] = False
+                    session["last_active"] = time.time()
+                    if not turn_error_retained:
+                        _clear_inflight_turn(session)
+                    _retire_turn_marker(session, marker_key)
+                    session.pop("_auto_continue_scheduled", None)
+                # Closing bookend of the "tui prompt accepted" record above —
+                # fires on every path (success, returned error, exception,
+                # interrupt), so one accepted prompt always produces exactly one
+                # finished record. agent.session_id is re-read here because
+                # compression may have rotated it mid-turn: an accepted/finished
+                # pair whose agent_session_id changed IS a rotation trace
+                # (#86647). A missing finished record means the turn thread died
+                # without reaching this finally.
+                logger.info(
+                    "tui turn finished: ui_session=%s session_key=%s "
+                    "agent_session_id=%s status=%s error_retained=%s duration=%.1fs",
+                    sid,
+                    session.get("session_key") or "",
+                    getattr(agent, "session_id", "") or "",
+                    (
+                        result.get("interrupted")
+                        and "interrupted"
+                        or result.get("error")
+                        and "error"
+                        or "complete"
+                    )
+                    if isinstance(result, dict)
+                    else ("error" if turn_error_retained else "complete"),
+                    turn_error_retained,
+                    time.monotonic() - _turn_started_monotonic,
                 )
-                if isinstance(result, dict)
-                else ("error" if turn_error_retained else "complete"),
-                turn_error_retained,
-                time.monotonic() - _turn_started_monotonic,
-            )
-            # Backstop for turns that never reached a terminal frame (the
-            # frame paths retire the marker as they emit).
-            with session["history_lock"]:
-                if (_sessions.get(sid) not in (None, session) or session.get("agent") is not agent
-                        or (int(session.get("_queued_prompt_generation", 0)) != settlement_generation
-                            and not owns_stopped_admission())
-                        or (session.get("inflight_turn") is not None and not turn_error_retained)
-                        or session.get("running")):
-                    return
-                # Preserve settled-cwd semantics while separating snapshot
-                # custody from transport I/O on this non-reentrant lock.
+                # Backstop for turns that never reached a terminal frame (the
+                # frame paths retire the marker as they emit).
+                with session["history_lock"]:
+                    if (_sessions.get(sid) not in (None, session) or session.get("agent") is not agent
+                            or (int(session.get("_queued_prompt_generation", 0)) != settlement_generation
+                                and not owns_stopped_admission())
+                            or (session.get("inflight_turn") is not None and not turn_error_retained)
+                            or session.get("running")):
+                        return False
+                    # Preserve settled-cwd semantics while separating snapshot
+                    # custody from transport I/O on this non-reentrant lock.
+                    try:
+                        _reconcile_session_cwd_from_terminal(session)
+                    except Exception:
+                        logger.debug("failed to reconcile settled session cwd", exc_info=True)
+                    settled_info = _session_info(agent, session, lock_held=True)
+                    projection_owner = _capture_lifecycle_projection_owner(session, sid)
+                settled_execution_token = _turn_outcome_execution.set((session, sid,
+                    execution[2] if execution is not None else None))
+                projection_token = _lifecycle_projection_owner.set(projection_owner)
+                settled_transport_token = bind_transport(admission_transport)
                 try:
-                    _reconcile_session_cwd_from_terminal(session)
-                except Exception:
-                    logger.debug("failed to reconcile settled session cwd", exc_info=True)
-                settled_info = _session_info(agent, session, lock_held=True)
-                projection_owner = _capture_lifecycle_projection_owner(session, sid)
-            settled_execution_token = _turn_outcome_execution.set((session, sid,
-                execution[2] if execution is not None else None))
-            projection_token = _lifecycle_projection_owner.set(projection_owner)
-            settled_transport_token = bind_transport(admission_transport)
-            try:
-                _emit("session.info", sid, settled_info)
-            finally:
-                reset_transport(settled_transport_token)
-                _lifecycle_projection_owner.reset(projection_token)
-                _turn_outcome_execution.reset(settled_execution_token)
-            with session["history_lock"]:
-                if (_sessions.get(sid) not in (None, session) or session.get("agent") is not agent
-                        or int(session.get("_queued_prompt_generation", 0)) != settlement_generation
-                        or session.get("running")
-                        or (session.get("inflight_turn") is not None and not turn_error_retained)):
-                    return
-                deferred_teardown = session.pop("_run_checkpoint_teardown_deferred", None)
-                deferred_finalize = session.pop("_run_checkpoint_finalize_deferred", None)
-            if deferred_teardown:
-                _teardown_session(session, end_reason=deferred_teardown)
-            elif deferred_finalize:
-                _finalize_session(session, end_reason=deferred_finalize)
+                    _emit("session.info", sid, settled_info)
+                finally:
+                    reset_transport(settled_transport_token)
+                    _lifecycle_projection_owner.reset(projection_token)
+                    _turn_outcome_execution.reset(settled_execution_token)
+                with session["history_lock"]:
+                    if (_sessions.get(sid) not in (None, session) or session.get("agent") is not agent
+                            or int(session.get("_queued_prompt_generation", 0)) != settlement_generation
+                            or session.get("running")
+                            or (session.get("inflight_turn") is not None and not turn_error_retained)):
+                        return False
+                    deferred_teardown = session.pop("_run_checkpoint_teardown_deferred", None)
+                    deferred_finalize = session.pop("_run_checkpoint_finalize_deferred", None)
+                if deferred_teardown:
+                    _teardown_session(session, end_reason=deferred_teardown)
+                elif deferred_finalize:
+                    _finalize_session(session, end_reason=deferred_finalize)
+                return True
+
+            turn_cleanup_completed = settle_owned_turn_cleanup()
+
+        if not turn_cleanup_completed:
+            return
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;

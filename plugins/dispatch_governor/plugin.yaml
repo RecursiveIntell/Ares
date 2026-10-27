@@ -1,0 +1,6 @@
+name: dispatch-governor
+version: 1.0.0
+description: "Persist the exact physical-send observation and terminal outcome on the canonical execution record. Observe mode by default; enforce mode denies a send when the pre-send marker cannot be committed."
+author: RecursiveIntell
+kind: standalone
+provides_hooks: []

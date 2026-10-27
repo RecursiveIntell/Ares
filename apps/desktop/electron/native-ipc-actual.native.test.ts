@@ -74,6 +74,7 @@ test.skipIf(process.platform !== 'linux')(
         XDG_CACHE_HOME: path.join(home, '.cache'),
         XDG_RUNTIME_DIR: root,
         P2_FIXTURE_PYTHON: fixturePython,
+        P1A_EVIDENCE_DIR: evidence,
         NATIVE_PRELOAD_BUNDLE: preload,
         NATIVE_RENDERER_BUNDLE: renderer,
         NATIVE_WS_VERSION: wsVersion
@@ -88,6 +89,16 @@ test.skipIf(process.platform !== 'linux')(
     try {
       const code = await new Promise<number | null>((resolve, reject) => {
         const timer = setTimeout(() => {
+          try {
+            fs.writeFileSync(path.join(evidence!, 'native-ipc-timeout.log'), logs.join(''))
+            fs.writeFileSync(
+              path.join(evidence!, 'native-ipc-timeout.json'),
+              JSON.stringify({ args, pid: child.pid, wsVersion }, null, 2)
+            )
+          } catch {
+            // Preserve the original deadline failure even if artifact capture fails.
+          }
+
           try {
             process.kill(-child.pid!, 'SIGKILL')
           } catch {

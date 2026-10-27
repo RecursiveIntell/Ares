@@ -1624,6 +1624,11 @@ DEFAULT_CONFIG = {
         "turn_isolation": False,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
+        # Opt-in dispatch-location requirement (default off). When true,
+        # prompt.submit refuses a turn that cannot route to a compute-host
+        # child instead of silently running it inline. This controls WHERE a
+        # turn runs; it is NOT an OS sandbox and proves no isolation.
+        "require_compute_host": False,
         # Finite execution bound for an already-authorized turn after the last
         # Desktop/WebSocket viewer detaches. Detachment is not cancellation;
         # explicit Stop still interrupts immediately. Runtime reads this from

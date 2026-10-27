@@ -156,6 +156,8 @@ export const ja = defineLocale({
       elevenLabsNeedsKey: 'ElevenLabs STT には ELEVENLABS_API_KEY が必要です。',
       elevenLabsRejectedKey: 'ElevenLabs が API キーを拒否しました (401)。',
       diskFull: 'ディスク容量不足です — 空きを作ってからもう一度お試しください。',
+      sessionBusyRetry: 'セッションがバックグラウンド処理を完了していませんでした — メッセージは送信されていません。もう一度送信してください。',
+      sessionBusyQueued: 'セッションが使用中でした — メッセージはキューに入り、現在のターンの後に実行されます。',
       gatewayAuthFailed: 'ゲートウェイ認証に失敗しました — API_SERVER_KEY を確認してください。',
       methodNotAllowed:
         'デスクトップバックエンドがそのリクエストを拒否しました (405 Method Not Allowed)。Hermes Desktop を再起動してください。',
@@ -2023,6 +2025,7 @@ export const ja = defineLocale({
     openDirective: '開く',
     queueMessage: 'メッセージをキューに入れる',
     stop: '停止',
+      stopAgain: 'もう一度停止 — このターンはまだ実行中の可能性があります',
     send: '送信',
     speaking: '話しています',
     transcribing: '文字起こし中',
@@ -2081,6 +2084,8 @@ export const ja = defineLocale({
     attachments: count => `${count} 件の添付`,
     editingInComposer: 'コンポーザーで編集中',
     editingQueuedInComposer: 'コンポーザーでキュー済みターンを編集中',
+      queuedBehindBusy: '現在のターンが終わり次第実行されます。',
+      queuedBehindPrompt: '上のプロンプトに回答すると実行されます。',
     queueEdit: '編集',
     queueSendNext: '次に送信',
     queueSteer: 'ステア — 現在のターンを今すぐ修正',
@@ -2804,6 +2809,9 @@ export const ja = defineLocale({
       loadingSession: 'セッションを読み込み中',
       showEarlier: '以前のメッセージを表示',
       loadingResponse: 'Hermes が応答を読み込み中',
+      activityBackground: 'バックグラウンド更新を処理中',
+      activityGoalCheck: 'ゴールを確認中',
+      activityGoalStep: 'ゴールに向けて作業中',
       resumeWhenBackgroundDone: count =>
         count === 1
           ? 'バックグラウンドタスクの完了後に再開します'

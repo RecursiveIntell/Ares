@@ -11,8 +11,10 @@ name: OS-specific tests
 # reproducing any of the OS behaviour that branch exists for. This workflow
 # is where those markers actually execute:
 #
-#   macos    → ``-m macos_only``     on macos-latest
 #   windows  → ``-m windows_only``   on windows-latest
+#   macos    → moved to tests-macos.yml (advisory, NOT part of the required
+#              gate: macos-latest runners are scarce and a starved job was
+#              failing the required check for unrelated, Linux-only changes).
 #
 # Deliberately NOT sliced. The marked set is small (tens of tests, not
 # thousands), so one plain ``pytest`` process per OS is both faster and far
@@ -44,9 +46,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macOS-only tests
-            runner: macos-latest
-            marker: macos_only
           - name: Windows-only tests
             runner: windows-latest
             marker: windows_only

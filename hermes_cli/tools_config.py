@@ -6114,7 +6114,30 @@ def _apply_mcp_change(config: dict, targets: List[str], action: str) -> Set[str]
     return failed_servers
 
 
-def _print_tools_list(enabled_toolsets: set, mcp_servers: dict, platform: str = "cli"):
+def _config_only_toolset_status(ts_key: str, config: Optional[dict] = None) -> Optional[bool]:
+    """Report a config-only toolset's own switch, not platform membership.
+
+    Config-only capabilities (``_CONFIG_ONLY_TOOLSETS``) ship zero tool schemas
+    and are never members of ``platform_toolsets`` -- their on/off switch lives
+    in their own config section (e.g. ``stt.enabled``). Reporting them by
+    membership therefore always renders them disabled, contradicting the config
+    the user actually set.
+
+    Returns ``None`` for anything that is not a config-only toolset, or when the
+    section carries no explicit ``enabled`` key, so the caller falls back to
+    membership.
+    """
+    if ts_key not in _CONFIG_ONLY_TOOLSETS:
+        return None
+    section = config if config is not None else load_config()
+    own = (section or {}).get(ts_key)
+    if isinstance(own, dict) and "enabled" in own:
+        return bool(own["enabled"])
+    return None
+
+
+def _print_tools_list(enabled_toolsets: set, mcp_servers: dict, platform: str = "cli",
+                      config: Optional[dict] = None):
     """Print a summary of enabled/disabled toolsets and MCP tool filters."""
     effective_all = _get_effective_configurable_toolsets()
     effective = [
@@ -6127,7 +6150,9 @@ def _print_tools_list(enabled_toolsets: set, mcp_servers: dict, platform: str = 
     for ts_key, label, _ in effective:
         if ts_key not in builtin_keys:
             continue
-        status = (color("✓ enabled", Colors.GREEN) if ts_key in enabled_toolsets
+        override = _config_only_toolset_status(ts_key, config)
+        is_on = override if override is not None else (ts_key in enabled_toolsets)
+        status = (color("✓ enabled", Colors.GREEN) if is_on
                   else color("✗ disabled", Colors.RED))
         print(f"  {status}  {ts_key}  {color(label, Colors.DIM)}")
 
@@ -6194,7 +6219,7 @@ def tools_disable_enable_command(args):
 
     if action == "list":
         _print_tools_list(_get_platform_tools(config, platform, include_default_mcp_servers=False),
-                          config.get("mcp_servers") or {}, platform)
+                          config.get("mcp_servers") or {}, platform, config)
         return
 
     targets: List[str] = args.names
