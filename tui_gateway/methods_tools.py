@@ -6,6 +6,24 @@ are rebound onto server.py's globals at install time — see method_ctx.py.
 
 from .method_ctx import HandlerRegistry
 
+from hermes_cli.goals import GoalPersistenceCause
+
+
+def _goal_persistence_message(cause: str) -> str:
+    """Per-cause user-facing message for a failed goal persistence (F0.1)."""
+    cause = (cause or "").strip()
+    if cause == GoalPersistenceCause.UNAVAILABLE:
+        return (
+            "Goal set in this session but NOT yet persisted (storage warming up). "
+            "It will flush automatically; if the app restarts before then it is lost. "
+            "Do not rely on /goal status alone to verify."
+        )
+    if cause == GoalPersistenceCause.CONFLICT:
+        return "Another writer changed the goal concurrently — check /goal status and retry."
+    if cause == GoalPersistenceCause.INVALID_SESSION:
+        return "No live session to attach the goal to."
+    return "Goal persistence failed — please retry."
+
 _registry = HandlerRegistry()
 method = _registry.method
 _profile_scoped = _registry.profile_scoped
@@ -907,7 +925,9 @@ def _(rid, params: dict) -> dict:
         except ValueError as exc:
             return _err(rid, 4004, f"invalid goal: {exc}")
         except RuntimeError as exc:
-            return _err(rid, 5032, f"Goal persistence unconfirmed: {exc}")
+            cause = getattr(exc, "cause", None) or "write_failed"
+            detail = _goal_persistence_message(cause)
+            return _err(rid, 5032, detail or f"Goal persistence unconfirmed: {exc}")
 
         notice = (
             f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}\n"

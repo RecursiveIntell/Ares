@@ -68,6 +68,7 @@ from agent.turn_context import (
 )
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.goals import has_nonterminal_goal_for_session, invalidate_nonterminal_goal_cache
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -7062,6 +7063,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key, max_active_age=_bg_max_age_seconds,
             ),
+            # F3.5 (goal-loop plan): standing-goal presence guard. The key is
+            # the DB session id (the goal rows' namespace) — the same id
+            # GoalManager is constructed with at gateway/run.py:22046.
+            has_nonterminal_goal_fn=has_nonterminal_goal_for_session,
         )
         # One enforced loop-side boundary for the synchronous SessionStore.
         # Sync helpers keep using ``session_store`` directly; async gateway

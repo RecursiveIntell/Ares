@@ -279,7 +279,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             // was reopened (#80348). Mirror the output into the store exactly
             // like the plain-output path does.
             if (name === 'goal' && dispatch.output) {
-              applyGoalStatusText(sessionId, dispatch.output)
+              applyGoalStatusText(sessionId, dispatch.output, { runtimeId: sessionId, mapKey: storedSessionId ?? sessionId })
             }
 
             renderSlashOutput(dispatch.output ?? '(no output)')
@@ -306,7 +306,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             // runs. Seed the goal store from the notice so the indicator shows
             // the active goal right away instead of after the first turn.
             if (name === 'goal') {
-              applyGoalStatusText(sessionId, dispatch.notice.trim())
+              applyGoalStatusText(sessionId, dispatch.notice.trim(), { runtimeId: sessionId, mapKey: storedSessionId ?? sessionId })
             }
           }
 
@@ -397,7 +397,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // cleared." …). Mirror it into the goal store so the composer
           // indicator tracks pause/resume/clear immediately.
           if (name === 'goal' && output?.output) {
-            applyGoalStatusText(sessionId, output.output)
+            applyGoalStatusText(sessionId, output.output, { runtimeId: sessionId, mapKey: storedSessionId ?? sessionId })
           }
 
           renderSlashOutput(output?.warning ? `warning: ${output.warning}\n${body}` : body)

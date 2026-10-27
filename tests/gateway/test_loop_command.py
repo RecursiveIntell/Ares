@@ -136,8 +136,8 @@ async def test_gateway_loop_goal_note_after_explicit_retry_of_slow_db_init(tmp_p
     goals._DB_CACHE.clear()
     # Tolerate the deferred-write buffer being absent so an unfixed tree
     # fails on the real symptom (missing note) instead of an AttributeError.
-    if hasattr(goals, "_DEFERRED_GOAL_WRITES"):
-        goals._DEFERRED_GOAL_WRITES.clear()
+    if hasattr(goals, "_MEMORY_DEFERRED_GOAL_WRITES"):
+        goals._MEMORY_DEFERRED_GOAL_WRITES.clear()
 
     try:
         # Cold cache + slow init: this write cannot land inside the window.
@@ -151,7 +151,7 @@ async def test_gateway_loop_goal_note_after_explicit_retry_of_slow_db_init(tmp_p
         db = await asyncio.to_thread(goals._get_session_db)
         assert db is not None
         assert goals.load_goal("sid-gateway-loop") is None
-        assert not goals._DEFERRED_GOAL_WRITES
+        assert not goals._MEMORY_DEFERRED_GOAL_WRITES
         manager.set("finish the migration")
 
         runner = _make_runner()
@@ -163,8 +163,8 @@ async def test_gateway_loop_goal_note_after_explicit_retry_of_slow_db_init(tmp_p
         assert goals.GoalManager("sid-gateway-loop").state is not None
     finally:
         goals._DB_CACHE.clear()
-        if hasattr(goals, "_DEFERRED_GOAL_WRITES"):
-            goals._DEFERRED_GOAL_WRITES.clear()
+        if hasattr(goals, "_MEMORY_DEFERRED_GOAL_WRITES"):
+            goals._MEMORY_DEFERRED_GOAL_WRITES.clear()
 
 
 @pytest.mark.asyncio

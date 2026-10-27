@@ -9,7 +9,7 @@ from hermes_cli import goals
 def owner(tmp_path, monkeypatch):
     db = SessionDB(tmp_path / "state.db")
     monkeypatch.setattr(goals, "_get_session_db", lambda: db)
-    monkeypatch.setattr(goals, "_DEFERRED_GOAL_WRITES", {})
+    monkeypatch.setattr(goals, "_MEMORY_DEFERRED_GOAL_WRITES", {})
     yield db
     db.close()
 
@@ -41,14 +41,30 @@ def test_old_goal_cannot_replace_new_goal(owner):
     assert goals.load_goal("s").goal_id == second.goal_id
 
 
-def test_deferred_old_goal_cannot_overwrite_canonical_clear(owner):
+def test_deferred_old_goal_cannot_overwrite_canonical_clear(owner, monkeypatch, tmp_path):
+    """A journalled stale write is settled-as-superseded by the canonical clear.
+
+    The journal is per-PID; point this process's journal at tmp_path by
+    injecting a fake home and temporarily overriding the path helpers.
+    """
     manager = goals.GoalManager("s")
     original = goals.GoalState.from_json(manager.set("first").to_json())
     manager.clear()
-    goals._DEFERRED_GOAL_WRITES[("isolated", "s")] = {"payload": original.to_json(), "at": 0}
-    goals._flush_deferred_goal_writes("isolated", owner)
+    # Simulate a journalled stale write owned by a DEAD process in owner's home.
+    fake_home = str(tmp_path / "fake-home")
+    journal_dir = goals._deferred_journal_dir(fake_home)
+    import os as _os
+    _os.makedirs(journal_dir, exist_ok=True)
+    dead_pid = _os.getpid() + 4321  # extremely unlikely to exist; verified below
+    assert goals._process_alive(dead_pid) is False
+    record = {"kind": "write", "id": "j1", "session_id": "s",
+              "payload": original.to_json(), "at": 0}
+    with open(goals._deferred_journal_dir(fake_home) + f"/{dead_pid}.jsonl", "w") as f:
+        f.write(__import__("json").dumps(record) + "\n")
+    goals._flush_deferred_goal_writes(fake_home, owner)
     assert goals.load_goal("s").status == "cleared"
-    assert goals._DEFERRED_GOAL_WRITES == {}
+    # record settled: nothing live remains in that journal
+    assert goals._parse_journal_lines(goals._deferred_journal_dir(fake_home) + f"/{dead_pid}.jsonl") == []
 
 
 def test_set_refuses_concurrent_replacement_without_false_success(owner, monkeypatch):

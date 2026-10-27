@@ -373,9 +373,17 @@ def test_legacy_migration_is_idempotent_and_preserves_budget(monkeypatch, tmp_pa
 def test_deferred_flush_retains_failed_write_and_removes_only_after_success(monkeypatch, tmp_path):
     mgr = _manager(monkeypatch, tmp_path, sid="deferred-flush")
     state = mgr.set("retain deferred state")
-    goals._DEFERRED_GOAL_WRITES.clear()
-    goals._defer_goal_write("deferred-flush", state)
-    home = next(iter(goals._DEFERRED_GOAL_WRITES))[0]
+    # Journal the write via the module-level path (fake home = tmp_path), the
+    # same records _flush_deferred_goal_writes drains.
+    goals._MEMORY_DEFERRED_GOAL_WRITES.clear()
+    home = str(tmp_path)
+    goals._journal_append(home, {
+        "kind": "write",
+        "id": "rec-1",
+        "session_id": "deferred-flush",
+        "payload": state.to_json(),
+        "at": 0,
+    })
 
     class FailingDB:
         def get_meta(self, _key):
@@ -385,7 +393,9 @@ def test_deferred_flush_retains_failed_write_and_removes_only_after_success(monk
             raise OSError("injected flush failure")
 
     goals._flush_deferred_goal_writes(home, FailingDB())
-    assert (home, "deferred-flush") in goals._DEFERRED_GOAL_WRITES
+    # unsettled: journal record still live (not tombstoned)
+    assert (home, "deferred-flush") not in goals._MEMORY_DEFERRED_GOAL_WRITES
+    assert goals._parse_journal_lines(goals._deferred_journal_path(home))
 
     class WorkingDB:
         def __init__(self):
@@ -402,7 +412,9 @@ def test_deferred_flush_retains_failed_write_and_removes_only_after_success(monk
     db = WorkingDB()
     goals._flush_deferred_goal_writes(home, db)
     assert db.writes
-    assert (home, "deferred-flush") not in goals._DEFERRED_GOAL_WRITES
+    assert (home, "deferred-flush") not in goals._MEMORY_DEFERRED_GOAL_WRITES
+    # journal record tombstoned and file cleaned up
+    assert goals._parse_journal_lines(goals._deferred_journal_path(home)) == []
 
 
 def test_failed_atomic_goal_migration_keeps_parent_and_no_child(monkeypatch, tmp_path):
