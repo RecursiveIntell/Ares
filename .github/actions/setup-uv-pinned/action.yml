@@ -19,7 +19,12 @@ runs:
         curl -LsSf "https://astral.sh/uv/${{ inputs.uv-version }}/install.sh" -o "$tmp"
         sh "$tmp"
         rm -f "$tmp"
-        if ! command -v uv >/dev/null 2>&1; then
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-        fi
+        # Prepend the install dir to THIS step's PATH (a bare `uv --version`
+        # below must resolve the fresh pin even when $HOME/.local/bin was not
+        # already on PATH) and register it unconditionally for later steps,
+        # ahead of any pre-existing uv. The astral.sh installer's default
+        # install dir is $HOME/.local/bin.
+        UV_INSTALL_BIN="$HOME/.local/bin"
+        export PATH="$UV_INSTALL_BIN:$PATH"
+        echo "$UV_INSTALL_BIN" >> "$GITHUB_PATH"
         uv --version
