@@ -94,3 +94,20 @@ class TestContextVetoNotRetryable:
         assert surface is not None
         assert surface["retryable"] is True
         assert "context_veto" not in surface
+
+    def test_nonapi_preflight_text_is_non_retryable(self):
+        # Verifier run-2 medium finding: a NON-API exception carrying the
+        # Hermes-owned exhausted-preflight sentinel (re-raised as a plain
+        # RuntimeError by a transport wrapper) must not surface as
+        # gateway/retryable=True — same deterministic-resend rule.
+        exc = RuntimeError("CONTEXT_PREFLIGHT_EXHAUSTED")
+        surface = build_error_surface_from_exception(exc)
+        assert surface is not None
+        assert surface["code"] == "context_preflight_exhausted"
+        assert surface["retryable"] is False
+
+    def test_nonapi_lineage_text_is_non_retryable(self):
+        exc = RuntimeError("compact-v2 failed [lineage_integrity_mismatch]")
+        surface = build_error_surface_from_exception(exc)
+        assert surface is not None
+        assert surface["retryable"] is False

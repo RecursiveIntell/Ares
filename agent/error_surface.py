@@ -278,6 +278,20 @@ def build_error_surface_from_exception(
                     provider,
                     model,
                 )
+            if "CONTEXT_PREFLIGHT_EXHAUSTED" in message:
+                # Verifier follow-up (2026-10-26, run-2 medium finding): a
+                # non-API exception carrying the exhausted-preflight text
+                # (e.g. the marker string re-raised by a transport wrapper
+                # as RuntimeError) still surfaced gateway/retryable=True.
+                # The message is a Hermes-owned sentinel, not provider
+                # text — whichever type carries it, the resend answer is no.
+                return _surface(
+                    LAYER_RUNTIME,
+                    "context_preflight_exhausted",
+                    False,
+                    provider,
+                    model,
+                )
             if "lineage_integrity_mismatch" in message:
                 return _surface(
                     LAYER_RUNTIME, "lineage_integrity_mismatch", False, provider, model
