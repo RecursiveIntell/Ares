@@ -105,8 +105,19 @@ def _has_real_code_execution(doc: dict) -> bool:
                 r"(?:sudo\s+(?:-\S+(?:\s+\S+)*\s+)*|--\s+)*"
                 r"(?:env\s+|nice\s+|busybox\s+|xargs\s+)*"
             )
-            if re.search(rf"\b(?:curl|wget)\b[^|]*\|\s*{_wrapper}{_interp}", run_text):
-                return True
+            # Post-pipe detection: once a fetcher pipes anywhere, an
+            # interpreter appearing ANYWHERE downstream counts — wrappers with
+            # flags (env -i sh, xargs -I{} sh -c), filters (base64 -d | sh),
+            # and path-qualified sudo (/usr/bin/sudo bash) all covered.
+            interp_any = (
+                r"(?:[\w./-]+/)?(?:ba|z|da|k)?sh\b"
+                r"|(?:[\w./-]+/)?python[\d.]*\b|(?:[\w./-]+/)?(?:node|ruby|perl|php|lua|deno|bun)\b"
+            )
+            for fetcher in (r"\b(?:curl|wget)\b", r"\bgh\s+api\b"):
+                if re.search(rf"{fetcher}[^|\n]*\|", run_text):
+                    post = run_text.split("|", 1)[1]
+                    if re.search(rf"(?:^|[\s;&|(]){interp_any}", post, re.S):
+                        return True
             if re.search(r"\b(?:ba|z|da|k)?sh\s+(?:-\w+\s+)*<\s*[(<]\s*\(?\s*(?:curl|wget)\b", run_text):
                 return True
             if re.search(r"\b(?:source|\.)\s*<(?:\(|<)\s*(?:curl|wget)\b", run_text):
@@ -117,12 +128,15 @@ def _has_real_code_execution(doc: dict) -> bool:
                 return True
             # download-then-run: the fetcher appears anywhere in the command and
             # the interpreter follows a separator (&&, ;) or a bare newline —
-            # greedy + re.S so multi-line run blocks are covered.
+            # greedy + re.S so multi-line run blocks are covered. Executing the
+            # downloaded file by path (chmod +x && ./s.sh) is the same class.
             if re.search(r"\b(?:curl|wget)\b.*&&\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", run_text, re.S):
                 return True
             if re.search(r"\b(?:curl|wget)\b.*;\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", run_text, re.S):
                 return True
             if re.search(r"\b(?:curl|wget)\b.*\n\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b", run_text, re.S):
+                return True
+            if re.search(r"\b(?:curl|wget)\b.*&&.*(?:\./[\w.-]+|chmod\s+\+x)", run_text, re.S):
                 return True
             # Arbitrary package execution: npx -y / pnpm dlx / yarn dlx / bunx /
             # uvx / pipx run fetch and execute a package; pip/uv-pip installs
@@ -183,7 +197,38 @@ def check(workflow_dir: Path = WF_DIR) -> list[str]:
         if not (PR_EVENTS & events):
             continue  # non-PR flows are sanctioned write contexts (out of scope)
         if not _has_real_code_execution(doc):
-            continue  # activity-only automation; never executes PR code
+            # Activity-only automation (e.g. label reruns) never executes PR
+            # code, but it still holds a trusted token: an explicit minimal
+            # map and the write-scope refusal apply regardless. Code-exec
+            # gates only the FOREIGN-code rules (remote fetch, SARIF caller
+            # caps, package executors).
+            perms0 = doc.get("permissions")
+            if perms0 is None:
+                findings.append(
+                    f"{path.name}: PR-triggered workflow declares no workflow-level "
+                    f"permissions (inherits repo defaults; declare an explicit minimal map)"
+                )
+            elif isinstance(perms0, dict):
+                for scope in sorted(perms0):
+                    if scope not in (WORKFLOW_OK | JOB_WRITE_ALLOWED):
+                        findings.append(
+                            f"{path.name}: workflow-level scope '{scope}' is outside the minimal map "
+                            f"{sorted(WORKFLOW_OK | JOB_WRITE_ALLOWED)}"
+                        )
+                # Activity-only flows may keep operational write scopes
+                # (actions: write for run reruns, checks: write for statuses) —
+                # they never touch PR code. contents: write is refused on EVERY
+                # PR-family workflow: it can push to the PR branch.
+                for scope, level in sorted(perms0.items()):
+                    if level == "write" and scope in ("contents", "security-events"):
+                        findings.append(
+                            f"{path.name}: workflow-level '{scope}: write' refused on a PR-triggered "
+                            f"workflow (PR flows must never hold {scope} writes; "
+                            f"writes belong in workflow_run flows)"
+                        )
+            else:
+                findings.append(f"{path.name}: workflow-level permissions '{perms0}' is not an explicit minimal map")
+            continue
 
         perms = doc.get("permissions")
         if perms is None:
