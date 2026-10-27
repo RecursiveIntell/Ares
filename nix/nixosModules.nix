@@ -152,13 +152,26 @@
 
         # Python 3.12 venv — gives the agent a writable Python with pip.
         # --seed includes pip/setuptools so bare `pip install` works.
+        # Reviewed-range admission (uv-pin contract): the uv binary may run
+        # only if its version is inside [0.9.28, 0.13.0); otherwise the venv
+        # setup is skipped for this activation (the uv install above just
+        # placed the reviewed 0.12.24, so a stale binary means a persistent
+        # home kept an older one and must be repaired by the user).
         _UV_BIN="$TARGET_HOME/.local/bin/uv"
         if [ ! -d "$TARGET_HOME/.venv" ] && [ -x "$_UV_BIN" ]; then
-          su -s /bin/sh "$TARGET_USER" -c "
-            export PATH=\"\$HOME/.local/bin:\$PATH\"
-            uv python install 3.12
-            uv venv --python 3.12 --seed \"\$HOME/.venv\"
-          " || true
+          _UV_OK="$(su -s /bin/sh "$TARGET_USER" -c "\"$_UV_BIN\" --version" 2>/dev/null || true)"
+          case "$_UV_OK" in
+            uv\ 0.9.2[89]|uv\ 0.9.3[0-9]|uv\ 0.1[0-2].*)
+              su -s /bin/sh "$TARGET_USER" -c "
+                export PATH=\"\$HOME/.local/bin:\$PATH\"
+                uv python install 3.12
+                uv venv --python 3.12 --seed \"\$HOME/.venv\"
+              " || true
+              ;;
+            *)
+              echo "uv at $_UV_BIN is outside the reviewed range [0.9.28, 0.13.0) ($_UV_OK); skipping venv setup" >&2
+              ;;
+          esac
         fi
 
         # Put the agent venv first on PATH so python/pip resolve to writable copies

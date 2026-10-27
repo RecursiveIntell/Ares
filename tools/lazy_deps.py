@@ -755,7 +755,9 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
             # is never run here (no silent side-effect install either).
             uv_bin = resolve_uv_admitted()
         except Exception:
-            uv_bin = shutil.which("uv")
+            # Lookup failed entirely: the pip tier covers it. Never run an
+            # unadmitted PATH uv (round-9 public finding).
+            uv_bin = None
         if uv_bin:
             try:
                 r = subprocess.run(
