@@ -1039,6 +1039,10 @@ class TestInstallCli:
         import types as _types
         fake = _types.ModuleType("hermes_cli.managed_uv")
         fake.ensure_uv = lambda **kw: str(uv)
+        # Admission (uv-pin contract): the fake uv reports an in-range version.
+        fake.resolve_uv_admitted = lambda **kw: str(uv)
+        fake.resolve_uv = lambda: str(uv)
+        fake._uv_version_tuple = lambda p: (0, 12, 24)
         monkeypatch.setitem(_sys.modules, "hermes_cli.managed_uv", fake)
         ok, msg = bu_cli.install_cli()
         assert ok is True, msg
@@ -1055,6 +1059,10 @@ class TestInstallCli:
         import types as _types
         fake = _types.ModuleType("hermes_cli.managed_uv")
         fake.ensure_uv = lambda **kw: str(uv)
+        # Admission (uv-pin contract): the fake uv reports an in-range version.
+        fake.resolve_uv_admitted = lambda **kw: str(uv)
+        fake.resolve_uv = lambda: str(uv)
+        fake._uv_version_tuple = lambda p: (0, 12, 24)
         monkeypatch.setitem(_sys.modules, "hermes_cli.managed_uv", fake)
         ok, msg = bu_cli.install_cli()
         assert ok is False
