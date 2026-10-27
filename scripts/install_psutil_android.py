@@ -56,7 +56,7 @@ def _resolve_install_cmd(pip_arg: str | None, prefer_uv: bool) -> list[str]:
         if not uv:
             return None
         try:
-            out = subprocess.run([uv, "--version"], capture_output=True, text=True,
+            out = subprocess.run([uv, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace",
                                  encoding="utf-8", errors="replace", timeout=15, check=False).stdout
         except (OSError, subprocess.TimeoutExpired):
             return None
