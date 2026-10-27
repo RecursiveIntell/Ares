@@ -3,7 +3,7 @@ import { afterEach, expect, test, vi } from 'vitest'
 import type { NativeSocketBridge, NativeSocketEvent, NativeSocketOpen } from '../../electron/native-socket-contract'
 
 import { HermesGateway } from './client'
-import { NativeRendererSocket, nativeRouteUrl, resolveDesktopGatewayDial } from './native-socket'
+import { nativeCloseDiagnostic, NativeRendererSocket, nativeRouteUrl, resolveDesktopGatewayDial } from './native-socket'
 
 function fixture() {
   let listener: ((event: NativeSocketEvent) => void) | undefined
@@ -68,7 +68,11 @@ test('synchronous CONNECTING attaches listeners before async open, preserves tex
   const open = vi.fn()
   const removed = vi.fn()
   const frames: unknown[] = []
+  let closeDiagnostic: ReturnType<typeof nativeCloseDiagnostic> = null
   socket.addEventListener('open', open, { once: true })
+  socket.addEventListener('close', event => {
+    closeDiagnostic = nativeCloseDiagnostic(event)
+  })
   socket.addEventListener('message', removed)
   socket.removeEventListener('message', removed)
   socket.onmessage = event => frames.push(event.data)
@@ -85,6 +89,7 @@ test('synchronous CONNECTING attaches listeners before async open, preserves tex
   expect(f.bridge.ack).toHaveBeenCalledTimes(2)
   f.emit({ type: 'close', code: 4001, reason: 'synthetic close', wasClean: true })
   expect(socket.readyState).toBe(3)
+  expect(closeDiagnostic).toEqual({ channel: 'tts', phase: 'native_close', sequence: 4 })
   expect(f.unsubscribe).toHaveBeenCalledOnce()
 })
 test('pending close cancels by correlation; late handle/open cannot revive adapter', async () => {

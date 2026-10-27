@@ -147,6 +147,54 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
 
+    @patch("agent.prompt_builder.build_context_files_prompt", return_value="")
+    def test_workspace_context_receives_child_context_length(self, build_context):
+        _build_child_system_prompt(
+            "Inspect the workspace",
+            workspace_path="/tmp/workspace",
+            context_length=200_000,
+        )
+
+        build_context.assert_called_once_with(
+            cwd="/tmp/workspace",
+            skip_soul=True,
+            context_length=200_000,
+        )
+
+    def test_child_agent_resolves_prompt_window_from_effective_route(self):
+        parent = _make_mock_parent()
+        parent._config_context_length = None
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._resolve_workspace_hint", return_value="/tmp/workspace"),
+            patch("tools.delegate_tool._build_child_system_prompt", return_value="child prompt") as prompt_builder,
+            patch("agent.model_metadata.get_model_context_length", return_value=200_000) as resolve_window,
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Inspect",
+                context=None,
+                toolsets=None,
+                model="gpt-6-luna",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="openai-codex",
+                override_base_url="https://chatgpt.com/backend-api/codex",
+                override_api_key="test-token",
+            )
+
+        resolve_window.assert_called_once_with(
+            "gpt-6-luna",
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_key="test-token",
+            provider="openai-codex",
+            config_context_length=None,
+        )
+        self.assertEqual(prompt_builder.call_args.kwargs["context_length"], 200_000)
+
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])

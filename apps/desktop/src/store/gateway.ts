@@ -1,7 +1,7 @@
 import { type ConnectionState, type GatewayEvent, registryBackendScopeKey } from '@hermes/shared'
 import { atom } from 'nanostores'
 
-import { nativeRoute, resolveDesktopGatewayDial } from '@/api/native-socket'
+import { nativeCloseDiagnostic, nativeRoute, resolveDesktopGatewayDial } from '@/api/native-socket'
 import type { HermesConnection } from '@/global'
 import { HermesGateway, setApiRequestConnection } from '@/hermes'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
@@ -637,8 +637,22 @@ function isMissingProfileError(error: unknown): boolean {
 }
 
 function createSecondary(profile: string, connectionId: null | string = null): Secondary {
-  const gateway = new HermesGateway()
   const scope = registryBackendScopeKey(connectionId, profile)
+
+  const gateway = new HermesGateway({
+    onSocketClose(event) {
+      const diagnostic = nativeCloseDiagnostic(event)
+
+      console.warn('[gateway] secondary socket closed', {
+        code: event.code,
+        native: diagnostic,
+        phase: diagnostic?.phase ?? 'websocket_close',
+        scope
+      })
+
+      return false
+    }
+  })
 
   const entry: Secondary = {
     scope,

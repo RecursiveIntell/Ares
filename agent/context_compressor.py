@@ -105,7 +105,7 @@ def _is_summary_access_or_quota_error(exc: Exception) -> bool:
     if status in {401, 402, 403}:
         return True
 
-    if classified.reason is FailoverReason.billing:
+    if classified.reason in {FailoverReason.billing, FailoverReason.hard_quota}:
         return any(marker in err_text for marker in _SUMMARY_PERMANENT_QUOTA_MARKERS)
     return any(marker in err_text for marker in _SUMMARY_PERMANENT_QUOTA_MARKERS)
 
