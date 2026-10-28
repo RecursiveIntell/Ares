@@ -926,7 +926,12 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4004, f"invalid goal: {exc}")
         except RuntimeError as exc:
             cause = getattr(exc, "cause", None) or "write_failed"
-            detail = _goal_persistence_message(cause)
+            # Local import: registered handlers are rebound onto server.py's
+            # namespace, which does not carry methods_tools module globals —
+            # a bare call here would raise NameError on the installed handler.
+            from .methods_tools import _goal_persistence_message as _gpm
+
+            detail = _gpm(cause)
             return _err(rid, 5032, detail or f"Goal persistence unconfirmed: {exc}")
 
         notice = (

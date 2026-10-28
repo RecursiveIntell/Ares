@@ -1540,8 +1540,17 @@ def _migrate_or_archive_on_boundary(*, old_session_id: str, successor_session_id
         result = migrate_goal_to_session(old_session_id, successor, reason=reason or "boundary")
         if result:
             return True
-        # Fall through to the visible archive: a failed migration must not
-        # leave the row silently orphaned either.
+        # A failed migration (e.g., the atomic CAS lost to a concurrent update)
+        # must NOT fall through to the no-successor archive: the goal was never
+        # copied to the successor, so archiving here loses it permanently and
+        # records a false "no successor" reason. Leave the live row in place so
+        # the next boundary retries the migration.
+        logger.warning(
+            "GoalManager: successor migration %s -> %s failed (%s); "
+            "parent goal left in place for retry",
+            old_session_id, successor, reason or "boundary",
+        )
+        return False
     archived_raw = db.get_meta(_meta_key(old_session_id))
     if not archived_raw:
         return False
@@ -2506,9 +2515,15 @@ class GoalManager:
         )
         db = _get_session_db()
         if db is None:
+            # Same deferral contract as save_goal: journal the write so the
+            # next healthy bootstrap flushes it. Raising without the journal
+            # would drop the user's goal entirely, yet the per-surface
+            # UNAVAILABLE message promises a deferred flush.
+            _defer_goal_write(self.session_id, state)
+            logger.error("GoalManager: SessionDB unavailable at set(); goal deferred for flush")
             raise GoalPersistenceError(
                 GoalPersistenceCause.UNAVAILABLE,
-                "goal state could not be persisted: storage unavailable",
+                "goal state could not be persisted; deferred for flush when storage returns",
             )
         expected_raw = db.get_meta(_meta_key(self.session_id))
         outcome = save_goal_outcome(self.session_id, state, expected_raw)
