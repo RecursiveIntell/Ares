@@ -13,9 +13,16 @@ from .contracts import (
     WatchState,
 )
 from .matcher import replay_events
+from .records import (
+    EffectiveWatchState,
+    WatchRecordV1,
+    WorkItemRecordV1,
+    WorkItemState,
+)
 
 __all__ = [
     "AttentionContractError",
+    "EffectiveWatchState",
     "EventCoverageState",
     "EventDecisionV1",
     "EventFactV1",
@@ -23,7 +30,10 @@ __all__ = [
     "MatchDisposition",
     "ProviderEventV1",
     "SourceIdentityV1",
+    "WatchRecordV1",
     "WatchSpecV1",
     "WatchState",
+    "WorkItemRecordV1",
+    "WorkItemState",
     "replay_events",
 ]
