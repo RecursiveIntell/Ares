@@ -71,14 +71,11 @@ _ALLOWED: dict[tuple[str, str], str] = {
         "WSL diagnostic: deliberately inspects what PATH resolves so it can "
         "warn that the only reachable npm is the Windows one."
     ),
-    ("tools/lazy_deps.py", "uv"): (
-        "Fallback after resolve_uv(), plus the except-branch for the "
-        "hermes_cli import guard."
-    ),
-    ("tools/browser_use_cli.py", "uv"): (
-        "install_cli()'s fallback after ensure_uv() misses — a user-installed "
-        "uv on PATH is a legitimate last rung before giving up with install "
-        "guidance."
+    ("hermes_cli/managed_uv.py", "uv"): (
+        "resolve_uv_admitted(fallback=True) PATH rung: the last resort when no "
+        "managed uv exists. The result is version-gated against the reviewed "
+        "range before it is ever returned or run (Task 1.1); a bare lookup is "
+        "the point of this rung."
     ),
     ("hermes_cli/gateway.py", "node"): (
         "Fallback rung of _append_node_dir_for_service(), after the managed "

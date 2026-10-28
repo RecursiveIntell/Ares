@@ -37,6 +37,26 @@ from typing import Callable, Optional
 from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import SQLiteRuntimeInfo, probe_sqlite_runtime
 
+# Reviewed uv pin (OD-1). Single source of truth: `.github/uv-version`;
+# cross-surface agreement is enforced by tests/test_uv_pin_consistency.py.
+# Installs and self-updates must stay inside the reviewed range
+# [0.9.28, 0.13.0) — an untargeted `uv self update` drifts to unreviewed
+# releases (uv 0.13 broke the reviewed install contract).
+UV_PIN = "0.12.24"
+_UV_RANGE_MIN = (0, 9, 28)
+_UV_RANGE_MAX_EXCLUSIVE = (0, 13, 0)
+
+
+def _uv_version_tuple(uv_bin: str) -> Optional[tuple[int, int, int]]:
+    """Parse ``uv --version`` into a comparable tuple; None when unreadable."""
+    version_string = _uv_version_string(uv_bin)
+    import re as _re
+
+    match = _re.fullmatch(r"uv (\d+)\.(\d+)\.(\d+)(?: \S.*)?", version_string)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +92,36 @@ def resolve_uv() -> Optional[str]:
     p = managed_uv_path()
     if p.is_file() and os.access(p, os.X_OK):
         return str(p)
+    return None
+
+
+def resolve_uv_admitted(*, fallback: bool = True) -> Optional[str]:
+    """Range-aware managed-uv lookup for callers that must not trigger
+    installs (no side effects) but must never run an out-of-range binary.
+
+    Returns a uv path ONLY when its version is inside the reviewed range —
+    the managed binary when admitted, else (with ``fallback=True``) a PATH
+    uv that is itself version-admitted. A managed uv that is present but
+    out-of-range/unreadable suppresses the PATH fallback entirely (the
+    caller decides: sync refusal or explicit repair), so an unvetted binary
+    can never be returned.
+    """
+    existing = resolve_uv()
+    if existing:
+        version_tuple = _uv_version_tuple(existing)
+        if version_tuple is not None and _UV_RANGE_MIN <= version_tuple < _UV_RANGE_MAX_EXCLUSIVE:
+            return existing
+        return None  # present but unadmitted: suppress the PATH fallback
+    if fallback:
+        import shutil
+
+        path_uv = shutil.which("uv")
+        if not path_uv:
+            return None
+        path_tuple = _uv_version_tuple(path_uv)
+        if path_tuple is not None and _UV_RANGE_MIN <= path_tuple < _UV_RANGE_MAX_EXCLUSIVE:
+            return path_uv
+        return None  # PATH uv present but unadmitted
     return None
 
 
@@ -271,10 +321,39 @@ def _ensure_uv_path(
     *,
     repair_observer: Callable[[RuntimeRepairResult], None] | None = None,
 ) -> Optional[str]:
-    """Resolve the managed uv path, installing it if necessary (plain ``str``/``None``)."""
+    """Resolve the managed uv path, installing it if necessary (plain ``str``/``None``).
+
+    Reviewed-range admission (uv-pin fail-closed contract): an existing
+    managed uv outside [0.9.28, 0.13.0) — or with an unreadable version — is
+    replaced with the pin before being handed to any caller; if the
+    replacement fails, this returns None so callers refuse the operation
+    instead of running it on a stale binary.
+    """
     existing = resolve_uv()
     if existing:
-        return existing
+        version_tuple = _uv_version_tuple(existing)
+        if version_tuple is not None and _UV_RANGE_MIN <= version_tuple < _UV_RANGE_MAX_EXCLUSIVE:
+            return existing
+        # Out of range (or unreadable): repair in place before any use.
+        logger.warning(
+            "Managed uv %s at %s is outside the reviewed range %s..<%s; replacing with pin %s",
+            ".".join(map(str, version_tuple)) if version_tuple else "?",
+            existing, _UV_RANGE_MIN, _UV_RANGE_MAX_EXCLUSIVE, UV_PIN,
+        )
+        try:
+            target = managed_uv_path()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _install_uv(target)
+        except Exception as exc:
+            logger.warning("Managed uv pin reinstall failed: %s", exc)
+            return None
+        repaired = resolve_uv()
+        repaired_tuple = _uv_version_tuple(repaired) if repaired else None
+        if not repaired_tuple or not (_UV_RANGE_MIN <= repaired_tuple < _UV_RANGE_MAX_EXCLUSIVE):
+            logger.error("Managed uv still outside the reviewed range after pin reinstall at %s", repaired)
+            return None
+        print(f"  ✓ Managed uv replaced with reviewed pin {UV_PIN}")
+        return repaired
 
     target = managed_uv_path()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -291,6 +370,19 @@ def _ensure_uv_path(
     # Verify
     result = resolve_uv()
     if result:
+        # Fresh-install admission (uv-pin contract): the just-installed
+        # binary must be inside the reviewed range before it is handed to
+        # any caller; an installer that delivered a wrong/unreadable version
+        # fails closed here instead of reaching a dependency sync.
+        fresh_tuple = _uv_version_tuple(result)
+        if not fresh_tuple or not (_UV_RANGE_MIN <= fresh_tuple < _UV_RANGE_MAX_EXCLUSIVE):
+            logger.error(
+                "Freshly installed managed uv at %s is outside the reviewed range %s..<%s; refusing",
+                result, _UV_RANGE_MIN, _UV_RANGE_MAX_EXCLUSIVE,
+            )
+            print("  ✗ Installed uv is outside the reviewed range; dependency operations refused "
+                  "(re-run the installer to repair)")
+            return None
         version = subprocess.run(
             [result, "--version"],
             capture_output=True,
@@ -408,10 +500,52 @@ def update_managed_uv(
         # Not installed yet — ensure_uv() will handle that elsewhere.
         return None
 
+    # Reviewed-range admission check: a managed uv outside [0.9.28, 0.13.0)
+    # (e.g. one that drifted via an older untargeted self update) is replaced
+    # with the reviewed pin before any locked sync runs against it.
+    version_tuple = _uv_version_tuple(existing)
+    if version_tuple is None:
+        logger.warning("Managed uv version unreadable (%s); reinstalling reviewed pin %s", existing, UV_PIN)
+        self_update_allowed = False
+    elif not (_UV_RANGE_MIN <= version_tuple < _UV_RANGE_MAX_EXCLUSIVE):
+        logger.warning(
+            "Managed uv %s is outside the reviewed range %s..<%s; replacing with pin %s",
+            ".".join(map(str, version_tuple)), _UV_RANGE_MIN, _UV_RANGE_MAX_EXCLUSIVE, UV_PIN,
+        )
+        self_update_allowed = False
+    else:
+        self_update_allowed = True
+
+    if not self_update_allowed:
+        try:
+            target = managed_uv_path()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _install_uv(target)
+            # Validate the replacement actually landed in range before the
+            # caller proceeds with any dependency sync (verifier finding:
+            # a failed replacement must not hand back the stale binary).
+            new_version = _uv_version_tuple(existing)
+            if new_version is None or not (_UV_RANGE_MIN <= new_version < _UV_RANGE_MAX_EXCLUSIVE):
+                logger.error(
+                    "Managed uv at %s is still outside the reviewed range after pin reinstall; "
+                    "refusing to proceed with dependency sync (re-run install or update to repair)",
+                    existing,
+                )
+                print("  ✗ Managed uv is outside the reviewed range and could not be repaired; "
+                      "dependency sync refused")
+                return None
+            print(f"  ✓ Managed uv replaced with reviewed pin {UV_PIN}")
+        except Exception as exc:
+            # Fail closed: hand back None so callers treat uv as missing and
+            # refuse the sync, instead of proceeding with the stale binary.
+            logger.warning("Managed uv pin reinstall failed: %s; dependency sync refused", exc)
+            print(f"  ⚠ Managed uv is outside the reviewed range and pin reinstall failed: {exc}")
+            return None
+
     if force or not _uv_self_update_is_fresh():
         try:
             result = subprocess.run(
-                [existing, "self", "update"],
+                [existing, "self", "update", UV_PIN],
                 capture_output=True,
                 text=True, encoding='utf-8', errors='replace',
                 check=False,
@@ -1466,7 +1600,7 @@ def _install_uv_posix(env: dict[str, str]) -> None:
 
     try:
         subprocess.run(
-            ["curl", "-LsSf", "https://astral.sh/uv/install.sh", "-o", installer_path],
+            ["curl", "-LsSf", f"https://astral.sh/uv/{UV_PIN}/install.sh", "-o", installer_path],
             check=True,
             capture_output=True,
         )
@@ -1485,7 +1619,7 @@ def _install_uv_posix(env: dict[str, str]) -> None:
 
 def _install_uv_windows(env: dict[str, str]) -> None:
     """Invoke the PowerShell installer."""
-    cmd = "irm https://astral.sh/uv/install.ps1 | iex"
+    cmd = f"irm https://astral.sh/uv/{UV_PIN}/install.ps1 | iex"
     subprocess.run(
         ["powershell", "-ExecutionPolicy", "Bypass", "-c", cmd],
         env=env,

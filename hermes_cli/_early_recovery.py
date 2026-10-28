@@ -300,6 +300,10 @@ def _find_uv_binary() -> str | None:
     the stdlib ``pip`` fallback below refuses to touch them.  In that state
     the only sanctioned installer is uv itself, which Hermes already vendors
     (``~/.hermes/bin/uv.exe``) or the user has on PATH.  Stdlib-only.
+
+    Reviewed-range admission (uv-pin contract, round-7 verifier): every
+    candidate is version-checked against [0.9.28, 0.13.0) before it may run
+    the recovery install; out-of-range/unreadable candidates are skipped.
     """
     exe = "uv.exe" if sys.platform == "win32" else "uv"
     candidates = [
@@ -307,10 +311,29 @@ def _find_uv_binary() -> str | None:
         Path.home() / ".local" / "bin" / exe,
         Path.home() / ".cargo" / "bin" / exe,
     ]
+    which = shutil.which(exe)
+    if which:
+        candidates.append(Path(which))
     for path in candidates:
-        if path.is_file():
+        if not path.is_file():
+            continue
+        try:
+            probe = subprocess.run(
+                [str(path), "--version"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=15, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        import re as _re
+
+        m = _re.fullmatch(r"uv (\d+)\.(\d+)\.(\d+)(?: \S.*)?", (probe.stdout or "").strip())
+        if not m:
+            continue
+        version = tuple(int(g) for g in m.groups())
+        if (0, 9, 28) <= version < (0, 13, 0):
             return str(path)
-    return shutil.which(exe)
+    return None
 
 
 def _base_interpreter_is_externally_managed() -> bool:

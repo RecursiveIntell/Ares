@@ -22,6 +22,13 @@ class PolicyError(Exception):
     """Safe fixed-message error; never include input text."""
 
 
+# Reviewed uv admission range (OD-1). Mirrored by scripts/install.sh
+# (_uv_version_in_range) and hermes_cli/managed_uv.py (_UV_RANGE_MIN/_MAX);
+# cross-surface agreement is enforced by tests/test_uv_pin_consistency.py.
+UV_MIN_VERSION = (0, 9, 28)
+UV_MAX_EXCLUSIVE = (0, 13, 0)
+
+
 def local_path(value):
     return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9_./ -]+", value)) and not value.startswith("//")
 

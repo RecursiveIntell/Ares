@@ -1966,10 +1966,15 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     _m()._abort_dependency_sync_if_self_locked()
     print("→ Updating Python dependencies...")
 
-    from hermes_cli.managed_uv import ensure_uv, update_managed_uv
+    from hermes_cli.managed_uv import ensure_uv, resolve_uv, update_managed_uv
 
     # Keep managed uv current — runs `uv self update` if we already have one.
-    update_managed_uv()
+    # None return = out-of-range managed uv that could not be repaired: the
+    # sync is refused (uv-pin fail-closed contract).
+    if update_managed_uv() is None and resolve_uv():
+        print("  ✗ Managed uv is outside the reviewed range and could not be repaired; "
+              "skipping the Python dependency sync (re-run the installer to repair)")
+        return 1
 
     uv_bin = ensure_uv()
 
@@ -3502,6 +3507,13 @@ def _install_psutil_android_compat(
             env=env,
         )
 
+def _uv_version_tuple_of(bin_path: str) -> tuple[int, int, int] | None:
+    """Admission helper: parse a candidate uv binary's version, or None."""
+    from hermes_cli.managed_uv import _uv_version_tuple
+
+    return _uv_version_tuple(bin_path)
+
+
 def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
     """Best-effort uv bootstrap on Termux for faster update installs.
 
@@ -3510,18 +3522,30 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
     installer may not work (glibc vs bionic).  Prefer a uv already on PATH
     (e.g. ``pkg install uv``); only if there is none do we fall back to a
     wheel-only ``pip install uv`` so we never source-build the Rust crate.
-    """
-    from hermes_cli.managed_uv import resolve_uv
 
-    existing = resolve_uv()
+    Reviewed-range admission applies to EVERY candidate, including PATH
+    binaries: an out-of-range or unreadable uv is never returned to the
+    sync call sites (round-5 verifier HIGH).
+    """
+    from hermes_cli.managed_uv import resolve_uv_admitted
+
+    existing = resolve_uv_admitted()
     if existing:
         return existing
     if not _m()._is_termux_env():
         return None
     # A Termux-packaged uv lands on PATH but not in the managed bin dir, so
-    # resolve_uv() misses it. Use it before pip, which has no Android wheel and
+    # the managed lookup misses it. Use it before pip, which has no Android wheel and
     # would otherwise build uv from source on a low-memory device.
-    system_uv = shutil.which("uv")
+    def _admitted(path: str | None) -> str | None:
+        if not path:
+            return None
+        version = _uv_version_tuple_of(path)
+        if version is not None and (0, 9, 28) <= version < (0, 13, 0):
+            return path
+        return None
+
+    system_uv = _admitted(shutil.which("uv"))
     if system_uv:
         return system_uv
     try:
@@ -3535,8 +3559,8 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
             return None
     except Exception:
         pass
-    # After pip install, check managed path first, then PATH
-    return resolve_uv() or shutil.which("uv")
+    # After pip install, check managed path first, then PATH (both admitted).
+    return _admitted(resolve_uv_admitted() or shutil.which("uv"))
 
 def _npm_manifest_paths() -> tuple[Path, ...]:
     """Manifests whose changes must defeat the update-skip.
@@ -8948,10 +8972,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # uv can retain the same CPython patch while python-build-standalone
             # refreshes the embedded SQLite underneath it. Keep the existing
             # update-boundary hook active on this retry path too.
-            from hermes_cli.managed_uv import ensure_uv, update_managed_uv
+            from hermes_cli.managed_uv import ensure_uv, resolve_uv, update_managed_uv
 
             runtime_repairs = []
-            update_managed_uv(repair_observer=runtime_repairs.append)
+            # Fail-closed (uv-pin contract): None + existing binary = out of
+            # range and unrepairable; refuse the sync on this retry path too.
+            if update_managed_uv(repair_observer=runtime_repairs.append) is None and resolve_uv():
+                print("  ✗ Managed uv is outside the reviewed range and could not be repaired; "
+                      "skipping the Python dependency sync (re-run the installer to repair)")
+                return 1
             ensure_uv(repair_observer=runtime_repairs.append)
             runtime_repaired = next(
                 (result for result in runtime_repairs if result.repaired),
@@ -9355,10 +9384,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("→ Python dependencies unchanged — skipping reinstall")
         else:
             print("→ Updating Python dependencies...")
-        from hermes_cli.managed_uv import ensure_uv, update_managed_uv
+        from hermes_cli.managed_uv import ensure_uv, resolve_uv, update_managed_uv
 
         # Keep managed uv current — runs `uv self update` if we already have one.
-        update_managed_uv()
+        # None return = the managed uv is out of the reviewed range and could
+        # not be repaired: refuse the sync rather than run it on the stale
+        # binary (uv-pin fail-closed contract).
+        if update_managed_uv() is None and resolve_uv():
+            print("  ✗ Managed uv is outside the reviewed range and could not be repaired; "
+                  "skipping the Python dependency sync (re-run the installer to repair)")
+            return 1
 
         uv_bin = ensure_uv()
 

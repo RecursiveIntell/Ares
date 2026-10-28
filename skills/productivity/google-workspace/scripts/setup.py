@@ -154,7 +154,25 @@ def install_deps():
     # --python <interpreter>` installs into that exact interpreter without
     # needing pip present. Targeting sys.executable keeps us on the venv the
     # script is actually running under, rather than guessing.
-    uv = shutil.which("uv")
+    def _admitted_uv():
+        """Reviewed-range admission (uv-pin contract): run only a uv inside
+        [0.9.28, 0.13.0); otherwise fall back to pip."""
+        uv = shutil.which("uv")
+        if not uv:
+            return None
+        try:
+            out = subprocess.run([uv, "--version"], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=15, check=False).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        import re as _re
+        m = _re.fullmatch(r"uv (\d+)\.(\d+)\.(\d+)(?: \S.*)?", (out or "").strip())
+        if not m:
+            return None
+        version = tuple(int(g) for g in m.groups())
+        return uv if (0, 9, 28) <= version < (0, 13, 0) else None
+
+    uv = _admitted_uv()
     if uv:
         try:
             subprocess.check_call(

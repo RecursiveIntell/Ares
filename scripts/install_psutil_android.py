@@ -48,12 +48,31 @@ from hermes_cli.psutil_android import (
 def _resolve_install_cmd(pip_arg: str | None, prefer_uv: bool) -> list[str]:
     if pip_arg:
         return pip_arg.split()
-    if prefer_uv:
+    def _admitted_uv():
+        """Reviewed-range admission (uv-pin contract): run only a uv inside
+        [0.9.28, 0.13.0); any other uv (missing, out-of-range, unreadable)
+        routes to the stdlib pip fallback."""
         uv = shutil.which("uv")
         if not uv:
-            sys.exit("--uv requested but no uv on PATH")
+            return None
+        try:
+            out = subprocess.run([uv, "--version"], capture_output=True, text=True, encoding="utf-8",
+                                 errors="replace", timeout=15, check=False).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        import re as _re
+        m = _re.fullmatch(r"uv (\d+)\.(\d+)\.(\d+)(?: \S.*)?", (out or "").strip())
+        if not m:
+            return None
+        version = tuple(int(g) for g in m.groups())
+        return uv if (0, 9, 28) <= version < (0, 13, 0) else None
+
+    if prefer_uv:
+        uv = _admitted_uv()
+        if not uv:
+            sys.exit("--uv requested but no reviewed-range uv on PATH")
         return [uv, "pip"]
-    auto_uv = shutil.which("uv")
+    auto_uv = _admitted_uv()
     if auto_uv:
         return [auto_uv, "pip"]
     return [sys.executable, "-m", "pip"]

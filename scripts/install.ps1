@@ -750,10 +750,21 @@ function Install-Uv {
     $managedUv = Join-Path $HermesHome "bin\uv.exe"
 
     if (Test-Path $managedUv) {
-        $script:UvCmd = $managedUv
-        $version = & $managedUv --version
-        Write-Success "Managed uv found ($version)"
-        return $true
+        $version = (& $managedUv --version 2>$null | Out-String).Trim()
+        if ($version -match '^uv (\d+)\.(\d+)\.(\d+)') {
+            [version]$v = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+            $min = [version]"0.9.28"; $max = [version]"0.13.0"
+            if ($v -lt $min -or $v -ge $max) {
+                Write-Info "Managed uv ($version) is outside the reviewed range; replacing with pinned uv 0.12.24"
+                # fall through to the install branch below
+            } else {
+                $script:UvCmd = $managedUv
+                Write-Success "Managed uv found ($version)"
+                return $true
+            }
+        } else {
+            Write-Info "Managed uv version unreadable; replacing with pinned uv 0.12.24"
+        }
     }
 
     Write-Info "Installing managed uv into $HermesHome\bin ..."
@@ -781,16 +792,18 @@ function Install-Uv {
         # "installed but not found" message.
         $installerOutput = @()
         $astralOut = @()
-        & $psHostExe -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex" 2>&1 | Tee-Object -Variable astralOut | Out-Null
-        $installerOutput += "--- uv installer source: astral.sh ---"
+        # Reviewed uv pin (OD-1): versioned installer URL, never "latest".
+        & $psHostExe -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/0.12.24/install.ps1 | iex" 2>&1 | Tee-Object -Variable astralOut | Out-Null
+        $installerOutput += "--- uv installer source: astral.sh (pinned 0.12.24) ---"
         $installerOutput += @($astralOut | ForEach-Object { "$_" })
         if (Test-Path $managedUv) {
             Write-Info "uv installer succeeded via astral.sh"
         } else {
             Write-Info "astral.sh uv installer did not produce $managedUv; trying GitHub releases mirror ..."
             $ghOut = @()
-            & $psHostExe -ExecutionPolicy ByPass -c "irm https://github.com/astral-sh/uv/releases/latest/download/uv-installer.ps1 | iex" 2>&1 | Tee-Object -Variable ghOut | Out-Null
-            $installerOutput += "--- uv installer source: GitHub releases ---"
+            # Reviewed uv pin (OD-1): versioned fallback URL, never "latest".
+            & $psHostExe -ExecutionPolicy ByPass -c "irm https://github.com/astral-sh/uv/releases/download/0.12.24/uv-installer.ps1 | iex" 2>&1 | Tee-Object -Variable ghOut | Out-Null
+            $installerOutput += "--- uv installer source: GitHub releases (pinned 0.12.24) ---"
             $installerOutput += @($ghOut | ForEach-Object { "$_" })
             if (Test-Path $managedUv) {
                 Write-Info "uv installer succeeded via GitHub releases"
@@ -1070,15 +1083,31 @@ function Resolve-UvCmd {
     # Check the managed location first -- this is where Install-Uv puts it.
     $managedUv = Join-Path $HermesHome "bin\uv.exe"
     if (Test-Path $managedUv) {
-        $script:UvCmd = $managedUv
-        return
+        # Reviewed-range admission (uv-pin contract): only an in-range
+        # managed uv may be adopted; otherwise fall through to PATH/refuse.
+        $version = (& $managedUv --version 2>$null | Out-String).Trim()
+        if ($version -match '^uv (\d+)\.(\d+)\.(\d+)') {
+            [version]$v = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+            if ([version]"0.9.28" -le $v -and $v -lt [version]"0.13.0") {
+                $script:UvCmd = $managedUv
+                return
+            }
+        }
     }
 
     # Fall back to PATH (covers edge cases where the installer ran in a
-    # sibling process and HERMES_HOME wasn't propagated).
-    if (Get-Command uv -ErrorAction SilentlyContinue) {
-        $script:UvCmd = "uv"
-        return
+    # sibling process and HERMES_HOME wasn't propagated). The PATH uv is
+    # also version-admitted before adoption.
+    $pathUv = (Get-Command uv -ErrorAction SilentlyContinue).Source
+    if ($pathUv) {
+        $version = (& $pathUv --version 2>$null | Out-String).Trim()
+        if ($version -match '^uv (\d+)\.(\d+)\.(\d+)') {
+            [version]$v = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+            if ([version]"0.9.28" -le $v -and $v -lt [version]"0.13.0") {
+                $script:UvCmd = $pathUv
+                return
+            }
+        }
     }
 
     # Refresh PATH from registry in case the current process started before

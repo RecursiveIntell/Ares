@@ -214,7 +214,10 @@ export CARGO_HOME="$(cd "$CARGO_HOME" && pwd -P)"
 export RUSTUP_HOME="$(cd "$RUSTUP_HOME" && pwd -P)"
 unset PYTHONPATH PYTHONHOME VIRTUAL_ENV UV_PROJECT_ENVIRONMENT
 export PATH="$UV_INSTALL_DIR:$ARES_BIN_DIR:$HOME/.local/bin:$CARGO_HOME/bin:$HOME/.cargo/bin:$PATH"
-curl -fsSL https://astral.sh/uv/install.sh -o "$TEMP_DIR/uv-install.sh"
+# Reviewed uv pin (OD-1): install the reviewed version, never "latest"
+# (E-31/E-33; consistency-tested by tests/test_uv_pin_consistency.py).
+UV_PIN="0.12.24"
+curl -fsSL "https://astral.sh/uv/${UV_PIN}/install.sh" -o "$TEMP_DIR/uv-install.sh"
 UV_NO_MODIFY_PATH=1 sh "$TEMP_DIR/uv-install.sh"
 command -v uv >/dev/null 2>&1 || die "uv provisioning failed."
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
