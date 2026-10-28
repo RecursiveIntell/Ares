@@ -118,4 +118,29 @@ def test_npm_failure_output_stays_out_of_health_transcript(tmp_path: Path) -> No
     proc = _run(root, tmp_path)
     assert proc.returncode != 0
     assert "private-sentinel" not in proc.stdout + proc.stderr
+
+
+# --- Task 1.3 (PLAN-FINAL): name failing packages and states ---------------
+
+def test_failure_names_root_missing_and_web_invalid(tmp_path: Path) -> None:
+    """A failed gate names workspace:package:state on stderr (plan Task 1.3)."""
+    root = _fixture(tmp_path)
+    shutil.rmtree(root / "node_modules/root-probe")            # root devDep missing
+    _package(root / "node_modules/web-probe", "web-probe", version="9.9.9")  # invalid
+    proc = _run(root, tmp_path)
+    assert proc.returncode != 0
+    assert "root:root-probe:missing" in proc.stderr, proc.stderr
+    assert "web:web-probe:invalid" in proc.stderr, proc.stderr
+    # Names and states only — the failing version text must not leak.
+    assert "9.9.9" not in proc.stderr
+
+
+def test_named_lines_never_leak_registry_urls(tmp_path: Path) -> None:
+    """The naming path prints package names and states only (no spec/URL)."""
+    root = _fixture(tmp_path)
+    _package(root / "web", "web", dependencies={"web-probe": "https://user:private-sentinel@example.invalid/pkg.tgz"})
+    shutil.rmtree(root / "node_modules/web-probe")
+    proc = _run(root, tmp_path)
+    assert proc.returncode != 0
+    assert "private-sentinel" not in proc.stderr
     assert "example.invalid" not in proc.stdout + proc.stderr
