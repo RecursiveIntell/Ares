@@ -8,23 +8,18 @@
 # wrongly concludes "flag absent" → passes wrong flags to older installers.
 # GREEN: the probe consumes the script without a SIGPIPE-prone producer.
 #
-# This harness extracts the probe functions VERBATIM from
-# tests/install/install-update-e2e.sh, so any fix there is exercised here.
+# This test sources the probe helpers shared with the harness
+# (tests/install/probe-helpers.sh), so the probes exercised here are
+# byte-identical to the harness's — no source-text extraction (the root
+# AGENTS.md rule against source-reading tests).
 # External effects (git show, in_sandbox) are stubbed with fakes.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-HARNESS="$REPO_ROOT/tests/install/install-update-e2e.sh"
-[ -f "$HARNESS" ] || { echo "harness not found: $HARNESS" >&2; exit 2; }
-
-extract_fn() {
-    awk -v fn="$1" '
-        $0 ~ "^"fn"\\(\\) \\{" {p = 1}
-        p {print}
-        p && $0 == "}" {exit}
-    ' "$HARNESS"
-}
+HELPERS="$REPO_ROOT/tests/install/probe-helpers.sh"
+[ -f "$HELPERS" ] || { echo "probe helpers not found: $HELPERS" >&2; exit 2; }
+source "$HELPERS"
 
 work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
@@ -60,11 +55,6 @@ chmod +x "$work/bin/git"
 export FAKE_INSTALL_SCRIPT="$work/fake-install.sh"
 export FAKE_HELP="$work/fake-help.txt"
 export PATH="$work/bin:$PATH"
-
-update_supports_fn="$(extract_fn update_supports)"
-installer_supports_fn="$(extract_fn installer_supports)"
-eval "$update_supports_fn"
-eval "$installer_supports_fn"
 
 expect_ok() {  # probe must succeed
     local rc=0
