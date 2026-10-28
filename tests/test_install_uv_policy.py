@@ -350,3 +350,57 @@ def test_unsupported_platform_contract_fails_closed():
     # Platform is explicit input to the capability guard, not a mocked host.
     with pytest.raises(policy.PolicyError, match="requires POSIX"):
         policy.posix_capabilities("nt")
+
+
+@pytest.mark.parametrize(
+    "output,expected",
+    [
+        ("uv 0.12.24\n", (0, 12, 24)),
+        ("uv 0.9.28\n", (0, 9, 28)),
+        ("uv 0.13.0\n", (0, 13, 0)),
+        ("uv 0.12.24 (extra suffix)\n", (0, 12, 24)),
+        ("uv 0.12\n", None),
+        ("", None),
+        ("not uv output\n", None),
+    ],
+)
+def test_parse_uv_version(output, expected):
+    assert policy.parse_uv_version(output) == expected
+
+
+@pytest.mark.parametrize(
+    "version,expected",
+    [
+        ((0, 9, 28), True),   # floor
+        ((0, 12, 24), True),  # in range
+        ((0, 12, 99), True),  # upper bound is < 0.13.0
+        ((0, 9, 27), False),  # below floor
+        ((0, 13, 0), False),  # at upper bound
+        ((1, 0, 0), False),
+        (None, False),
+    ],
+)
+def test_uv_version_supported(version, expected):
+    assert policy.uv_version_supported(version) is expected
+
+
+@pytest.mark.parametrize(
+    "version_line,expected_code",
+    [
+        ("uv 0.12.24", 0),
+        ("uv 0.9.28", 0),
+        ("uv 0.9.27", 2),
+        ("uv 0.13.0", 2),
+        ("uv 0.14.1", 2),
+        ("garbage", 2),
+    ],
+)
+def test_check_uv_version_cli_mode(tmp_path, version_line, expected_code):
+    uv = tmp_path / "uv"
+    uv.write_text(f"#!/bin/bash\necho '{version_line}'\n")
+    uv.chmod(0o755)
+    result = subprocess.run(
+        [sys.executable, str(HELPER), "--uv", str(uv), "--check-uv-version"],
+        capture_output=True,
+    )
+    assert result.returncode == expected_code, result.stderr
