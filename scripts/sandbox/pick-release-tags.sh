@@ -13,11 +13,17 @@
 # between (config-schema bumps, venv layout changes, dependency floors).
 #
 # Usage:
-#   scripts/sandbox/pick-release-tags.sh [--count N] [--repo DIR]
+#   scripts/sandbox/pick-release-tags.sh [--count N] [--repo DIR] [--since-date YYYY-MM-DD]
 #
 #   --count   how many tags to emit (default 5, minimum 1). Fewer tags than
 #             requested emits all of them.
 #   --repo    repository to read tags from (default: this checkout).
+#   --since-date
+#             only consider release tags whose Git creator date is on or after
+#             this date. Used to narrow a route toward releases that may
+#             contain a fix: when the filtered set is empty the script emits []
+#             and exits 0, allowing the update route to have no eligible
+#             releases.
 #
 # Reads tags from the local checkout, so it needs one fetched with tags
 # (actions/checkout with fetch-depth: 0, or `fetch-tags: true`). A shallow
@@ -30,6 +36,7 @@
 set -euo pipefail
 
 COUNT=5
+SINCE_DATE=""
 # Default to the repository containing this script, resolved through its real
 # path so a symlinked or copied script still reads the checkout it lives in
 # rather than whatever repo the caller happens to be standing in.
@@ -42,7 +49,10 @@ while [ "$#" -gt 0 ]; do
     --repo)
       [ "$#" -ge 2 ] || { echo 'error: --repo needs a value' >&2; exit 1; }
       REPO="$2"; shift 2 ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    --since-date)
+      [ "$#" -ge 2 ] || { echo 'error: --since-date needs a value' >&2; exit 1; }
+      SINCE_DATE="$2"; shift 2 ;;
+    -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
     *) echo "error: unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -50,6 +60,10 @@ case "$COUNT" in
   ''|*[!0-9]*) echo "error: --count must be a positive integer: $COUNT" >&2; exit 1 ;;
 esac
 [ "$COUNT" -ge 1 ] || { echo 'error: --count must be at least 1' >&2; exit 1; }
+if [ -n "$SINCE_DATE" ] && ! printf '%s' "$SINCE_DATE" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+  echo "error: --since-date must be YYYY-MM-DD: $SINCE_DATE" >&2
+  exit 1
+fi
 
 # Resolve the script's own location through symlinks, then ask git which
 # worktree that path belongs to. Deriving the repo from the script rather than
@@ -66,14 +80,37 @@ fi
 
 # sort -V orders v2026.4.8 before v2026.4.13 (numeric), which a plain
 # lexicographic sort gets wrong.
+#
+# --since-date filters on the tag's Git creator date. Tag dates, not commit
+# ancestry: the pick job uses a blobless shallow checkout, and the date filter
+# is a proxy for release eligibility; it does not establish that a qualifying
+# tag corresponds to a release published on or after that date or that any
+# such release contains a given fix. An empty filtered set is a valid answer
+# (no tags meet the Git creator-date cutoff), so it emits [] instead of
+# failing the job.
 mapfile -t tags < <(
-  git -C "$REPO" tag --list 'v*' \
-    | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
-    | sort -V
+  if [ -n "$SINCE_DATE" ]; then
+    git -C "$REPO" for-each-ref --format='%(refname:short) %(creatordate:short)' 'refs/tags/*' \
+      | while read -r name date; do
+          [[ "$name" =~ ^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || continue
+          [[ "$date" < "$SINCE_DATE" ]] && continue
+          printf '%s\n' "$name"
+        done \
+      | sort -V
+  else
+    git -C "$REPO" tag --list 'v*' \
+      | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+      | sort -V
+  fi
 )
 
 total="${#tags[@]}"
 if [ "$total" -eq 0 ]; then
+  if [ -n "$SINCE_DATE" ]; then
+    echo "notice: no release tags with a Git creator date on or after $SINCE_DATE in $REPO; emitting []" >&2
+    printf '[]\n'
+    exit 0
+  fi
   echo "error: no release tags found in $REPO" >&2
   echo '       A shallow clone has no tags: fetch with tags (actions/checkout' >&2
   echo '       with fetch-depth: 0, or fetch-tags: true).' >&2
