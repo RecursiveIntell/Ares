@@ -148,37 +148,11 @@ fi
 rm -rf -- "$SANDBOX_ROOT"
 
 # ── helpers ────────────────────────────────────────────────────────────────
-# Does the INSTALLED hermes accept FLAG on `hermes update`?
-#
-# Asked of the installed binary rather than parsed out of a release's source:
-# the update subcommand has lived in main.py, subcommands/update.py, and
-# update_cmd.py across the releases we sample, so any static parse is a guess
-# that silently rots. `hermes update --help` is the same surface a user meets,
-# and argparse prints every option it accepts.
-update_supports() {
-  local flag="$1"
-  in_sandbox "hermes update --help 2>&1" | grep -qF -- "$flag"
-}
-
-# Does the installer at REF accept FLAG? Read it out of that ref's own
-# install.sh rather than assuming this checkout's flag set: the point of the
-# matrix is to install releases from months back, whose installers predate
-# options we take for granted. (Unlike the updater, the installer runs before
-# anything is installed, so there is no --help to ask yet.)
-#
-# The ref may not be local -- the sandbox does its own fetching -- so fall back
-# to fetching just that blob. Unresolvable means "flag absent", which costs a
-# more conservative invocation, never a wrong one.
-installer_supports() {
-  local ref="$1"
-  local flag="$2"
-  local script=""
-  script="$(git show "$ref:scripts/install.sh" 2>/dev/null)" || {
-    git fetch -q --depth 1 "$UPSTREAM_URL" "$ref" 2>/dev/null || return 1
-    script="$(git show FETCH_HEAD:scripts/install.sh 2>/dev/null)" || return 1
-  }
-  printf '%s' "$script" | grep -qF -- "$flag"
-}
+# Probe helpers live in probe-helpers.sh, shared with the fast regression test
+# (test_harness_flag_probe.sh) so the probes exercised there are byte-identical
+# to the harness's — no source-text extraction, per the root AGENTS.md rule
+# against source-reading tests.
+source "$REPO_ROOT/tests/install/probe-helpers.sh"
 
 # Run the real install one-liner inside the sandbox. `ref` non-empty installs
 # that upstream commit and promotes THIS checkout to fake main afterwards,
