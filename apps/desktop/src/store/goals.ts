@@ -45,12 +45,18 @@ export const $goalsBySession = atom<Record<string, SessionGoal>>({})
 const DONE_LINGER_MS = 8_000
 const clearTimers = keyedTimeouts()
 
+// Bumped on every goal write/clear. Verification responses capture it when
+// scheduled and discard themselves if it moved — a stale "no active goal"
+// reply must not clear a chip a newer notice just wrote.
+let goalWriteGeneration = 0
+
 export function setSessionGoal(sid: string, goal: SessionGoal) {
   if (!sid) {
     return
   }
 
   clearTimers.cancel(sid)
+  goalWriteGeneration += 1
   $goalsBySession.set({ ...$goalsBySession.get(), [sid]: goal })
 
   if (goal.status === 'done') {
@@ -120,6 +126,7 @@ export function clearSessionGoal(sid: string) {
   }
 
   const { [sid]: _drop, ...rest } = map
+  goalWriteGeneration += 1
   $goalsBySession.set(rest)
 }
 
@@ -311,8 +318,9 @@ function scheduleHydrationVerification(sid: string, mapKey: string, runtimeId?: 
   const nextCount = (hydrationVerifyCounts.get(countKey) ?? 0) + 1
   hydrationVerifyCounts.set(countKey, nextCount)
   hydrationVerifyTimers.cancel(`${mapKey}:verify`)
+  const generation = goalWriteGeneration
   hydrationVerifyTimers.schedule(`${mapKey}:verify`, HYDRATION_VERIFY_DELAY_MS, () => {
-    void performVerificationHydration(sid, mapKey, runtimeId, nextCount)
+    void performVerificationHydration(sid, mapKey, runtimeId, nextCount, generation)
   })
 }
 
@@ -320,11 +328,19 @@ async function performVerificationHydration(
   sid: string,
   mapKey: string,
   runtimeId: string | undefined,
-  attempt: number
+  attempt: number,
+  generation: number
 ) {
   const gateway = $gateway.get()
 
   if (!gateway || isSessionGone(sid)) {
+    return
+  }
+
+  if (generation !== goalWriteGeneration) {
+    // A newer goal notice or structured update landed while this verification
+    // was in flight — the response is stale and must not clear/overwrite the
+    // freshly written chip.
     return
   }
 
