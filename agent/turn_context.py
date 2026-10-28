@@ -994,6 +994,21 @@ def build_turn_context(
             tools=agent.tools or None,
         )
         _compressor = agent.context_compressor
+        # Preflight drift telemetry: when the rough estimate exceeds the last
+        # REAL provider-reported prompt by >= 15%, log one bounded INFO line
+        # naming the gap. The rough estimator can run ~20% hot over real usage
+        # (the measured incident shape behind Task 2.2); surfacing it lets an
+        # operator spot estimator drift before it forces a needless compaction.
+        _real_prompt = getattr(_compressor, "last_real_prompt_tokens", -1)
+        if _preflight_tokens is not None and _real_prompt is not None and _real_prompt > 0:
+            _drift_gap = (_preflight_tokens - _real_prompt) / _real_prompt
+            if _drift_gap >= 0.15:
+                logger.info(
+                    "Preflight estimate drift: rough=%s real=%s (%+.1f%%)",
+                    f"{_preflight_tokens:,}",
+                    f"{_real_prompt:,}",
+                    _drift_gap * 100,
+                )
         # getattr guard: minimal compressor doubles (SimpleNamespace in the
         # engine-preflight tests) and plugin context engines lack this
         # ContextCompressor-only method — absence means no snapshot, and the
