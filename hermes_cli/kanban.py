@@ -2232,6 +2232,7 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
         verdict, reason, _, _, _ = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(),
             last_response=evidence.strip(),
+            session_id=getattr(task, "session_id", None),
         )
     except Exception as judge_exc:
         import logging as _logging
