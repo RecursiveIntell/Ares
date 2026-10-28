@@ -40,9 +40,15 @@ try {
     }
   };
   if (record(summary) && record(summary.dependencies)) {
-    // Top-level dependencies are the workspace trees, keyed by workspace name.
+    // Top-level entries are the workspace trees AND the root project. Each can
+    // itself be missing/invalid (npm ls reports the root's installed-version
+    // drift as an invalidVersion flag on its own entry) — the child walk never
+    // sees that flag, so check it here before descending.
     for (const [wsName, tree] of Object.entries(summary.dependencies)) {
-      if (record(tree)) walk(wsName, tree.dependencies);
+      if (!record(tree)) continue;
+      if (tree.missing) problems.push(`${wsName}:${wsName}:missing`);
+      else if (tree.invalid || tree.invalidVersion) problems.push(`${wsName}:${wsName}:invalid`);
+      walk(wsName, tree.dependencies);
     }
   }
   // Root-manifest required devDependencies absent from the summary tree
