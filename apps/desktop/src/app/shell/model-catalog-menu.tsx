@@ -267,6 +267,17 @@ export function ModelCatalogMenu({
     }
 
     if (controller.preserveOptionsOnSelect) {
+      // Preserving surfaces keep the session's options for anything the user
+      // never set on the TARGET row. What they did set there (a remembered
+      // preset, capability-gated) is explicit intent for this model and must
+      // not be discarded by the pick; unset dimensions still carry over.
+      const effort = (caps?.reasoning ?? true) && preset.effort !== current.effort ? preset.effort : undefined
+      const presetFast = (caps?.fast ?? false) && preset.fast !== current.fast ? preset.fast : undefined
+
+      if (effort !== undefined || presetFast !== undefined) {
+        controller.applyPreset({ effort, fast: presetFast }, { model: family.id, provider: provider.slug })
+      }
+
       return
     }
 

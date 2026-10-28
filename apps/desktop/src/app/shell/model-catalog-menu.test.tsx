@@ -97,7 +97,7 @@ describe('the catalog owns model curation', () => {
     expect(applyPreset).not.toHaveBeenCalled()
   })
 
-  it('a preserving surface selects only the model, never a remembered effort/Fast preset', async () => {
+  it('a preserving surface applies the target row\'s own remembered effort, but never Fast it cannot do', async () => {
     const applyPreset = vi.fn()
 
     const select = renderMenu({
@@ -109,10 +109,62 @@ describe('the catalog owns model curation', () => {
 
     fireEvent.click(await screen.findByText(/Gemini 3\.1 Pro/i))
     await vi.waitFor(() => expect(select).toHaveBeenCalledWith('gemini-3.1-pro', 'google'))
+    // Effort the user chose on this row survives the pick; Fast is dropped
+    // because the catalog reports no param-fast capability for it.
+    await vi.waitFor(() =>
+      expect(applyPreset).toHaveBeenCalledWith(
+        { effort: 'low', fast: undefined },
+        { model: 'gemini-3.1-pro', provider: 'google' }
+      )
+    )
+  })
+
+  it('a preserving surface carries the session options over when the target row has no preset', async () => {
+    const applyPreset = vi.fn()
+
+    const select = renderMenu({
+      preserveOptionsOnSelect: true,
+      applyPreset,
+      current: { model: '', provider: '', effort: 'high', fast: false },
+      presetFor: () => ({})
+    })
+
+    fireEvent.click(await screen.findByText(/Gemini 3\.1 Pro/i))
+    await vi.waitFor(() => expect(select).toHaveBeenCalledWith('gemini-3.1-pro', 'google'))
     expect(applyPreset).not.toHaveBeenCalled()
   })
 
-  it('still applies no preset when an older selection settles after the newer one', async () => {
+  it('applies a remembered Fast preset only on a model whose catalog row supports param Fast', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          capabilities: { 'claude-opus-5-5': { fast: true, reasoning: true }, 'claude-sonnet-5-5': { fast: false, reasoning: true } },
+          models: ['claude-opus-5-5', 'claude-sonnet-5-5'],
+          name: 'Anthropic',
+          slug: 'anthropic-api'
+        }
+      ]
+    })
+    const applyPreset = vi.fn()
+
+    const select = renderMenu({
+      preserveOptionsOnSelect: true,
+      applyPreset,
+      current: { model: 'claude-sonnet-5-5', provider: 'anthropic-api', effort: 'high', fast: false },
+      presetFor: () => ({ fast: true })
+    })
+
+    fireEvent.click(await screen.findByText(/Opus 5 5/i))
+    await vi.waitFor(() => expect(select).toHaveBeenCalledWith('claude-opus-5-5', 'anthropic-api'))
+    await vi.waitFor(() =>
+      expect(applyPreset).toHaveBeenCalledWith(
+        { effort: undefined, fast: true },
+        { model: 'claude-opus-5-5', provider: 'anthropic-api' }
+      )
+    )
+  })
+
+  it('applies no preset when an older selection settles after the newer one', async () => {
     const applyPreset = vi.fn()
     const settle: Array<(ok: boolean) => void> = []
     const select = vi.fn(() => new Promise<boolean>(resolve => settle.push(resolve)))
@@ -121,7 +173,7 @@ describe('the catalog owns model curation', () => {
       applyPreset,
       current: { model: '', provider: '', effort: 'high', fast: false },
       preserveOptionsOnSelect: true,
-      presetFor: () => ({ effort: 'low', fast: true }),
+      presetFor: () => ({}),
       select
     })
 
