@@ -14,7 +14,10 @@ import signal
 import subprocess
 import sys
 import tempfile
-import tomllib
+try:
+    import tomllib  # Python 3.11+; only needed by the locked policy path
+except ImportError:  # pragma: no cover — py<3.11 can still run --check-uv-version
+    tomllib = None
 from urllib.parse import urlsplit
 
 

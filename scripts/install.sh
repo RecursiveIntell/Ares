@@ -552,20 +552,22 @@ detect_os() {
 # Dependency checks
 # ============================================================================
 
-# True when the managed uv at $1 is inside the reviewed version range.
-# The authoritative range lives in scripts/install_uv_policy.py; this invokes
-# that same script (a sibling of this one) so the two can never drift. When
-# python3 or the policy script is unavailable at this stage, fall through to
-# "valid" — the locked-install policy step still enforces the range.
+# True when the managed uv at $1 is inside the reviewed version range
+# (0.9.28 <= v < 0.13.0). The authoritative range lives in
+# scripts/install_uv_policy.py (the locked-install step enforces it from the
+# checkout); this gate is an INLINE stdlib-only copy so it also works when
+# install.sh is piped (`curl | bash`: $0 is `bash`, there is no sibling script
+# yet). Keep the two in sync — the policy file is the source of truth.
 _managed_uv_in_reviewed_range() {
-    local _py3 _policy
+    local _py3 _ver
     _py3="$(command -v python3 2>/dev/null || true)"
-    _policy="$(dirname "$0")/install_uv_policy.py"
-    if [ -n "$_py3" ] && [ -f "$_policy" ]; then
-        "$_py3" "$_policy" --uv "$1" --check-uv-version >/dev/null 2>&1
-    else
-        return 0
-    fi
+    [ -n "$_py3" ] || return 0  # cannot validate; the locked-install step still enforces
+    _ver="$("$1" --version 2>/dev/null)" || return 0
+    "$_py3" -c '
+import re, sys
+m = re.fullmatch(r"uv (\d+)\.(\d+)\.(\d+)(?: [^\n]*)?\n?", sys.argv[1])
+sys.exit(0 if m and (0, 9, 28) <= tuple(map(int, m.groups())) < (0, 13, 0) else 1)
+' "$_ver" 2>/dev/null
 }
 
 install_uv() {
