@@ -161,7 +161,7 @@ def build_report(workflow: str, runs: list[dict], failed_jobs: dict[str, list[di
                 run_cls = cls
         per_run_classes[rid] = [
             (_parse_ts(r.get("startedAt") or r.get("run_started_at") or ""), c)
-            for c in {classify_failure(j) for j in jobs} or {run_cls}
+            for c in {classify_failure(j) for j in failed_only} or {run_cls}
         ]
 
     streak = green_streak(runs)
@@ -265,8 +265,18 @@ def collect_live(workflows: list[str], limit: int, repo: str) -> tuple[list[dict
                         print(f"warn: jobs for run {rid}: {exc}", file=sys.stderr)
         reports.append(build_report(wf, runs, failed_jobs, DEFAULT_BUDGET_MIN))
     try:
-        raw = gh_json(["api", "--paginate", f"/repos/{repo}/dependabot/alerts?state=open&per_page=100"])
-        total = raw if isinstance(raw, list) else []
+        # --slurp wraps the paginated output into ONE JSON array of pages;
+        # a bare --paginate stream emits one JSON document per page, which a
+        # single json.loads cannot parse once alerts exceed one page.
+        raw = gh_json(["api", "--paginate", "--slurp",
+                       f"/repos/{repo}/dependabot/alerts?state=open&per_page=100"])
+        total: list = []
+        if isinstance(raw, list):
+            for page in raw:
+                if isinstance(page, list):
+                    total.extend(page)
+                elif isinstance(page, dict):
+                    total.append(page)
         crit_high = gh_json(["api", f"/repos/{repo}/dependabot/alerts?state=open&severity=critical&per_page=100"])
         high = gh_json(["api", f"/repos/{repo}/dependabot/alerts?state=open&severity=high&per_page=100"])
         n_crit = len(crit_high) if isinstance(crit_high, list) else 0
@@ -282,7 +292,7 @@ def collect_live(workflows: list[str], limit: int, repo: str) -> tuple[list[dict
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--workflows", default="ci.yml,install-e2e.yml,osv-scanner.yml,e2e-desktop.yml",
+    ap.add_argument("--workflows", default="ci.yaml,install-e2e.yml,osv-scanner.yml,e2e-desktop.yml",
                     help="comma-separated workflow file names or display names")
     ap.add_argument("--limit", type=int, default=50, help="runs per workflow to sample")
     ap.add_argument("--repo", default=REPO)
@@ -293,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.input:
         fixture = json.loads(Path(args.input).read_text(encoding="utf-8"))
         reports = [build_report(wf, d.get("runs", []), d.get("failed_jobs", {}), DEFAULT_BUDGET_MIN)
-                   for wf, d in fixture.items()]
+                   for wf, d in fixture.items() if wf != "__alerts__"]
         alerts = fixture.get("__alerts__")
     else:
         reports, alerts = collect_live([w.strip() for w in args.workflows.split(",") if w.strip()], args.limit, args.repo)
@@ -303,6 +313,7 @@ def main(argv: list[str] | None = None) -> int:
                "reports": reports, "alert_baseline": alerts}
     text = to_markdown(reports, alerts)
     if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(f"{args.out}.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         Path(f"{args.out}.md").write_text(text, encoding="utf-8")
         print(f"wrote {args.out}.json and {args.out}.md")
