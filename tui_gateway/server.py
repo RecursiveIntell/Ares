@@ -16040,6 +16040,24 @@ def _run_prompt_submit(
                 _usage_thread.join()
             with session["history_lock"]:
                 if not owns_admission() or session.get("agent") is not agent:
+                    # Stop revokes EXECUTION authority: no completion, readiness,
+                    # or goal-judge publication from this turn. It does not make
+                    # the turn's transcript disappear -- the agent already
+                    # persisted those rows durably. Adopt them into the live
+                    # history while this exact stopped admission is still the
+                    # latest owner and nothing else mutated history, or the next
+                    # turn starts from the pre-turn snapshot (the "model forgot
+                    # everything" reset). A successor admission fails
+                    # owns_stopped_admission() and is never overwritten.
+                    if (
+                        session.get("agent") is agent
+                        and isinstance(result, dict)
+                        and isinstance(result.get("messages"), list)
+                        and owns_stopped_admission()
+                        and int(session.get("history_version", 0)) == history_version
+                    ):
+                        session["history"] = result["messages"]
+                        session["history_version"] = history_version + 1
                     return
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)

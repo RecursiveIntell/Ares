@@ -48,13 +48,9 @@ export function resolveFastControl(
     return { kind: 'variant', baseId: model, fastId, on: false }
   }
 
-  // Fast isn't natively offered here, but if the session still has the speed
-  // param on (carried over from a previous model), expose the toggle so it can
-  // be turned off rather than stranded.
-  if (currentFastMode) {
-    return { kind: 'param', on: true }
-  }
-
+  // Fast isn't offered on this model. A speed flag carried over from the
+  // previous model is NOT a reason to render a control: the backend already
+  // projects effective Fast off here, and a stranded toggle only misreports it.
   return { kind: 'none' }
 }
 

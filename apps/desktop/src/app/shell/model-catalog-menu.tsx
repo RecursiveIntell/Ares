@@ -267,6 +267,25 @@ export function ModelCatalogMenu({
     }
 
     if (controller.preserveOptionsOnSelect) {
+      // Preserving surfaces keep the session's options for anything the user
+      // never set on the TARGET row. What they did set there (a remembered
+      // preset, capability-gated) is explicit intent for this model and must
+      // not be discarded by the pick; unset dimensions still carry over.
+      // Build a DELTA with only the dimensions that actually differ — passing
+      // an explicit `undefined` for a matching dimension would be spread into
+      // the persisted preset and erase the remembered value.
+      const delta: { effort?: string; fast?: boolean } = {}
+      if ((caps?.reasoning ?? true) && preset.effort !== undefined && preset.effort !== current.effort) {
+        delta.effort = preset.effort
+      }
+      if ((caps?.fast ?? false) && preset.fast !== undefined && preset.fast !== current.fast) {
+        delta.fast = preset.fast
+      }
+
+      if (delta.effort !== undefined || delta.fast !== undefined) {
+        controller.applyPreset(delta, { model: family.id, provider: provider.slug })
+      }
+
       return
     }
 
