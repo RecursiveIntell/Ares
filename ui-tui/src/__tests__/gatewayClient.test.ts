@@ -179,21 +179,23 @@ describe('GatewayClient websocket attach mode', () => {
     await vi.waitFor(() => expect(gatewaySocket.sent).toHaveLength(1))
     const frame = JSON.parse(gatewaySocket.sent[0] ?? '{}') as { id: string }
 
-    gatewaySocket.message(JSON.stringify({
-      id: frame.id,
-      jsonrpc: '2.0',
-      error: {
-        code: 5019,
-        message: 'Stop application could not be confirmed',
-        data: {
-          effect_disposition: 'indeterminate',
-          failure_code: 'interrupt_application_failed',
-          owner_reconciliation_required: true,
-          prompt: 'must not cross the client boundary',
-          token: 'must not cross the client boundary'
+    gatewaySocket.message(
+      JSON.stringify({
+        id: frame.id,
+        jsonrpc: '2.0',
+        error: {
+          code: 5019,
+          message: 'Stop application could not be confirmed',
+          data: {
+            effect_disposition: 'indeterminate',
+            failure_code: 'interrupt_application_failed',
+            owner_reconciliation_required: true,
+            prompt: 'must not cross the client boundary',
+            token: 'must not cross the client boundary'
+          }
         }
-      }
-    }))
+      })
+    )
 
     await expect(req).rejects.toMatchObject({
       name: 'GatewayRpcError',

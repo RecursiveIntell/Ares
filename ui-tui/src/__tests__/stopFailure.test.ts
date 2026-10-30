@@ -22,9 +22,13 @@ describe('Stop failure disposition mapping', () => {
 
   it('does not reinterpret generic transport errors as a Stop disposition', () => {
     expect(stopRecoveryStateFromError(new Error('websocket closed'))).toBeNull()
-    expect(stopRecoveryStateFromError(new GatewayRpcError('Stop failed', 500, {
-      effect_disposition: 'indeterminate'
-    }))).toBeNull()
+    expect(
+      stopRecoveryStateFromError(
+        new GatewayRpcError('Stop failed', 500, {
+          effect_disposition: 'indeterminate'
+        })
+      )
+    ).toBeNull()
   })
 
   it('reconciles an indeterminate Stop with the authoritative accepted-turn projection', async () => {
@@ -39,11 +43,13 @@ describe('Stop failure disposition mapping', () => {
     const sys = vi.fn()
 
     const gw = {
-
-      request: vi.fn()
-        .mockRejectedValueOnce(new GatewayRpcError('Stop application could not be confirmed', 5019, {
-          effect_disposition: 'indeterminate'
-        }))
+      request: vi
+        .fn()
+        .mockRejectedValueOnce(
+          new GatewayRpcError('Stop application could not be confirmed', 5019, {
+            effect_disposition: 'indeterminate'
+          })
+        )
         .mockResolvedValueOnce({ running: false, session_id: 's1' })
     }
 
