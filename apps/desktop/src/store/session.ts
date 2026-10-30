@@ -1225,12 +1225,10 @@ function composerModelOwner(owner: ComposerModelOwner): Readonly<ComposerModelOw
 function composerModelOwnerKeyFor(owner: ComposerModelOwner): string {
   const normalized = composerModelOwner(owner)
 
-  return JSON.stringify([
-    normalized.connectionId,
-    normalized.profile,
-    normalized.targetProfile,
-    normalized.sessionId ?? null
-  ])
+  const base = [normalized.connectionId, normalized.profile, normalized.targetProfile]
+
+  // Session-less (profile-level) owners keep the original three-part key.
+  return JSON.stringify(normalized.sessionId ? [...base, normalized.sessionId] : base)
 }
 
 function boundComposerModelMap<T>(values: Map<string, T>): void {

@@ -26,12 +26,10 @@ export interface MainModelSavedChange extends MainModelSaveOrigin {
 export type OnMainModelChanged = (change: MainModelSavedChange) => void
 
 export function composerOwnerKey(owner: ComposerSelectionOwner): string {
-  return JSON.stringify([
-    owner.connectionId,
-    owner.profile,
-    owner.targetProfile || owner.profile,
-    owner.sessionId ?? null
-  ])
+  const base = [owner.connectionId, owner.profile, owner.targetProfile || owner.profile]
+
+  // Session-less (profile-level) owners keep the original three-part key.
+  return JSON.stringify(owner.sessionId ? [...base, owner.sessionId] : base)
 }
 
 export function composerOwnerForSession(owner: SessionOwnerScope, sessionId?: string): ComposerSelectionOwner | null {
