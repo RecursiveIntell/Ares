@@ -26,12 +26,21 @@ export interface MainModelSavedChange extends MainModelSaveOrigin {
 export type OnMainModelChanged = (change: MainModelSavedChange) => void
 
 export function composerOwnerKey(owner: ComposerSelectionOwner): string {
-  return JSON.stringify([owner.connectionId, owner.profile, owner.targetProfile || owner.profile])
+  return JSON.stringify([
+    owner.connectionId,
+    owner.profile,
+    owner.targetProfile || owner.profile,
+    owner.sessionId ?? null
+  ])
 }
 
-export function composerOwnerForSession(owner: SessionOwnerScope): ComposerSelectionOwner | null {
+export function composerOwnerForSession(owner: SessionOwnerScope, sessionId?: string): ComposerSelectionOwner | null {
   if (typeof owner === 'string') {
-    return { connectionId: null, profile: owner.trim() || 'default' }
+    return {
+      connectionId: null,
+      profile: owner.trim() || 'default',
+      ...(sessionId ? { sessionId } : {})
+    }
   }
 
   if (!owner?.connectionId?.trim()) {
@@ -41,6 +50,7 @@ export function composerOwnerForSession(owner: SessionOwnerScope): ComposerSelec
   return {
     connectionId: owner.connectionId.trim(),
     profile: owner.profile.trim() || 'default',
+    ...(sessionId ? { sessionId } : {}),
     ...(owner.targetProfile?.trim() ? { targetProfile: owner.targetProfile.trim() } : {})
   }
 }

@@ -1095,14 +1095,20 @@ export const setResumeExhaustedSessionId = (next: Updater<string | null>) => upd
 export const setBusy = (next: Updater<boolean>) => updateAtom($busy, next)
 export const setAwaitingResponse = (next: Updater<boolean>) => updateAtom($awaitingResponse, next)
 
-export const setCurrentModel = (next: Updater<string>) => {
+export const setCurrentModel = (next: Updater<string>, persist = true) => {
   updateAtom($currentModel, next)
-  persistString(COMPOSER_MODEL_KEY, $currentModel.get() || null)
+
+  if (persist) {
+    persistString(COMPOSER_MODEL_KEY, $currentModel.get() || null)
+  }
 }
 
-export const setCurrentProvider = (next: Updater<string>) => {
+export const setCurrentProvider = (next: Updater<string>, persist = true) => {
   updateAtom($currentProvider, next)
-  persistString(COMPOSER_PROVIDER_KEY, $currentProvider.get() || null)
+
+  if (persist) {
+    persistString(COMPOSER_PROVIDER_KEY, $currentProvider.get() || null)
+  }
 }
 
 export const getCurrentModelSource = (): ComposerModelSource => {
@@ -1170,6 +1176,7 @@ export const markComposerSelectionManual = (): void => {
 export interface ComposerModelOwner {
   connectionId: string | null
   profile: string
+  sessionId?: string
   targetProfile?: string
 }
 
@@ -1207,13 +1214,23 @@ function composerModelOwner(owner: ComposerModelOwner): Readonly<ComposerModelOw
 
   const profile = owner.profile.trim() || 'default'
 
-  return Object.freeze({ connectionId, profile, targetProfile: owner.targetProfile?.trim() || profile })
+  return Object.freeze({
+    connectionId,
+    profile,
+    ...(owner.sessionId?.trim() ? { sessionId: owner.sessionId.trim() } : {}),
+    targetProfile: owner.targetProfile?.trim() || profile
+  })
 }
 
 function composerModelOwnerKeyFor(owner: ComposerModelOwner): string {
   const normalized = composerModelOwner(owner)
 
-  return JSON.stringify([normalized.connectionId, normalized.profile, normalized.targetProfile])
+  return JSON.stringify([
+    normalized.connectionId,
+    normalized.profile,
+    normalized.targetProfile,
+    normalized.sessionId ?? null
+  ])
 }
 
 function boundComposerModelMap<T>(values: Map<string, T>): void {
@@ -1229,6 +1246,10 @@ function boundComposerModelMap<T>(values: Map<string, T>): void {
 /** Foreground draft transitions invalidate pending defaults, including A→B→A.
  *  Known route-qualified manual pins survive. Live tile writes do not call this. */
 export function setComposerModelSelectionOwner(owner: ComposerModelOwner): void {
+  if (owner.sessionId) {
+    return
+  }
+
   const key = composerModelOwnerKeyFor(owner)
 
   if (key !== composerModelOwnerKey) {
@@ -1256,10 +1277,12 @@ export function captureComposerModelSelection(owner: ComposerModelOwner): Compos
 }
 
 function ownsComposerModelSelection(ticket: ComposerModelSelectionTicket): boolean {
+  const sessionScoped = Boolean(ticket.owner.sessionId)
+
   return (
     ticket.ownerKey === composerModelOwnerKeyFor(ticket.owner) &&
-    ticket.ownerEpoch === composerModelOwnerEpoch &&
-    ticket.selectionGeneration === composerSelectionGeneration &&
+    (sessionScoped ||
+      (ticket.ownerEpoch === composerModelOwnerEpoch && ticket.selectionGeneration === composerSelectionGeneration)) &&
     composerModelRequests.get(ticket.ownerKey) === ticket.requestGeneration
   )
 }

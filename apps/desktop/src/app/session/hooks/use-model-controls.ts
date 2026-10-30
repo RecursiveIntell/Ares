@@ -263,7 +263,14 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
       const touchesPrimary = !liveSessionId || liveSessionId === primaryRuntimeId
 
       const runtimeOwner = liveSessionId ? knownOwnerForSession(liveSessionId) : null
-      const composerOwner = liveSessionId ? composerOwnerForSession(runtimeOwner) : captureDraftComposerOwner()
+
+      const composerOwner = liveSessionId
+        ? (composerOwnerForSession(runtimeOwner, liveSessionId) ?? {
+            connectionId: getApiRequestConnection(),
+            profile: $activeGatewayProfile.get().trim() || 'default',
+            sessionId: liveSessionId
+          })
+        : captureDraftComposerOwner()
 
       if (!liveSessionId && composerOwner) {
         setComposerModelSelectionOwner(composerOwner)
@@ -390,27 +397,30 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
       let publishedComposerStamp: ComposerStamp | null = null
 
       const paintSelection = () => {
-        if (touchesPrimary) {
-          // Mirror first, then capture the exact manual intent generation as
-          // required by the independently owned ticket/receipt store.
+        if (touchesPrimary && liveSessionId) {
+          // The primary session's mirror is transient; its owner-qualified
+          // receipt below is session-scoped, not the profile's draft selection.
+          setCurrentModel(selection.model, false)
+          setCurrentProvider(selection.provider, false)
+        } else if (touchesPrimary) {
           setCurrentModel(selection.model)
           setCurrentProvider(selection.provider)
           markComposerSelectionManual()
+        }
 
-          if (composerOwner) {
-            const stamp = recordComposerModelSelection(captureComposerModelSelection(composerOwner), {
-              model: selection.model,
-              provider: selection.provider,
-              source: 'manual'
-            })
+        if (touchesPrimary && composerOwner) {
+          const stamp = recordComposerModelSelection(captureComposerModelSelection(composerOwner), {
+            model: selection.model,
+            provider: selection.provider,
+            source: 'manual'
+          })
 
-            if (stamp) {
-              publishedComposerStamp = stamp
-              composerRollbacks.set(selectionTarget, { published: stamp, baseline: rollbackComposerStamp })
+          if (stamp) {
+            publishedComposerStamp = stamp
+            composerRollbacks.set(selectionTarget, { published: stamp, baseline: rollbackComposerStamp })
 
-              while (composerRollbacks.size > 1024) {
-                composerRollbacks.delete(composerRollbacks.keys().next().value!)
-              }
+            while (composerRollbacks.size > 1024) {
+              composerRollbacks.delete(composerRollbacks.keys().next().value!)
             }
           }
         }
@@ -478,9 +488,14 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
             composerRollbacks.delete(selectionTarget)
           }
 
-          setCurrentModel(appliedRollbackModel)
-          setCurrentProvider(appliedRollbackProvider)
-          setCurrentModelSource(appliedRollbackSource)
+          if (liveSessionId) {
+            setCurrentModel(appliedRollbackModel, false)
+            setCurrentProvider(appliedRollbackProvider, false)
+          } else {
+            setCurrentModel(appliedRollbackModel)
+            setCurrentProvider(appliedRollbackProvider)
+            setCurrentModelSource(appliedRollbackSource)
+          }
         }
 
         cacheSelection(appliedRollbackProvider, appliedRollbackModel)
@@ -625,12 +640,14 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
                 $currentModel.get() === rollbackModel &&
                 $currentProvider.get() === rollbackProvider
               ) {
-                setCurrentModel(selection.model)
-                setCurrentProvider(selection.provider)
-                setCurrentModelSource('manual')
-                // Preserve the live-runtime acknowledgement. This late result
-                // has no proven draft-stamp checkpoint lineage, so it cannot
-                // republish a manual stamp over newer owner intent.
+                setCurrentModel(selection.model, !liveSessionId)
+                setCurrentProvider(selection.provider, !liveSessionId)
+
+                if (!liveSessionId) {
+                  setCurrentModelSource('manual')
+                }
+                // A live session's selection receipt is session-qualified; the
+                // profile-scoped draft owner is not republished here.
               }
 
               cacheSelection(selection.provider, selection.model)
@@ -703,13 +720,14 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
             // matches the snapshot this notification was created for.
             isStale: () =>
               !owns('model') ||
-              (touchesPrimary
+              (touchesPrimary && !liveSessionId
                 ? !stillOwnsPrimarySelection() ||
                   $currentModel.get() !== prevModel ||
                   $currentProvider.get() !== prevProvider
                 : !liveSessionId ||
-                  $sessionStates.get()[liveSessionId]?.model !== prevModel ||
-                  $sessionStates.get()[liveSessionId]?.provider !== prevProvider),
+                  ($sessionStates.get()[liveSessionId] !== undefined &&
+                    ($sessionStates.get()[liveSessionId]?.model !== prevModel ||
+                      $sessionStates.get()[liveSessionId]?.provider !== prevProvider))),
             repaint: () => {
               paintSelection()
               cacheSelection(selection.provider, selection.model)

@@ -4,9 +4,10 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 
 import { setApiRequestConnection } from '@/api/client'
 import { DropdownMenu, DropdownMenuContent } from '@/components/ui/dropdown-menu'
-import { setModelPreset } from '@/store/model-presets'
+import { activeGatewayConnectionId } from '@/store/gateway'
+import { $modelPresets, modelPresetScopeKey, setModelPreset } from '@/store/model-presets'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
-import { $activeSessionId, $currentModel, $currentProvider } from '@/store/session'
+import { $activeSessionId, $currentModel, $currentProvider, $selectedStoredSessionId } from '@/store/session'
 import { $sessions, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
 
 import { ModelMenuPanel } from './model-menu-panel'
@@ -57,6 +58,8 @@ const MOCK_PROVIDERS = [DEEPSEEK_PROVIDER, GOOGLE_PROVIDER, MOA_PROVIDER]
 beforeEach(() => {
   _resetSessionOwnerHintsForTests()
   $sessions.set([])
+  $selectedStoredSessionId.set(null)
+  $modelPresets.set({})
   $activeSessionId.set('runtime-1')
   $currentModel.set('')
   $currentProvider.set('')
@@ -178,7 +181,15 @@ describe('ModelMenuPanel current selection', () => {
   it('applies saved options through the live alias of a custom provider', async () => {
     $currentProvider.set('custom:foo')
     $currentModel.set('fixture')
-    setModelPreset('foo', 'fixture', { effort: 'high' })
+
+    const scopeKey = modelPresetScopeKey({
+      connectionId: activeGatewayConnectionId(),
+      draftId: 'draft-test',
+      profile: 'default',
+      sessionId: 'runtime-1'
+    })
+
+    setModelPreset(scopeKey, 'foo', 'fixture', { effort: 'high' })
     getGlobalModelOptions.mockResolvedValue({
       providers: [
         {
@@ -201,6 +212,29 @@ describe('ModelMenuPanel current selection', () => {
         value: { effort: 'high' }
       })
     )
+  })
+
+  it('does not show another session’s saved target options', async () => {
+    $currentProvider.set('foo')
+    $currentModel.set('fixture')
+
+    const otherSessionScope = modelPresetScopeKey({
+      connectionId: activeGatewayConnectionId(),
+      draftId: 'draft-test',
+      profile: 'default',
+      sessionId: 'runtime-other'
+    })
+
+    setModelPreset(otherSessionScope, 'foo', 'fixture', { effort: 'high' })
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [{ models: ['fixture'], name: 'Foo', slug: 'foo' }]
+    })
+
+    const { content } = renderPanel()
+    const row = (await content.findByText('Fixture')).closest('[role="menuitem"]')!
+    fireEvent.keyDown(row, { key: 'ArrowRight' })
+
+    expect(screen.queryByRole('menuitem', { name: /apply options/i })).toBeNull()
   })
 
   it('keeps the checkmark on the live SessionView model when a stale options response disagrees', async () => {

@@ -291,8 +291,13 @@ describe('useModelControls', () => {
     })
   })
 
-  it('keeps an active primary-session picker change scoped to that session', async () => {
+  it('keeps an active primary-session picker change out of persisted draft model preferences', async () => {
     $activeSessionId.set('session-1')
+    setCurrentModel('draft-model')
+    setCurrentProvider('draft-provider')
+    setCurrentModelSource('manual')
+    const persistedDraftModel = window.localStorage.getItem('hermes.desktop.composer.model')
+    const persistedDraftProvider = window.localStorage.getItem('hermes.desktop.composer.provider')
     const requestGateway = vi.fn(async () => ({ key: 'model', value: 'claude-sonnet-4.6' }) as never)
     let controls!: Controls
 
@@ -313,6 +318,11 @@ describe('useModelControls', () => {
       value: 'claude-sonnet-4.6 --provider anthropic --session'
     })
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    expect($currentModel.get()).toBe('claude-sonnet-4.6')
+    expect($currentProvider.get()).toBe('anthropic')
+    expect(window.localStorage.getItem('hermes.desktop.composer.model')).toBe(persistedDraftModel)
+    expect(window.localStorage.getItem('hermes.desktop.composer.provider')).toBe(persistedDraftProvider)
+    expect(getCurrentModelSource()).toBe('manual')
   })
 
   it('resumes a stored primary session and retries config.set after its runtime was reaped', async () => {
@@ -389,7 +399,7 @@ describe('useModelControls', () => {
     expect(notifyError).not.toHaveBeenCalled()
   })
 
-  it('keeps a mid-turn pick painted and skips the refetch that would repaint the old model', async () => {
+  it('keeps a mid-turn pick session-scoped and skips the refetch that would repaint the old model', async () => {
     // The gateway queues a switch made during a turn and applies it at the next
     // turn start. Invalidating now would answer with the still-running model
     // and overwrite the user's choice in the pill.

@@ -310,7 +310,12 @@ describe('real core owner receipts produced by controls', () => {
     second.reject(new Error('newer rejected'))
     await newerPick
     expect($sessionStates.get()['runtime-owned'].model).toBe('model-b')
-    expect(getComposerModelSelection(a)).toMatchObject({ model: 'model-b', provider: 'provider-b', source: 'manual' })
+    expect(getComposerModelSelection(a)?.model).toBe('model-a')
+    expect(getComposerModelSelection({ ...a, sessionId: 'runtime-owned' })).toMatchObject({
+      model: 'model-b',
+      provider: 'provider-b',
+      source: 'manual'
+    })
   })
 
   it('late older success preserves runtime handling without republishing an unproved draft stamp', async () => {

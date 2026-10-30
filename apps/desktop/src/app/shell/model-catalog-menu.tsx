@@ -74,11 +74,14 @@ export interface ModelChoice {
 export interface ModelMenuController {
   /** Live chats preserve explicit options; preset application is deliberate. */
   preserveOptionsOnSelect?: boolean
-  /** Restore a model's remembered settings after it is selected. Separate from
-   *  `setOptions` because it is one atomic "apply this model's preset" write,
-   *  not a user editing one control — surfaces that write through to a session
-   *  need to batch it. Values are already capability-gated by the menu. */
-  applyPreset: (preset: { effort?: string; fast?: boolean }, row: { model: string; provider: string }) => void
+  /** Snapshot option intent before the asynchronous model switch. The opaque token lets the host skip stale follow-up writes. */
+  beginSelection?: (provider: string, model: string) => unknown
+  /** Restore a target model's explicitly remembered settings after selection. */
+  applyPreset: (
+    preset: { effort?: string; fast?: boolean },
+    row: { model: string; provider: string; selectionModel?: string },
+    intent?: unknown
+  ) => void
   current: ModelChoice
   presetFor: (provider: string, model: string) => { effort?: string; fast?: boolean }
   /** Commit a model row. Return false to abort (a failed session switch). */
@@ -238,10 +241,11 @@ export function ModelCatalogMenu({
   const selectFamily = async (family: ModelFamily, provider: ModelOptionProvider) => {
     const caps = provider.capabilities?.[family.id]
     const preset = controller.presetFor(provider.slug, family.id)
+    const intent = controller.beginSelection?.(provider.slug, family.id)
 
-    // Variant-fast models (no speed param) express "fast" as a separate `-fast`
-    // id, so honor the remembered preset by selecting that sibling. Param-fast
-    // is applied through setOptions below instead.
+    // A Fast variant is selected by model ID. Otherwise derive the session's
+    // effective Fast choice from its current family/capability, not from a
+    // global preset or a parameter carried by a different session.
     const variantFast = !(caps?.fast ?? false) && !!family.fastId
     const currentProvider = pickerProviders.find(row => isCurrentProvider(row, current.provider))
 
@@ -259,14 +263,35 @@ export function ModelCatalogMenu({
     )
 
     const preservedFast = currentFast.kind === 'none' ? current.fast : currentFast.on
-    const fast = controller.preserveOptionsOnSelect ? preservedFast : preset.fast
-    const targetId = variantFast && fast === true ? family.fastId! : family.id
+    const targetFast = preset.fast ?? preservedFast
+    const targetId = variantFast && targetFast ? family.fastId! : family.id
 
     if ((await controller.select(targetId, provider.slug)) === false) {
       return
     }
 
     if (controller.preserveOptionsOnSelect) {
+      const changes: { effort?: string; fast?: boolean } = {}
+
+      if ((caps?.reasoning ?? true) && preset.effort !== undefined && preset.effort !== current.effort) {
+        changes.effort = preset.effort
+      }
+
+      if (caps?.fast && targetFast !== current.fast) {
+        changes.fast = targetFast
+      } else if (!targetFast && current.fast) {
+        // The target explicitly turns Fast off; clear a parameter carried by
+        // the previous model even when the target uses a different mechanism.
+        changes.fast = false
+      } else if (!caps?.fast && !variantFast && preset.fast === true) {
+        // Never forward a positive Fast parameter to a model with no mechanism.
+        changes.fast = false
+      }
+
+      if (changes.effort !== undefined || changes.fast !== undefined) {
+        controller.applyPreset(changes, { model: family.id, provider: provider.slug, selectionModel: targetId }, intent)
+      }
+
       return
     }
 
@@ -275,7 +300,8 @@ export function ModelCatalogMenu({
         effort: (caps?.reasoning ?? true) ? (preset.effort ?? defaultEffort) : undefined,
         fast: (caps?.fast ?? false) ? (preset.fast ?? false) : undefined
       },
-      { model: family.id, provider: provider.slug }
+      { model: family.id, provider: provider.slug, selectionModel: targetId },
+      intent
     )
   }
 
@@ -477,12 +503,17 @@ export function ModelCatalogMenu({
                     const effEffort = isCurrent ? current.effort : (preset.effort ?? '')
                     const effFast = isCurrent ? current.fast : (preset.fast ?? false)
 
-                    const fastControl: FastControl = resolveFastControl(
+                    const resolvedFastControl = resolveFastControl(
                       activeId ?? family.id,
                       group.provider.models ?? [],
                       caps?.fast ?? false,
                       effFast
                     )
+
+                    const fastControl: FastControl =
+                      !isCurrent && resolvedFastControl.kind === 'variant'
+                        ? { ...resolvedFastControl, on: effFast }
+                        : resolvedFastControl
 
                     const meta = [
                       fastControl.kind !== 'none' && fastControl.on ? copy.fast : null,
@@ -539,7 +570,11 @@ export function ModelCatalogMenu({
                                       effort: (caps?.reasoning ?? true) ? preset.effort : undefined,
                                       fast: (caps?.fast ?? false) ? preset.fast : undefined
                                     },
-                                    { model: family.id, provider: group.provider.slug }
+                                    {
+                                      model: family.id,
+                                      provider: group.provider.slug,
+                                      selectionModel: activeId ?? family.id
+                                    }
                                   )
                               : undefined
                           }
