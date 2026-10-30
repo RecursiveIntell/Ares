@@ -11,6 +11,7 @@ import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
+  $currentReasoningEffort,
   $selectedStoredSessionId,
   setCurrentModel,
   setCurrentProvider,
@@ -294,6 +295,62 @@ describe('ModelMenuPanel current selection', () => {
       }
     ])
     expect(getModelPreset(scopeKey, 'google', 'gemini-3.1-pro')).toEqual({ effort: 'high' })
+  })
+
+  it('does not apply a preset when an older model selection settles after the newer one', async () => {
+    $activeSessionId.set(null)
+    $currentProvider.set('deepseek')
+    $currentModel.set('deepseek-v4-pro')
+    setCurrentReasoningEffort('medium')
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          capabilities: {
+            'gemini-2.5-flash': { fast: true, reasoning: true },
+            'gemini-3.1-pro': { fast: true, reasoning: true }
+          },
+          models: ['gemini-3.1-pro', 'gemini-2.5-flash'],
+          name: 'Google',
+          slug: 'google'
+        }
+      ]
+    })
+
+    const settle: Array<(applied: boolean) => void> = []
+
+    const onSelectModel = vi.fn((selection: { model: string; provider: string }) => {
+      setCurrentModel(selection.model, false)
+      setCurrentProvider(selection.provider, false)
+
+      return new Promise<boolean>(resolve => settle.push(resolve))
+    })
+
+    const { content } = renderPanel(onSelectModel)
+
+    const firstRow = (await content.findByText(/Gemini 3\.1 Pro/i)).closest('[role="menuitem"]')!
+    fireEvent.keyDown(firstRow, { key: 'ArrowRight' })
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /^Low$/i }))
+
+    const secondRow = (await content.findByText(/Gemini 2\.5 Flash/i)).closest('[role="menuitem"]')!
+    fireEvent.keyDown(secondRow, { key: 'ArrowRight' })
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /^High$/i }))
+
+    fireEvent.click(await content.findByText(/Gemini 3\.1 Pro/i))
+    fireEvent.click(await content.findByText(/Gemini 2\.5 Flash/i))
+
+    expect(onSelectModel).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      settle[1](true)
+    })
+    expect($currentReasoningEffort.get()).toBe('high')
+
+    await act(async () => {
+      settle[0](true)
+    })
+
+    expect($currentModel.get()).toBe('gemini-2.5-flash')
+    expect($currentReasoningEffort.get()).toBe('high')
   })
 
   it('does not show another session’s saved target options', async () => {
