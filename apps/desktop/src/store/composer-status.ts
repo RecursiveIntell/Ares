@@ -198,8 +198,8 @@ const stabilizeItems = (prev: ComposerStatusItem[] | undefined, next: ComposerSt
 let prevStatusItems: Record<string, ComposerStatusItem[]> = {}
 
 export const $statusItemsBySession = computed(
-  [$goalsBySession, $subagentsBySession, $backgroundStatusBySession, $todosBySession],
-  (goals, subs, background, todos) => {
+  [$goalsBySession, $subagentsBySession, $backgroundStatusBySession, $todosBySession, $sessions],
+  (goals, subs, background, todos, sessions) => {
     const out: Record<string, ComposerStatusItem[]> = {}
 
     const push = (sid: string, items: ComposerStatusItem[]) => {
@@ -213,7 +213,15 @@ export const $statusItemsBySession = computed(
     }
 
     for (const [sid, goal] of Object.entries(goals)) {
-      push(sid, [goalToItem(goal)])
+      // Goals are keyed by the STORED session id, but the composer status
+      // stack subscribes by the RUNTIME id. Re-map through the lineage alias
+      // set (same pattern as $backgroundRunningSessionIds) so the goal
+      // indicator renders for bound sessions and survives compression-tip
+      // rotation; a not-yet-persisted session has no lineage entry and falls
+      // back to the stored key, which equals the runtime key pre-persist.
+      for (const alias of lineageAliases(sid, sessions)) {
+        push(alias, [goalToItem(goal)])
+      }
     }
 
     for (const [sid, list] of Object.entries(subs)) {

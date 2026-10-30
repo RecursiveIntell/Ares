@@ -26,6 +26,7 @@ import {
 } from '@/store/composer-status'
 import { refreshSessionGoal } from '@/store/goals'
 import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview-status'
+import { $sessionStates } from '@/store/session-states'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { openSessionInNewWindow } from '@/store/windows'
 
@@ -108,7 +109,10 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   useEffect(() => {
     if (sessionId) {
       void refreshBackgroundProcesses(sessionId)
-      void refreshSessionGoal(sessionId)
+      // F1.1: hydration RPC keeps the runtime id; the chip's map key resolves
+      // through the runtime→stored binding when it is known.
+      const storedId = $sessionStates.get()[sessionId]?.storedSessionId
+      void refreshSessionGoal(sessionId, storedId ? { mapKey: storedId } : undefined)
     }
   }, [sessionId])
 

@@ -1281,7 +1281,7 @@ class SessionStore:
     """
     
     def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None):
+                 has_active_processes_fn=None, has_nonterminal_goal_fn=None):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
@@ -1319,6 +1319,9 @@ class SessionStore:
         self._transcript_append_failures: Dict[str, int] = {}
         self._fts_rebuild_attempted = False
         self._has_active_processes_fn = has_active_processes_fn
+        # F3.5 (goal-loop fix plan): standing-goal presence guard; consulted
+        # beside _has_active_processes_safe at the three expiry/reset sites.
+        self._has_nonterminal_goal_fn = has_nonterminal_goal_fn
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
         # backward compatibility; disable via gateway.write_sessions_json.
@@ -1462,7 +1465,28 @@ class SessionStore:
                 exc,
             )
             return True
-    
+
+    def _has_standing_goal_safe(self, session_id: str, *, context: str) -> bool:
+        """Return whether a session holds a standing /goal (F3.5, goal-loop plan).
+
+        ``session_id`` is the DB session id (the goal rows' key namespace),
+        NOT the routing key — callers pass ``entry.session_id``. Failure
+        semantics live in the closure; when no closure is configured this is
+        a no-op, matching _has_active_processes_safe's unset behavior.
+        """
+        if self._has_nonterminal_goal_fn is None:
+            return False
+        try:
+            return bool(self._has_nonterminal_goal_fn(session_id))
+        except Exception as exc:
+            logger.warning(
+                "has_nonterminal_goal_fn raised during %s for %s; treating goal as present: %s",
+                context,
+                session_id,
+                exc,
+            )
+            return True
+
     def _ensure_loaded(self) -> None:
         """Load sessions index from disk if not already loaded."""
         with self._lock:
@@ -2448,6 +2472,14 @@ class SessionStore:
             )
             return False
 
+        # F3.5 (goal-loop plan): a standing /goal keeps the session alive too.
+        if self._has_standing_goal_safe(entry.session_id, context="expiry"):
+            logger.debug(
+                "Session %s not expired — standing goal present",
+                entry.session_key,
+            )
+            return False
+
         policy = self.config.get_reset_policy(
             platform=entry.platform,
             session_type=entry.chat_type,
@@ -2545,6 +2577,17 @@ class SessionStore:
         if self._has_active_processes_safe(session_key, context="reset"):
             logger.debug(
                 "Session reset skipped for %s — active background processes",
+                session_key,
+            )
+            return None
+
+        # F3.5 (goal-loop plan): reset needs the DB session id, not the
+        # routing key — resolve it from the live entry when one exists.
+        _reset_goal_sid = (self._entries.get(session_key).session_id
+                           if self._entries.get(session_key) is not None else "")
+        if _reset_goal_sid and self._has_standing_goal_safe(_reset_goal_sid, context="reset"):
+            logger.debug(
+                "Session reset skipped for %s — standing goal present",
                 session_key,
             )
             return None
@@ -3006,6 +3049,26 @@ class SessionStore:
             # "resume_pending_expired" is distinguishable from a normal
             # "session_reset" caused by idle/daily expiry).
             _db_end_reason = auto_reset_reason if auto_reset_reason else "session_reset"
+            # F3.1/F3.2 (goal-loop fix plan): the row-ending point is the ONE
+            # migration site. A non-terminal goal on the predecessor row must not
+            # outlive the boundary silently — compression does
+            # migrate_goal_to_session at its own boundary
+            # (agent/conversation_compression.py); every reset-shape boundary
+            # lands here. Successor id is the entry's NEW db session id (minted
+            # during phase 2, held on db_create_kwargs); when no successor row is
+            # produced, the goal is archived visibly instead of orphaned.
+            _goal_successor_id = (
+                str(db_create_kwargs.get("session_id") or "") if db_create_kwargs else ""
+            )
+            try:
+                from hermes_cli.goals import _migrate_or_archive_on_boundary
+                _migrate_or_archive_on_boundary(
+                    old_session_id=str(db_end_session_id or ""),
+                    successor_session_id=_goal_successor_id,
+                    reason=_db_end_reason,
+                )
+            except Exception as _goal_boundary_exc:
+                logger.debug("goal boundary migration failed: %s", _goal_boundary_exc)
             try:
                 # promote_to_session_reset, not end_session: the row may
                 # already be ended with a recoverable accidental reason
@@ -3395,6 +3458,10 @@ class SessionStore:
                 # has_active_for_session); passing session_id here used to
                 # never match, so active sessions got pruned anyway.
                 if self._has_active_processes_safe(entry.session_key, context="prune"):
+                    continue
+                # Never prune a session holding a standing /goal either
+                # (F3.5, goal-loop plan) — same keep-alive reasoning.
+                if self._has_standing_goal_safe(entry.session_id, context="prune"):
                     continue
                 if entry.updated_at < cutoff:
                     removed_keys.append(key)
