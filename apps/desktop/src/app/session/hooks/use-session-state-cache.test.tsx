@@ -190,7 +190,11 @@ describe('useSessionStateCache — per-session turn timer', () => {
     expect($turnStartedAt.get()).toBeNull()
   })
 
-  it('mirrors the focused session model metadata when switching from a cached session', () => {
+  it('mirrors the focused session model metadata without changing draft preferences', () => {
+    setCurrentModel('draft-model')
+    setCurrentProvider('draft-provider')
+    const savedDraftModel = window.localStorage.getItem('hermes.desktop.composer.model')
+    const savedDraftProvider = window.localStorage.getItem('hermes.desktop.composer.provider')
     let cache!: Cache
 
     const { rerender } = render(
@@ -212,8 +216,10 @@ describe('useSessionStateCache — per-session turn timer', () => {
       )
     })
 
-    // Background metadata is cached but must not bleed into the visible statusbar.
-    expect($currentModel.get()).toBe('')
+    // Background metadata is cached but must not bleed into the visible statusbar;
+    // the saved draft preference remains the only value outside the live session.
+    expect($currentModel.get()).toBe('draft-model')
+    expect($currentProvider.get()).toBe('draft-provider')
     expect($currentReasoningEffort.get()).toBe('')
     expect($currentFastMode.get()).toBe(false)
 
@@ -228,6 +234,8 @@ describe('useSessionStateCache — per-session turn timer', () => {
 
     expect($currentModel.get()).toBe('anthropic/claude-opus-4.8')
     expect($currentProvider.get()).toBe('anthropic')
+    expect(window.localStorage.getItem('hermes.desktop.composer.model')).toBe(savedDraftModel)
+    expect(window.localStorage.getItem('hermes.desktop.composer.provider')).toBe(savedDraftProvider)
     expect($currentReasoningEffort.get()).toBe('high')
     expect($currentServiceTier.get()).toBe('priority')
     expect($currentFastMode.get()).toBe(true)
