@@ -47,7 +47,9 @@ on:
         value: ${{ jobs.aggregate.outputs.critical_findings }}
 
 permissions:
-  pull-requests: write
+  # Task 4.2: this workflow posts no PR comments (verified E-64; the review
+  # comment posts from ci-review-comment.yml, a workflow_run top-level flow).
+  pull-requests: read
   contents: read
 
 jobs:
