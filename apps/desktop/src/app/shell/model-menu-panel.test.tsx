@@ -1,14 +1,23 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { setApiRequestConnection } from '@/api/client'
 import { DropdownMenu, DropdownMenuContent } from '@/components/ui/dropdown-menu'
 import { activeGatewayConnectionId } from '@/store/gateway'
-import { $modelPresets, modelPresetScopeKey, setModelPreset } from '@/store/model-presets'
+import { $modelPresets, getModelPreset, modelPresetScopeKey, setModelPreset } from '@/store/model-presets'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
-import { $activeSessionId, $currentModel, $currentProvider, $selectedStoredSessionId } from '@/store/session'
+import {
+  $activeSessionId,
+  $currentModel,
+  $currentProvider,
+  $selectedStoredSessionId,
+  setCurrentModel,
+  setCurrentProvider,
+  setCurrentReasoningEffort
+} from '@/store/session'
 import { $sessions, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
+import { $sessionStates } from '@/store/session-states'
 
 import { ModelMenuPanel } from './model-menu-panel'
 
@@ -58,11 +67,13 @@ const MOCK_PROVIDERS = [DEEPSEEK_PROVIDER, GOOGLE_PROVIDER, MOA_PROVIDER]
 beforeEach(() => {
   _resetSessionOwnerHintsForTests()
   $sessions.set([])
+  $sessionStates.set({})
   $selectedStoredSessionId.set(null)
   $modelPresets.set({})
   $activeSessionId.set('runtime-1')
   $currentModel.set('')
   $currentProvider.set('')
+  setCurrentReasoningEffort('')
   $collapsedProviders.set([])
   getGlobalModelOptions.mockResolvedValue({ providers: MOCK_PROVIDERS })
 })
@@ -212,6 +223,77 @@ describe('ModelMenuPanel current selection', () => {
         value: { effort: 'high' }
       })
     )
+  })
+
+  it('a target-row effort edit made during a pending model switch supersedes the captured preset', async () => {
+    $currentProvider.set('deepseek')
+    $currentModel.set('deepseek-v4-pro')
+    setCurrentReasoningEffort('medium')
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          capabilities: { 'gemini-3.1-pro': { fast: true, reasoning: true } },
+          models: ['gemini-3.1-pro'],
+          name: 'Google',
+          slug: 'google'
+        }
+      ]
+    })
+
+    const scopeKey = modelPresetScopeKey({
+      connectionId: activeGatewayConnectionId(),
+      draftId: 'draft-test',
+      profile: 'default',
+      sessionId: 'runtime-1'
+    })
+
+    setModelPreset(scopeKey, 'google', 'gemini-3.1-pro', { effort: 'low' })
+
+    let resolveSwitch!: (applied: boolean) => void
+
+    const switchResult = new Promise<boolean>(resolve => {
+      resolveSwitch = resolve
+    })
+
+    const onSelectModel = vi.fn((selection: { model: string; provider: string }) => {
+      setCurrentModel(selection.model, false)
+      setCurrentProvider(selection.provider, false)
+
+      return switchResult
+    })
+
+    const requestGateway = vi.fn().mockResolvedValue({})
+    const { content } = renderPanel(onSelectModel, requestGateway)
+
+    const target = await content.findByText(/Gemini 3\.1 Pro/i)
+    fireEvent.click(target)
+    expect(onSelectModel).toHaveBeenCalledWith({ model: 'gemini-3.1-pro', provider: 'google', sessionId: 'runtime-1' })
+
+    fireEvent.keyDown(target.closest('[role="menuitem"]')!, { key: 'ArrowRight' })
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /^High$/i }))
+    await vi.waitFor(() =>
+      expect(requestGateway).toHaveBeenCalledWith('config.set', {
+        key: 'runtime_options',
+        session_id: 'runtime-1',
+        value: { effort: 'high' }
+      })
+    )
+
+    await act(async () => {
+      resolveSwitch(true)
+      await switchResult
+    })
+
+    expect(
+      requestGateway.mock.calls.map(([, params]) => params).filter(params => params?.key === 'runtime_options')
+    ).toEqual([
+      {
+        key: 'runtime_options',
+        session_id: 'runtime-1',
+        value: { effort: 'high' }
+      }
+    ])
+    expect(getModelPreset(scopeKey, 'google', 'gemini-3.1-pro')).toEqual({ effort: 'high' })
   })
 
   it('does not show another session’s saved target options', async () => {

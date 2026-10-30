@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
 
@@ -15,22 +15,39 @@ import {
   $activeSessionId,
   $currentFastMode,
   $currentReasoningEffort,
+  $selectedStoredSessionId,
   getComposerRuntimeOptions,
   setCurrentFastMode,
   setCurrentReasoningEffort
 } from './session'
-import { $sessionStates } from './session-states'
+import { $sessionStates, publishSessionState, type SessionTileDelegate, setSessionTileDelegate } from './session-states'
 
 type GatewayRequest = <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 
 const sessionScope = (sessionId: string) =>
   modelPresetScopeKey({ connectionId: 'source-a', draftId: 'draft', profile: 'worker', sessionId })
 
+const createSessionTileDelegate = (updateSession: SessionTileDelegate['updateSession']): SessionTileDelegate => ({
+  archiveSession: async () => undefined,
+  branchSession: async () => undefined,
+  deleteSession: async () => undefined,
+  executeSlash: async () => undefined,
+  interruptSession: async () => undefined,
+  resumeTile: async () => 'runtime-a',
+  submitToSession: async () => undefined,
+  updateSession
+})
+
 describe('session-scoped model presets', () => {
+  afterEach(() => {
+    setSessionTileDelegate(createSessionTileDelegate(() => undefined as never))
+  })
+
   beforeEach(() => {
     $modelPresets.set({})
     $sessionStates.set({})
     $activeSessionId.set(null)
+    $selectedStoredSessionId.set(null)
     setCurrentFastMode(false)
     setCurrentReasoningEffort('')
   })
@@ -130,9 +147,20 @@ describe('session-scoped model presets', () => {
     expect(calls).toEqual([])
   })
 
-  it('a delayed earlier Fast failure cannot roll back a newer session intent', async () => {
+  it('a delayed first Fast failure cannot roll back a third, newer session intent', async () => {
     $activeSessionId.set('runtime-a')
+    $selectedStoredSessionId.set('stored-a')
     setCurrentFastMode(false)
+    const initial = createClientSessionState('stored-a')
+    publishSessionState('runtime-a', { ...initial, model: 'model-a', provider: 'provider-a', fast: false })
+    setSessionTileDelegate(
+      createSessionTileDelegate((id, updater) => {
+        const next = updater($sessionStates.get()[id])
+        publishSessionState(id, next)
+
+        return next
+      })
+    )
 
     let rejectFirst!: (error: Error) => void
 
@@ -144,19 +172,29 @@ describe('session-scoped model presets', () => {
       .fn(async <T>(_method: string, _params?: Record<string, unknown>) => ({}) as T)
       .mockImplementationOnce(<T>() => first as Promise<T>)
       .mockResolvedValueOnce({} as never)
+      .mockResolvedValueOnce({} as never)
 
     const stale = applyModelPreset(
       { fast: true },
       { failMessage: 'x', primary: true, request: request as unknown as GatewayRequest, sessionId: 'runtime-a' }
     )
 
-    const latest = applyModelPreset(
+    const middle = applyModelPreset(
       { fast: false },
       { failMessage: 'x', primary: true, request: request as unknown as GatewayRequest, sessionId: 'runtime-a' }
     )
 
-    await Promise.resolve()
-    expect(request).toHaveBeenCalledTimes(2)
+    const latest = applyModelPreset(
+      { fast: true },
+      { failMessage: 'x', primary: true, request: request as unknown as GatewayRequest, sessionId: 'runtime-a' }
+    )
+
+    expect(request).toHaveBeenCalledTimes(3)
+    expect($sessionStates.get()['runtime-a'].fast).toBe(true)
+    await Promise.all([middle, latest])
+    rejectFirst(new Error('delayed first write failure'))
+    await stale
+
     expect(request).toHaveBeenNthCalledWith(1, 'config.set', {
       key: 'runtime_options',
       session_id: 'runtime-a',
@@ -167,11 +205,12 @@ describe('session-scoped model presets', () => {
       session_id: 'runtime-a',
       value: { fast: false }
     })
-
-    await latest
-    rejectFirst(new Error('delayed failure'))
-    await stale
-
-    expect($currentFastMode.get()).toBe(false)
+    expect(request).toHaveBeenNthCalledWith(3, 'config.set', {
+      key: 'runtime_options',
+      session_id: 'runtime-a',
+      value: { fast: true }
+    })
+    expect($currentFastMode.get()).toBe(true)
+    expect($sessionStates.get()['runtime-a'].fast).toBe(true)
   })
 })
