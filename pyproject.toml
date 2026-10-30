@@ -404,7 +404,7 @@ override-dependencies = [
   # actually have wheels (Linux py < 3.12) instead of pinning a different
   # package behind uv's back. Revisit when openWakeWord publishes a release
   # whose dependency set resolves on current Python.
-  "tflite-runtime; sys_platform == 'linux' and python_full_version < '3.12'",
+  "tflite-runtime>=2.14,<3; sys_platform == 'linux' and python_full_version < '3.12'",
 ]
 exclude-newer = "14 days"
 # h2: temporary exclude-newer exception for the CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg,

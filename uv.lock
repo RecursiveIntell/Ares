@@ -9,7 +9,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-10-14T07:48:28.039429511Z"
+exclude-newer = "2026-10-02T20:22:27.900197462Z"
 exclude-newer-span = "P14D"
 
 [options.exclude-newer-package]
@@ -30,7 +30,7 @@ huggingface-hub = false
 overrides = [
     { name = "cryptography", specifier = ">=50,<51" },
     { name = "pynacl", specifier = ">=1.6,<1.7" },
-    { name = "tflite-runtime", marker = "python_full_version < '3.12' and sys_platform == 'linux'" },
+    { name = "tflite-runtime", marker = "python_full_version < '3.12' and sys_platform == 'linux'", specifier = ">=2.14,<3" },
 ]
 
 [[package]]
