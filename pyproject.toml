@@ -400,6 +400,19 @@ override-dependencies = [
   # requests with RSA and AES, and that API did not break in 49 or 50.
   # Remove this line when alibabacloud-tea-openapi lifts the cap.
   "cryptography>=50,<51",
+  # openwakeword 0.6.0 declares tflite-runtime for Linux (sys_platform == 'linux').
+  # tflite-runtime 2.14.0 ships only cp311 wheels and no sdist (PyPI), so any
+  # CPython >= 3.12 sync of [wake] — part of every desktop-default install —
+  # is unresolvable and fails the whole sync. This bricked the canonical
+  # curl|bash install on a clean ubuntu:24.04 (found 2026-10-28; reproduced
+  # twice). Ares's wake-word code only selects the tflite backend on macOS
+  # ARM64 (tools/wake_word.py), where ai-edge-litert is declared explicitly
+  # in the [wake] extra; Linux runs the ONNX backend and never imports
+  # tflite_runtime. Narrow the transitive marker to the interpreters that
+  # actually have wheels (Linux py < 3.12) instead of pinning a different
+  # package behind uv's back. Revisit when openWakeWord publishes a release
+  # whose dependency set resolves on current Python.
+  "tflite-runtime>=2.14,<3; sys_platform == 'linux' and python_full_version < '3.12'",
 ]
 exclude-newer = "14 days"
 # h2: temporary exclude-newer exception for the CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg,
