@@ -39,6 +39,25 @@ describe('owner-qualified composer selections', () => {
     expect(value?.selectionGeneration).toBeTypeOf('number')
   })
 
+  it('keeps a live-session model receipt separate from its profile draft owner', () => {
+    setComposerModelSelectionOwner(a)
+    const draft = recordComposerModelSelection(captureComposerModelSelection(a), pair)!
+    const liveOwner = { ...a, sessionId: 'runtime-session-a' }
+    const pending = captureComposerModelSelection(liveOwner)
+    expect(getComposerModelSelection(a)).toBe(draft)
+
+    // A different foreground draft/profile transition cannot revoke this live
+    // session's selection transaction. It intentionally expires A's default
+    // receipt, while the session-owned record remains separate.
+    setComposerModelSelectionOwner(b)
+    const live = recordComposerModelSelection(pending, { ...pair, model: 'live-model', source: 'manual' })
+
+    expect(live).toMatchObject({ owner: liveOwner, model: 'live-model', source: 'manual' })
+    expect(getComposerModelSelection(liveOwner)).toBe(live)
+    expect(getComposerModelSelection(a)).toBeNull()
+    expect(getComposerModelSelection(b)).toBeNull()
+  })
+
   it('refuses incomplete defaults and an unspecified connection', () => {
     setComposerModelSelectionOwner(a)
     expect(recordComposerModelSelection(captureComposerModelSelection(a), { ...pair, model: '' })).toBeNull()

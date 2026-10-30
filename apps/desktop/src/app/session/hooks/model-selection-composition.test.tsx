@@ -499,7 +499,8 @@ describe('actual producer/store/admission composition', () => {
     act(() => {
       picking = value.handle.controls.selectModel({ model: 'rejected-a', provider: 'provider-a' })
     })
-    expect(getComposerModelSelection(a)?.model).toBe('rejected-a')
+    expect(getComposerModelSelection({ ...a, sessionId: 'composition-live' })?.model).toBe('rejected-a')
+    expect(getComposerModelSelection(a)?.model).toBe('default-a')
     pending.reject(new Error('offline rejected model'))
     await act(async () => {
       expect(await picking).toBe(false)
