@@ -24,10 +24,9 @@ import {
 import { $visibleModels } from '@/store/model-visibility'
 import {
   $defaultReasoningEffort,
-  beginRuntimeOptionIntent,
   getComposerModelSelection,
   markComposerSelectionManual,
-  ownsRuntimeOptionIntent
+  peekRuntimeOptionIntent
 } from '@/store/session'
 import { $sessionStates, knownOwnerForSession } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
@@ -44,12 +43,49 @@ interface ModelPresetSelectionIntent {
   modelKey: string
   revisions: Record<PresetDimension, number>
   runtimeTarget?: string
-  runtimeTokens?: Record<string, number>
+  runtimeTokens?: Record<string, number | undefined>
   scopeKey: string
 }
 
 function presetRevisionKey(scopeKey: string, provider: string, model: string, dimension: PresetDimension): string {
   return JSON.stringify([scopeKey, provider, model, dimension])
+}
+
+// Draft preset identity belongs to the composing surface, not to this menu: the
+// dropdown unmounts its content when closed, so a component-local id would drop
+// a draft's remembered options on every reopen. A surface keeps its draft id
+// until the session identity it shows changes (draft → session → new draft).
+let draftPresetSequence = 0
+const draftPresetOwners = new Map<string, { id: string; identity: null | string }>()
+
+export function draftPresetIdFor(surfaceKey: string, sessionIdentity: null | string): string {
+  const existing = draftPresetOwners.get(surfaceKey)
+
+  if (existing && existing.identity === sessionIdentity) {
+    return existing.id
+  }
+
+  const next = { id: `draft-${++draftPresetSequence}`, identity: sessionIdentity }
+  draftPresetOwners.delete(surfaceKey)
+  draftPresetOwners.set(surfaceKey, next)
+
+  // Bounded: tile surfaces get mount-local keys, so evict the oldest tile entries.
+  for (const key of draftPresetOwners.keys()) {
+    if (draftPresetOwners.size <= 64) {
+      break
+    }
+
+    if (key !== 'primary') {
+      draftPresetOwners.delete(key)
+    }
+  }
+
+  return next.id
+}
+
+/** Test-only reset for the module-scoped draft identities. */
+export function _resetDraftPresetOwnersForTests(): void {
+  draftPresetOwners.clear()
 }
 
 export interface ModelSelection {
@@ -84,16 +120,11 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const activeSessionId = useStore(view.$runtimeId)
   const storedSessionId = useStore(view.$storedId)
   const sessionPresetIdentity = storedSessionId || activeSessionId
-  const draftPresetId = useId()
-  const priorSessionPresetIdentity = useRef(sessionPresetIdentity)
-  const draftPresetEpoch = useRef(0)
-
-  if (priorSessionPresetIdentity.current !== sessionPresetIdentity) {
-    priorSessionPresetIdentity.current = sessionPresetIdentity
-    draftPresetEpoch.current += 1
-  }
-
-  const scopedDraftPresetId = `${draftPresetId}:${draftPresetEpoch.current}`
+  // Tiles are always bound to a stored session, so only the primary surface
+  // composes drafts; a tile keeps a mount-local key for its (unused) draft slot.
+  const tileSurfaceId = useId()
+  const surfaceKey = view.kind === 'primary' ? 'primary' : `tile:${tileSurfaceId}`
+  const scopedDraftPresetId = draftPresetIdFor(surfaceKey, sessionPresetIdentity ?? null)
   const owner = knownOwnerForSession(activeSessionId)
   const draftOwner = useDraftComposerOwner()
 
@@ -234,7 +265,16 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     preserveOptionsOnSelect: true,
     beginSelection: (provider, model) => {
       const runtimeTarget = activeSessionId ? runtimeOptionsTargetForSession(activeSessionId) : undefined
-      const runtimeTokens = runtimeTarget ? beginRuntimeOptionIntent(runtimeTarget, ['effort', 'fast']) : undefined
+
+      // Snapshot, do not revoke: an effort/Fast write already in flight keeps
+      // ownership of its own rollback and pending-overlay settlement. Any later
+      // option edit changes the newest token and voids this continuation.
+      const runtimeTokens = runtimeTarget
+        ? {
+            effort: peekRuntimeOptionIntent(runtimeTarget, 'effort'),
+            fast: peekRuntimeOptionIntent(runtimeTarget, 'fast')
+          }
+        : undefined
 
       return {
         modelKey: JSON.stringify([provider, model]),
@@ -279,8 +319,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
             !activeSessionId ||
             !selectionIntent.runtimeTarget ||
             (runtimeOptionsTargetForSession(activeSessionId) === selectionIntent.runtimeTarget &&
-              runtimeIntent !== undefined &&
-              ownsRuntimeOptionIntent(selectionIntent.runtimeTarget, dimension, runtimeIntent))
+              peekRuntimeOptionIntent(selectionIntent.runtimeTarget, dimension) === runtimeIntent)
 
           if (currentRevision !== selectionIntent.revisions[dimension] || !runtimeStillOwned) {
             delete applicable[dimension]
@@ -310,6 +349,16 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     },
 
     presetFor: (provider, model) => modelPresets[modelPresetKey(modelPresetScope, provider, model)] ?? {},
+
+    rememberOptions: (patch, row) => {
+      if (patch.fast === undefined) {
+        return
+      }
+
+      const key = presetRevisionKey(modelPresetScope, row.provider, row.model, 'fast')
+      optionPresetRevisions.current.set(key, (optionPresetRevisions.current.get(key) ?? 0) + 1)
+      setModelPreset(modelPresetScope, row.provider, row.model, { fast: patch.fast })
+    },
 
     // The composer picker never persists the profile default. With a session it
     // scopes the switch to that session; with none it's UI state shipped on the

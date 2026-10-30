@@ -720,6 +720,10 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
             // matches the snapshot this notification was created for.
             isStale: () =>
               !owns('model') ||
+              // A primary-surface confirmation must still own the foreground:
+              // after navigating to another session or a fresh draft, its
+              // repaint would otherwise overwrite that newer surface.
+              !stillOwnsPrimarySelection() ||
               (touchesPrimary && !liveSessionId
                 ? !stillOwnsPrimarySelection() ||
                   $currentModel.get() !== prevModel ||

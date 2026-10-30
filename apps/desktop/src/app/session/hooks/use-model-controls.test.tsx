@@ -481,6 +481,42 @@ describe('useModelControls', () => {
     expect($currentProvider.get()).toBe('opencode-go')
   })
 
+  it('drops a primary live-session confirmation after the user navigates to a fresh draft', async () => {
+    $activeSessionId.set('session-1')
+    setCurrentModel('gpt-5.6-sol')
+    setCurrentProvider('openai-codex')
+
+    const requestGateway = vi.fn().mockResolvedValueOnce({
+      confirm_message: 'This contributor model trains on your data.',
+      confirm_required: true,
+      key: 'model',
+      value: 'muse-spark-1.2-contributor'
+    })
+
+    let controls!: Controls
+
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    await expect(controls.selectModel({ model: 'muse-spark-1.2-contributor', provider: 'opencode-go' })).resolves.toBe(
+      false
+    )
+
+    const action = notify.mock.calls.at(-1)?.[0]?.action
+
+    // Navigate to a fresh draft: the original session is no longer foreground,
+    // and the draft happens to show the same model/provider as before.
+    $activeSessionId.set(null)
+    $selectedStoredSessionId.set(null)
+
+    await act(async () => {
+      await action?.onClick()
+    })
+
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    expect($currentModel.get()).toBe('gpt-5.6-sol')
+    expect($currentProvider.get()).toBe('openai-codex')
+  })
+
   it('keeps the pick when an OLDER gateway refuses a mid-turn switch', async () => {
     // Pre-deferral backends answer 4009 instead of parking the pick. Rolling
     // back would bounce the pill to the old model and toast an error at a user

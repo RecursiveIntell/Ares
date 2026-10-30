@@ -84,6 +84,9 @@ export interface ModelMenuController {
   ) => void
   current: ModelChoice
   presetFor: (provider: string, model: string) => { effort?: string; fast?: boolean }
+  /** Record a row's remembered option WITHOUT a runtime option write — used
+   *  when the active row's Fast toggle swaps to a catalog `-fast` variant. */
+  rememberOptions?: (patch: { fast?: boolean }, row: { model: string; provider: string }) => void
   /** Commit a model row. Return false to abort (a failed session switch). */
   select: (model: string, provider: string) => Promise<boolean | void> | void
   /** Edit ONE option on a row. `isActive` says whether it's the current model. */
@@ -578,7 +581,21 @@ export function ModelCatalogMenu({
                                   )
                               : undefined
                           }
-                          onSelectModel={nextModel => controller.select(nextModel, group.provider.slug)}
+                          onSelectModel={async nextModel => {
+                            const result = await controller.select(nextModel, group.provider.slug)
+
+                            // The active row's Fast toggle swaps base ⇄ -fast by
+                            // model ID; remember that choice for this family so
+                            // returning to it later does not restore an older one.
+                            if (result !== false && isCurrent && fastControl.kind === 'variant') {
+                              controller.rememberOptions?.(
+                                { fast: nextModel === fastControl.fastId },
+                                { model: family.id, provider: group.provider.slug }
+                              )
+                            }
+
+                            return result
+                          }}
                           onSetOptions={patch =>
                             controller.setOptions(patch, {
                               isActive: isCurrent,

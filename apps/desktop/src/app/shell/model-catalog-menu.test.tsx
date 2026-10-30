@@ -252,3 +252,60 @@ describe('the catalog owns model curation', () => {
     expect($modelVisibilityOpen.get()).toBe(true)
   })
 })
+
+describe('active Fast-variant toggles', () => {
+  it('remembers an active row Fast-variant toggle for the family after the swap succeeds', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [{ models: ['alpha', 'alpha-fast'], name: 'Fixture', slug: 'fixture' }]
+    })
+
+    const rememberOptions = vi.fn()
+    const select = vi.fn(async () => true)
+
+    renderMenu({
+      current: { model: 'alpha-fast', provider: 'fixture', effort: '', fast: false },
+      rememberOptions,
+      select
+    })
+
+    const row = (await screen.findByText('Alpha')).closest('[role="menuitem"]')!
+    fireEvent.keyDown(row, { key: 'ArrowRight' })
+    const fastItem = (await screen.findByText(/^Fast$/)).closest('[role="menuitem"]')!
+    const toggle = fastItem.querySelector('[role="switch"]')!
+    expect(toggle.getAttribute('aria-checked')).toBe('true')
+
+    await act(async () => {
+      fireEvent.click(toggle)
+    })
+
+    expect(select).toHaveBeenCalledWith('alpha', 'fixture')
+    expect(rememberOptions).toHaveBeenCalledWith({ fast: false }, { model: 'alpha', provider: 'fixture' })
+  })
+
+  it('does not remember the toggle when the variant swap fails', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [{ models: ['alpha', 'alpha-fast'], name: 'Fixture', slug: 'fixture' }]
+    })
+
+    const rememberOptions = vi.fn()
+    const select = vi.fn(async () => false)
+
+    renderMenu({
+      current: { model: 'alpha-fast', provider: 'fixture', effort: '', fast: false },
+      rememberOptions,
+      select
+    })
+
+    const row = (await screen.findByText('Alpha')).closest('[role="menuitem"]')!
+    fireEvent.keyDown(row, { key: 'ArrowRight' })
+
+    const fastItem = (await screen.findByText(/^Fast$/)).closest('[role="menuitem"]')!
+
+    await act(async () => {
+      fireEvent.click(fastItem.querySelector('[role="switch"]')!)
+    })
+
+    expect(select).toHaveBeenCalledWith('alpha', 'fixture')
+    expect(rememberOptions).not.toHaveBeenCalled()
+  })
+})

@@ -1166,6 +1166,13 @@ export function ownsRuntimeOptionIntent(target: string, dimension: string, token
   return runtimeOptionIntents.get(JSON.stringify([target, dimension])) === token
 }
 
+/** Read the newest intent token for a dimension WITHOUT starting a new intent.
+ *  A model-selection continuation snapshots this so a later option edit is
+ *  detected, while an in-flight write keeps ownership of its own settlement. */
+export function peekRuntimeOptionIntent(target: string, dimension: string): number | undefined {
+  return runtimeOptionIntents.get(JSON.stringify([target, dimension]))
+}
+
 export const getComposerSelectionGeneration = (): number => composerSelectionGeneration
 
 export const markComposerSelectionManual = (): void => {

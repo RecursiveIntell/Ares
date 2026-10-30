@@ -4,6 +4,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 
 import { setApiRequestConnection } from '@/api/client'
 import { DropdownMenu, DropdownMenuContent } from '@/components/ui/dropdown-menu'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { activeGatewayConnectionId } from '@/store/gateway'
 import { $modelPresets, getModelPreset, modelPresetScopeKey, setModelPreset } from '@/store/model-presets'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
@@ -18,9 +19,14 @@ import {
   setCurrentReasoningEffort
 } from '@/store/session'
 import { $sessions, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
-import { $sessionStates } from '@/store/session-states'
+import {
+  $sessionStates,
+  publishSessionState,
+  type SessionTileDelegate,
+  setSessionTileDelegate
+} from '@/store/session-states'
 
-import { ModelMenuPanel } from './model-menu-panel'
+import { _resetDraftPresetOwnersForTests, ModelMenuPanel } from './model-menu-panel'
 
 const notify = vi.fn((..._args: unknown[]) => 'confirm-toast-1')
 const notifyError = vi.fn((..._args: unknown[]) => undefined)
@@ -66,6 +72,7 @@ const GOOGLE_PROVIDER = {
 const MOCK_PROVIDERS = [DEEPSEEK_PROVIDER, GOOGLE_PROVIDER, MOA_PROVIDER]
 
 beforeEach(() => {
+  _resetDraftPresetOwnersForTests()
   _resetSessionOwnerHintsForTests()
   $sessions.set([])
   $sessionStates.set({})
@@ -351,6 +358,98 @@ describe('ModelMenuPanel current selection', () => {
 
     expect($currentModel.get()).toBe('gemini-2.5-flash')
     expect($currentReasoningEffort.get()).toBe('high')
+  })
+
+  it('keeps a draft’s remembered target-row options when the menu is closed and reopened', async () => {
+    $activeSessionId.set(null)
+    $currentProvider.set('deepseek')
+    $currentModel.set('deepseek-v4-pro')
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          capabilities: { 'gemini-3.1-pro': { fast: true, reasoning: true } },
+          models: ['gemini-3.1-pro'],
+          name: 'Google',
+          slug: 'google'
+        }
+      ]
+    })
+
+    const first = renderPanel()
+    const row = (await first.content.findByText(/Gemini 3\.1 Pro/i)).closest('[role="menuitem"]')!
+    fireEvent.keyDown(row, { key: 'ArrowRight' })
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /^High$/i }))
+    first.content.unmount()
+
+    // The dropdown unmounts its content when closed; reopening mounts a new panel.
+    const second = renderPanel()
+    const reopened = (await second.content.findByText(/Gemini 3\.1 Pro/i)).closest('[role="menuitem"]')!
+    expect(reopened.textContent?.toLowerCase()).toContain('high')
+  })
+
+  it('selecting a model does not take over settlement of an in-flight option write', async () => {
+    $currentProvider.set('deepseek')
+    $currentModel.set('deepseek-v4-pro')
+    publishSessionState('runtime-1', {
+      ...createClientSessionState(null),
+      model: 'deepseek-v4-pro',
+      provider: 'deepseek',
+      reasoningEffort: 'medium'
+    })
+    setSessionTileDelegate({
+      updateSession: (id: string, updater: (current: never) => never) => {
+        const next = updater($sessionStates.get()[id] as never)
+        publishSessionState(id, next)
+
+        return next
+      }
+    } as unknown as SessionTileDelegate)
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          capabilities: { 'deepseek-v4-pro': { reasoning: true } },
+          models: ['deepseek-v4-pro', 'deepseek-chat'],
+          name: 'DeepSeek',
+          slug: 'deepseek'
+        }
+      ]
+    })
+
+    let rejectWrite!: (error: Error) => void
+
+    const write = new Promise((_, reject) => {
+      rejectWrite = reject
+    })
+
+    const requestGateway = vi.fn((method: string, params?: Record<string, unknown>) =>
+      method === 'config.set' && params?.key === 'runtime_options' ? write : Promise.resolve({})
+    )
+
+    const onSelectModel = vi.fn(() => new Promise<boolean>(() => undefined))
+
+    try {
+      const { content } = renderPanel(onSelectModel, requestGateway)
+      const active = (await content.findByText(/Deepseek V4 Pro/i)).closest('[role="menuitem"]')!
+      fireEvent.keyDown(active, { key: 'ArrowRight' })
+      fireEvent.click(await screen.findByRole('menuitemradio', { name: /^High$/i }))
+      await vi.waitFor(() =>
+        expect($sessionStates.get()['runtime-1']?.pendingRuntimeOptions).toEqual({ effort: 'high' })
+      )
+
+      // Pick another model while the effort write is still pending.
+      fireEvent.click(await content.findByText(/Deepseek Chat/i))
+      expect(onSelectModel).toHaveBeenCalled()
+
+      await act(async () => {
+        rejectWrite(Object.assign(new Error('rejected'), { code: 4001 }))
+        await write.catch(() => undefined)
+      })
+
+      await vi.waitFor(() => expect($sessionStates.get()['runtime-1']?.pendingRuntimeOptions ?? null).toBeNull())
+      expect($sessionStates.get()['runtime-1']?.reasoningEffort).toBe('medium')
+    } finally {
+      setSessionTileDelegate({} as SessionTileDelegate)
+    }
   })
 
   it('does not show another session’s saved target options', async () => {
