@@ -72,6 +72,32 @@ def top_level_value_flag_sets() -> tuple[frozenset[str], frozenset[str]]:
         return _VALUE_FLAGS_FALLBACK, _OPTIONAL_VALUE_FLAGS_FALLBACK
 
 
+@lru_cache(maxsize=1)
+def top_level_option_metadata() -> dict[str, str]:
+    """Return the canonical top-level option arity table.
+
+    Values are ``flag`` for switches, ``value`` for required values, and
+    ``optional`` for optional values.  The early specialist route uses this
+    table before importing the ordinary CLI startup path, so its argv scan
+    must derive from the same parser owner as the ordinary parser.
+    """
+    parser = build_top_level_parser()[0]
+    result: dict[str, str] = {}
+    for action in parser._actions:
+        if not action.option_strings:
+            continue
+        kind = (
+            "flag"
+            if action.nargs == 0
+            else ("optional" if action.nargs == "?" else "value")
+        )
+        for option in action.option_strings:
+            result[option] = kind
+    for option, has_value in PRE_ARGPARSE_INHERITED_FLAGS:
+        result[option] = "value" if has_value else "flag"
+    return result
+
+
 def _inherited_flag(parser, *args, **kwargs):
     """Register a flag that ``hermes_cli.relaunch`` should carry over when
     the CLI re-execs itself (e.g. after ``sessions browse`` picks a session,

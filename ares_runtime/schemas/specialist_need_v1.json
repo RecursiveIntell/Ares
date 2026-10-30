@@ -1,0 +1,336 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://recursiveintell.local/schemas/ares-specialist/specialistneedv1.json",
+  "title": "SpecialistNeedV1",
+  "description": "Inert record of a reviewed task obligation and its cited alternatives. It does not assert expertise or grant authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "x-canonical-owner": "Ares specialist routing artifact contracts; inert versioned data",
+  "x-maxContractBytes": 262144,
+  "x-maxJsonDepth": 16,
+  "x-maxArrayItems": 128,
+  "x-maxSourceBytes": 67108864,
+  "x-canonicalEncoding": "ares_runtime.collaboration.canonical_json: sorted keys, compact separators, ASCII escaping, allow_nan=false, terminal LF; this is not an RFC 8785/JCS claim",
+  "x-envelopeDigestRule": "sha256 over all envelope fields except only its own digest field",
+  "x-inputDigestRule": "byte_digest binds exact source bytes separately from the envelope digest",
+  "required": [
+    "schema_version",
+    "task_id",
+    "task_ref",
+    "task_digest",
+    "obligation_id",
+    "obligation_text",
+    "affected_decision",
+    "consequence",
+    "evidence_refs",
+    "approved_input_manifest",
+    "coverage_snapshot_digest",
+    "alternatives",
+    "reviewer_assessments",
+    "need_digest"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "x-maxUtf8Bytes": 65536
+    },
+    "task_ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+      "x-maxUtf8Bytes": 256
+    },
+    "task_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+    },
+    "obligation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "x-maxUtf8Bytes": 65536
+    },
+    "obligation_text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "x-maxUtf8Bytes": 65536
+    },
+    "affected_decision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "x-maxUtf8Bytes": 65536
+    },
+    "consequence": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "x-maxUtf8Bytes": 65536
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+        "x-maxUtf8Bytes": 256
+      },
+      "minItems": 0,
+      "maxItems": 128,
+      "uniqueItems": true
+    },
+    "approved_input_manifest": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "artifact_ref",
+          "byte_digest"
+        ],
+        "properties": {
+          "artifact_ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+            "x-maxUtf8Bytes": 256
+          },
+          "byte_digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+          }
+        }
+      },
+      "minItems": 0,
+      "maxItems": 128
+    },
+    "coverage_snapshot_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+    },
+    "alternatives": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "alternative_ref",
+          "kind",
+          "description",
+          "assessment",
+          "evidence_refs"
+        ],
+        "properties": {
+          "alternative_ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+            "x-maxUtf8Bytes": 256
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "direct_evidence",
+              "procedure",
+              "skill",
+              "existing_role",
+              "independent_pass",
+              "other"
+            ]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "x-maxUtf8Bytes": 65536
+          },
+          "assessment": {
+            "type": "string",
+            "enum": [
+              "sufficient",
+              "insufficient",
+              "unknown"
+            ]
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+              "x-maxUtf8Bytes": 256
+            },
+            "minItems": 0,
+            "maxItems": 128,
+            "uniqueItems": true
+          }
+        }
+      },
+      "minItems": 0,
+      "maxItems": 128
+    },
+    "reviewer_assessments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reviewer_ref",
+          "materiality",
+          "direct_sufficiency",
+          "semantic_coverage",
+          "substantive_method_coverage",
+          "independent_pass_requirement",
+          "method_feasibility",
+          "disposition",
+          "reason",
+          "evidence_refs",
+          "uncertainty"
+        ],
+        "properties": {
+          "reviewer_ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+            "x-maxUtf8Bytes": 256
+          },
+          "materiality": {
+            "type": "string",
+            "enum": [
+              "material",
+              "not_material",
+              "unknown"
+            ]
+          },
+          "direct_sufficiency": {
+            "type": "string",
+            "enum": [
+              "sufficient",
+              "insufficient",
+              "unknown"
+            ]
+          },
+          "semantic_coverage": {
+            "type": "string",
+            "enum": [
+              "covered",
+              "not_covered",
+              "unknown"
+            ]
+          },
+          "substantive_method_coverage": {
+            "type": "string",
+            "enum": [
+              "covered",
+              "uncovered",
+              "unknown"
+            ]
+          },
+          "independent_pass_requirement": {
+            "type": "string",
+            "enum": [
+              "required",
+              "not_required",
+              "unknown"
+            ]
+          },
+          "method_feasibility": {
+            "type": "string",
+            "enum": [
+              "specified",
+              "undefined",
+              "not_assessed"
+            ]
+          },
+          "disposition": {
+            "type": "string",
+            "enum": [
+              "no_material_gap",
+              "direct_evidence_or_skill_sufficient",
+              "existing_role_covers_need",
+              "existing_role_unindexed_or_unavailable",
+              "coverage_unknown",
+              "independent_review_needed",
+              "evidence_blocked",
+              "candidate_proposal"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "x-maxUtf8Bytes": 65536
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+              "x-maxUtf8Bytes": 256
+            },
+            "minItems": 0,
+            "maxItems": 128,
+            "uniqueItems": true
+          },
+          "uncertainty": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 65536,
+              "x-maxUtf8Bytes": 65536
+            },
+            "minItems": 0,
+            "maxItems": 128
+          }
+        }
+      },
+      "minItems": 0,
+      "maxItems": 128
+    },
+    "need_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+    }
+  },
+  "$defs": {
+    "ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+      "x-maxUtf8Bytes": 256
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "x-maxUtf8Bytes": 65536
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+    }
+  },
+  "x-runtime-invariants": [
+    "approved_input_manifest is sorted and unique by artifact_ref",
+    "evidence_refs, alternative citations, and reviewer citations are sorted, unique, and subsets of approved_input_manifest",
+    "alternatives have unique alternative_ref values and retain their declared cheaper-first order",
+    "reviewer_assessments is sorted and unique by reviewer_ref"
+  ]
+}
