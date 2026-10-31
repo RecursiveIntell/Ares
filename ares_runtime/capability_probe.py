@@ -4,8 +4,10 @@
 model can actually *call* a capability: a plugin tool whose schema reaches
 the model without parameters, a real-profile browser that refuses to resolve
 the desktop's default browser, or a web backend that resolves to nothing all
-pass a reachability probe. These checks read only local state and make no
-network call, provider call, or browser launch.
+pass a reachability probe. These checks inspect local state and do not
+intentionally make provider requests or launch a browser. Provider availability
+methods are extension points that are expected to make no network calls; this
+probe does not enforce that contract against nonconforming plugins.
 
 Run as ``python -m ares_runtime.capability_probe``; prints one JSON object
 mapping check label to ``{"ok": bool, "detail": str}``.
