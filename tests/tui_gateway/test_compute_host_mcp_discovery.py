@@ -75,3 +75,43 @@ def test_existing_host_session_is_reused_without_new_discovery(host, monkeypatch
 
     assert host._ensure_server_session(server, {"sid": "s3", "session_key": "k3"}) is existing
     assert calls == []
+
+
+def test_real_init_session_still_schedules_late_refresh_after_discovery(monkeypatch):
+    """Drive the REAL server._init_session on the compute-host path.
+
+    Only its I/O side effects are stubbed; the late-refresh scheduler is
+    replaced with a recorder so the test witnesses the actual call order:
+    discovery start → agent build → late refresh for that same agent.
+    """
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_transfer_db_to_agent", lambda agent, db: False)
+
+    class _DB:
+        def get_session(self, key):
+            return None
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    for name in ("_register_session_cwd", "_wire_callbacks", "_notify_session_boundary", "_emit"):
+        monkeypatch.setattr(server, name, lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda sid, session: None)
+    monkeypatch.setattr(server, "_session_info", lambda agent, session, **kw: {})
+    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "off")
+    monkeypatch.setattr(server, "_load_memory_notifications", lambda: "off")
+
+    order: list[tuple[str, object]] = []
+    built = _Agent()
+    monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: order.append(("discovery", None)))
+    monkeypatch.setattr(server, "_make_agent", lambda sid, key, **kw: order.append(("make_agent", None)) or built)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda sid, agent: order.append(("late_refresh", agent)))
+
+    instance = ComputeHost(heartbeat_secs=0)
+    try:
+        session = instance._ensure_server_session(server, {"sid": "s4", "session_key": "k4"})
+    finally:
+        instance.close()
+
+    assert session["agent"] is built
+    assert [step for step, _ in order] == ["discovery", "make_agent", "late_refresh"]
+    assert order[-1][1] is built
