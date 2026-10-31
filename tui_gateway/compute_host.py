@@ -910,6 +910,18 @@ class ComputeHost:
                 )
                 if persisted_history:
                     history = server.sanitize_replay_history(persisted_history)
+            # This child process never runs entry.main() or the dashboard
+            # startup, so nothing else starts MCP discovery here. Start it
+            # under the session's profile scope (bound above) before the agent
+            # snapshots its tools, exactly as the in-process _start_agent_build
+            # path does; _make_agent then waits the bounded discovery timeout
+            # and the late-refresh scheduler covers slower servers.
+            try:
+                from tui_gateway.entry import ensure_mcp_discovery_started
+
+                ensure_mcp_discovery_started()
+            except Exception:
+                server.logger.warning("compute-host MCP discovery startup failed", exc_info=True)
             agent = server._make_agent(
                 sid,
                 key,
