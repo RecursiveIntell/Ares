@@ -110,6 +110,7 @@ class TestDetectDefaultLinux:
     def _run_with(self, output: str):
         class _Proc:
             stdout = output
+            returncode = 0
 
         return patch.object(bc.subprocess, "run", return_value=_Proc())
 
@@ -196,6 +197,34 @@ class TestDetectDefaultLinuxOmarchyWrapper:
         with patch.object(bc.subprocess, "run", side_effect=run):
             assert bc._detect_default_linux() == "chromium"
         assert [c[0] for c in calls] == ["xdg-settings"]
+
+    @pytest.mark.parametrize("failing", ["xdg-settings", "omarchy-cmd-default-browser"])
+    def test_nonzero_exit_is_no_answer_even_with_browser_on_stdout(self, failing):
+        """A failed query must not be classified from whatever it printed."""
+
+        def run(argv, **kwargs):
+            out = "omarchy-browser.desktop\n" if argv[0] == "xdg-settings" else "chromium.desktop\n"
+            if argv[0] == failing:
+                out = "chromium.desktop\n"
+
+            class _Proc:
+                stdout = out
+                returncode = 1 if argv[0] == failing else 0
+
+            return _Proc()
+
+        with patch.object(bc.subprocess, "run", side_effect=run):
+            assert bc._detect_default_linux() is None
+
+    def test_resolver_answering_with_the_wrapper_is_unknown(self, monkeypatch):
+        """Self-resolution must stay unknown even if the wrapper name ever
+        matched a classifier fragment (mutation guard for the explicit check)."""
+        monkeypatch.setattr(bc, "_LINUX_DESKTOP_MAP", bc._LINUX_DESKTOP_MAP + (("omarchy-browser", "chromium"),))
+        run, _ = self._runner(
+            {"xdg-settings": "omarchy-browser.desktop\n", "omarchy-cmd-default-browser": "omarchy-browser.desktop\n"}
+        )
+        with patch.object(bc.subprocess, "run", side_effect=run):
+            assert bc._detect_default_linux() is None
 
 
 class TestLinuxProfileDir:

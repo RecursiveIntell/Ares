@@ -401,18 +401,25 @@ def _detect_default_darwin() -> str | None:
 
 
 def _xdg_query(argv: list[str]) -> str:
-    """Run a bounded desktop-default query; any failure reads as no answer."""
+    """Run a bounded desktop-default query; any failure reads as no answer.
+
+    A nonzero exit is a failure even when the command printed something, so a
+    failed query is never classified from partial or diagnostic output.
+    """
     try:
-        return subprocess.run(
+        proc = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=5,
-        ).stdout.strip().lower()
+        )
     except Exception:
         return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip().lower()
 
 
 # Omarchy registers a launcher wrapper as the xdg default browser; the wrapper
