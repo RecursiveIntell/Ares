@@ -400,10 +400,11 @@ def _detect_default_darwin() -> str | None:
     return None
 
 
-def _detect_default_linux() -> str | None:
+def _xdg_query(argv: list[str]) -> str:
+    """Run a bounded desktop-default query; any failure reads as no answer."""
     try:
-        out = subprocess.run(
-            ["xdg-settings", "get", "default-web-browser"],
+        return subprocess.run(
+            argv,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -411,7 +412,24 @@ def _detect_default_linux() -> str | None:
             timeout=5,
         ).stdout.strip().lower()
     except Exception:
-        out = ""
+        return ""
+
+
+# Omarchy registers a launcher wrapper as the xdg default browser; the wrapper
+# only re-dispatches to the real browser, which Omarchy's own resolver names.
+_OMARCHY_BROWSER_WRAPPER = "omarchy-browser.desktop"
+_OMARCHY_DEFAULT_BROWSER_CMD = "omarchy-cmd-default-browser"
+
+
+def _detect_default_linux() -> str | None:
+    out = _xdg_query(["xdg-settings", "get", "default-web-browser"])
+    if out == _OMARCHY_BROWSER_WRAPPER:
+        # Follow the wrapper exactly as its launcher does, then classify the
+        # answer with the same fail-closed rules. A missing or failing
+        # resolver, or one that answers with the wrapper itself, is unknown.
+        out = _xdg_query([_OMARCHY_DEFAULT_BROWSER_CMD])
+        if out == _OMARCHY_BROWSER_WRAPPER:
+            return None
     # Channels first: ``google-chrome-beta.desktop`` contains the stable
     # ``google-chrome`` fragment, so a substring match would drive stable.
     # Catch recognized channels and fail closed instead.

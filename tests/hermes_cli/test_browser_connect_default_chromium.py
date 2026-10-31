@@ -138,6 +138,66 @@ class TestDetectDefaultLinux:
             assert bc._detect_default_linux() is None
 
 
+class TestDetectDefaultLinuxOmarchyWrapper:
+    """Omarchy registers ``omarchy-browser.desktop``, a launcher wrapper, as the
+    xdg default. Its own ``omarchy-cmd-default-browser`` names the real
+    browser. Detection must follow that indirection and then apply the same
+    fail-closed classification — never guess an installed Chromium."""
+
+    @staticmethod
+    def _runner(answers: dict):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(list(argv))
+            answer = answers.get(argv[0])
+            if isinstance(answer, BaseException):
+                raise answer
+
+            class _Proc:
+                stdout = answer if isinstance(answer, str) else ""
+                returncode = 0 if isinstance(answer, str) else 1
+
+            return _Proc()
+
+        return run, calls
+
+    @pytest.mark.parametrize(
+        "resolved,expected",
+        [
+            ("chromium.desktop\n", "chromium"),
+            ("google-chrome.desktop\n", "chrome"),
+            ("brave-browser.desktop\n", "brave"),
+            ("firefox.desktop\n", None),
+            ("google-chrome-beta.desktop\n", bc.UNSUPPORTED_CHANNEL),
+            ("omarchy-browser.desktop\n", None),
+            ("\n", None),
+        ],
+    )
+    def test_wrapper_is_resolved_then_classified(self, resolved, expected):
+        run, calls = self._runner(
+            {"xdg-settings": "omarchy-browser.desktop\n", "omarchy-cmd-default-browser": resolved}
+        )
+        with patch.object(bc.subprocess, "run", side_effect=run):
+            assert bc._detect_default_linux() == expected
+        assert [c[0] for c in calls] == ["xdg-settings", "omarchy-cmd-default-browser"]
+
+    @pytest.mark.parametrize(
+        "failure",
+        [FileNotFoundError("omarchy-cmd-default-browser"), bc.subprocess.TimeoutExpired("x", 5), None],
+    )
+    def test_wrapper_resolution_failure_fails_closed(self, failure):
+        run, _ = self._runner({"xdg-settings": "omarchy-browser.desktop\n", "omarchy-cmd-default-browser": failure})
+        with patch.object(bc.subprocess, "run", side_effect=run):
+            assert bc._detect_default_linux() is None
+
+    def test_non_wrapper_default_never_invokes_resolver(self):
+        run, calls = self._runner({"xdg-settings": "chromium.desktop\n"})
+        with patch.object(bc.subprocess, "run", side_effect=run):
+            assert bc._detect_default_linux() == "chromium"
+        assert [c[0] for c in calls] == ["xdg-settings"]
+
+
 class TestLinuxProfileDir:
     def _env(self, monkeypatch, home):
         monkeypatch.setenv("HOME", str(home))
