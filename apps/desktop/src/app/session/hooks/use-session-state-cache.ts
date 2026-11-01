@@ -43,8 +43,8 @@ function syncRuntimeMetadataToView(cached: ClientSessionState, sessionId: string
   const state =
     live && (live.selectorObservation || live.pendingModelSelection || live.pendingRuntimeOptions) ? live : cached
 
-  setCurrentModel(state.model ?? '')
-  setCurrentProvider(state.provider ?? '')
+  setCurrentModel(state.model ?? '', false)
+  setCurrentProvider(state.provider ?? '', false)
   setCurrentReasoningEffort(state.reasoningEffort ?? '', false)
   setCurrentServiceTier(state.serviceTier ?? '')
   setCurrentFastMode(state.fast ?? false, false)

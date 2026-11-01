@@ -1,15 +1,32 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { setApiRequestConnection } from '@/api/client'
 import { DropdownMenu, DropdownMenuContent } from '@/components/ui/dropdown-menu'
-import { setModelPreset } from '@/store/model-presets'
+import { createClientSessionState } from '@/lib/chat-runtime'
+import { activeGatewayConnectionId } from '@/store/gateway'
+import { $modelPresets, getModelPreset, modelPresetScopeKey, setModelPreset } from '@/store/model-presets'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
-import { $activeSessionId, $currentModel, $currentProvider } from '@/store/session'
+import {
+  $activeSessionId,
+  $currentModel,
+  $currentProvider,
+  $currentReasoningEffort,
+  $selectedStoredSessionId,
+  setCurrentModel,
+  setCurrentProvider,
+  setCurrentReasoningEffort
+} from '@/store/session'
 import { $sessions, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
+import {
+  $sessionStates,
+  publishSessionState,
+  type SessionTileDelegate,
+  setSessionTileDelegate
+} from '@/store/session-states'
 
-import { ModelMenuPanel } from './model-menu-panel'
+import { _resetDraftPresetOwnersForTests, ModelMenuPanel } from './model-menu-panel'
 
 const notify = vi.fn((..._args: unknown[]) => 'confirm-toast-1')
 const notifyError = vi.fn((..._args: unknown[]) => undefined)
@@ -55,11 +72,16 @@ const GOOGLE_PROVIDER = {
 const MOCK_PROVIDERS = [DEEPSEEK_PROVIDER, GOOGLE_PROVIDER, MOA_PROVIDER]
 
 beforeEach(() => {
+  _resetDraftPresetOwnersForTests()
   _resetSessionOwnerHintsForTests()
   $sessions.set([])
+  $sessionStates.set({})
+  $selectedStoredSessionId.set(null)
+  $modelPresets.set({})
   $activeSessionId.set('runtime-1')
   $currentModel.set('')
   $currentProvider.set('')
+  setCurrentReasoningEffort('')
   $collapsedProviders.set([])
   getGlobalModelOptions.mockResolvedValue({ providers: MOCK_PROVIDERS })
 })
@@ -178,7 +200,15 @@ describe('ModelMenuPanel current selection', () => {
   it('applies saved options through the live alias of a custom provider', async () => {
     $currentProvider.set('custom:foo')
     $currentModel.set('fixture')
-    setModelPreset('foo', 'fixture', { effort: 'high' })
+
+    const scopeKey = modelPresetScopeKey({
+      connectionId: activeGatewayConnectionId(),
+      draftId: 'draft-test',
+      profile: 'default',
+      sessionId: 'runtime-1'
+    })
+
+    setModelPreset(scopeKey, 'foo', 'fixture', { effort: 'high' })
     getGlobalModelOptions.mockResolvedValue({
       providers: [
         {
@@ -201,6 +231,248 @@ describe('ModelMenuPanel current selection', () => {
         value: { effort: 'high' }
       })
     )
+  })
+
+  it('a target-row effort edit made during a pending model switch supersedes the captured preset', async () => {
+    $currentProvider.set('deepseek')
+    $currentModel.set('deepseek-v4-pro')
+    setCurrentReasoningEffort('medium')
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          capabilities: { 'gemini-3.1-pro': { fast: true, reasoning: true } },
+          models: ['gemini-3.1-pro'],
+          name: 'Google',
+          slug: 'google'
+        }
+      ]
+    })
+
+    const scopeKey = modelPresetScopeKey({
+      connectionId: activeGatewayConnectionId(),
+      draftId: 'draft-test',
+      profile: 'default',
+      sessionId: 'runtime-1'
+    })
+
+    setModelPreset(scopeKey, 'google', 'gemini-3.1-pro', { effort: 'low' })
+
+    let resolveSwitch!: (applied: boolean) => void
+
+    const switchResult = new Promise<boolean>(resolve => {
+      resolveSwitch = resolve
+    })
+
+    const onSelectModel = vi.fn((selection: { model: string; provider: string }) => {
+      setCurrentModel(selection.model, false)
+      setCurrentProvider(selection.provider, false)
+
+      return switchResult
+    })
+
+    const requestGateway = vi.fn().mockResolvedValue({})
+    const { content } = renderPanel(onSelectModel, requestGateway)
+
+    const target = await content.findByText(/Gemini 3\.1 Pro/i)
+    fireEvent.click(target)
+    expect(onSelectModel).toHaveBeenCalledWith({ model: 'gemini-3.1-pro', provider: 'google', sessionId: 'runtime-1' })
+
+    fireEvent.keyDown(target.closest('[role="menuitem"]')!, { key: 'ArrowRight' })
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /^High$/i }))
+    await vi.waitFor(() =>
+      expect(requestGateway).toHaveBeenCalledWith('config.set', {
+        key: 'runtime_options',
+        session_id: 'runtime-1',
+        value: { effort: 'high' }
+      })
+    )
+
+    await act(async () => {
+      resolveSwitch(true)
+      await switchResult
+    })
+
+    expect(
+      requestGateway.mock.calls.map(([, params]) => params).filter(params => params?.key === 'runtime_options')
+    ).toEqual([
+      {
+        key: 'runtime_options',
+        session_id: 'runtime-1',
+        value: { effort: 'high' }
+      }
+    ])
+    expect(getModelPreset(scopeKey, 'google', 'gemini-3.1-pro')).toEqual({ effort: 'high' })
+  })
+
+  it('does not apply a preset when an older model selection settles after the newer one', async () => {
+    $activeSessionId.set(null)
+    $currentProvider.set('deepseek')
+    $currentModel.set('deepseek-v4-pro')
+    setCurrentReasoningEffort('medium')
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          capabilities: {
+            'gemini-2.5-flash': { fast: true, reasoning: true },
+            'gemini-3.1-pro': { fast: true, reasoning: true }
+          },
+          models: ['gemini-3.1-pro', 'gemini-2.5-flash'],
+          name: 'Google',
+          slug: 'google'
+        }
+      ]
+    })
+
+    const settle: Array<(applied: boolean) => void> = []
+
+    const onSelectModel = vi.fn((selection: { model: string; provider: string }) => {
+      setCurrentModel(selection.model, false)
+      setCurrentProvider(selection.provider, false)
+
+      return new Promise<boolean>(resolve => settle.push(resolve))
+    })
+
+    const { content } = renderPanel(onSelectModel)
+
+    const firstRow = (await content.findByText(/Gemini 3\.1 Pro/i)).closest('[role="menuitem"]')!
+    fireEvent.keyDown(firstRow, { key: 'ArrowRight' })
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /^Low$/i }))
+
+    const secondRow = (await content.findByText(/Gemini 2\.5 Flash/i)).closest('[role="menuitem"]')!
+    fireEvent.keyDown(secondRow, { key: 'ArrowRight' })
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /^High$/i }))
+
+    fireEvent.click(await content.findByText(/Gemini 3\.1 Pro/i))
+    fireEvent.click(await content.findByText(/Gemini 2\.5 Flash/i))
+
+    expect(onSelectModel).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      settle[1](true)
+    })
+    expect($currentReasoningEffort.get()).toBe('high')
+
+    await act(async () => {
+      settle[0](true)
+    })
+
+    expect($currentModel.get()).toBe('gemini-2.5-flash')
+    expect($currentReasoningEffort.get()).toBe('high')
+  })
+
+  it('keeps a draft’s remembered target-row options when the menu is closed and reopened', async () => {
+    $activeSessionId.set(null)
+    $currentProvider.set('deepseek')
+    $currentModel.set('deepseek-v4-pro')
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          capabilities: { 'gemini-3.1-pro': { fast: true, reasoning: true } },
+          models: ['gemini-3.1-pro'],
+          name: 'Google',
+          slug: 'google'
+        }
+      ]
+    })
+
+    const first = renderPanel()
+    const row = (await first.content.findByText(/Gemini 3\.1 Pro/i)).closest('[role="menuitem"]')!
+    fireEvent.keyDown(row, { key: 'ArrowRight' })
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /^High$/i }))
+    first.content.unmount()
+
+    // The dropdown unmounts its content when closed; reopening mounts a new panel.
+    const second = renderPanel()
+    const reopened = (await second.content.findByText(/Gemini 3\.1 Pro/i)).closest('[role="menuitem"]')!
+    expect(reopened.textContent?.toLowerCase()).toContain('high')
+  })
+
+  it('selecting a model does not take over settlement of an in-flight option write', async () => {
+    $currentProvider.set('deepseek')
+    $currentModel.set('deepseek-v4-pro')
+    publishSessionState('runtime-1', {
+      ...createClientSessionState(null),
+      model: 'deepseek-v4-pro',
+      provider: 'deepseek',
+      reasoningEffort: 'medium'
+    })
+    setSessionTileDelegate({
+      updateSession: (id: string, updater: (current: never) => never) => {
+        const next = updater($sessionStates.get()[id] as never)
+        publishSessionState(id, next)
+
+        return next
+      }
+    } as unknown as SessionTileDelegate)
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          capabilities: { 'deepseek-v4-pro': { reasoning: true } },
+          models: ['deepseek-v4-pro', 'deepseek-chat'],
+          name: 'DeepSeek',
+          slug: 'deepseek'
+        }
+      ]
+    })
+
+    let rejectWrite!: (error: Error) => void
+
+    const write = new Promise((_, reject) => {
+      rejectWrite = reject
+    })
+
+    const requestGateway = vi.fn((method: string, params?: Record<string, unknown>) =>
+      method === 'config.set' && params?.key === 'runtime_options' ? write : Promise.resolve({})
+    )
+
+    const onSelectModel = vi.fn(() => new Promise<boolean>(() => undefined))
+
+    try {
+      const { content } = renderPanel(onSelectModel, requestGateway)
+      const active = (await content.findByText(/Deepseek V4 Pro/i)).closest('[role="menuitem"]')!
+      fireEvent.keyDown(active, { key: 'ArrowRight' })
+      fireEvent.click(await screen.findByRole('menuitemradio', { name: /^High$/i }))
+      await vi.waitFor(() =>
+        expect($sessionStates.get()['runtime-1']?.pendingRuntimeOptions).toEqual({ effort: 'high' })
+      )
+
+      // Pick another model while the effort write is still pending.
+      fireEvent.click(await content.findByText(/Deepseek Chat/i))
+      expect(onSelectModel).toHaveBeenCalled()
+
+      await act(async () => {
+        rejectWrite(Object.assign(new Error('rejected'), { code: 4001 }))
+        await write.catch(() => undefined)
+      })
+
+      await vi.waitFor(() => expect($sessionStates.get()['runtime-1']?.pendingRuntimeOptions ?? null).toBeNull())
+      expect($sessionStates.get()['runtime-1']?.reasoningEffort).toBe('medium')
+    } finally {
+      setSessionTileDelegate({} as SessionTileDelegate)
+    }
+  })
+
+  it('does not show another session’s saved target options', async () => {
+    $currentProvider.set('foo')
+    $currentModel.set('fixture')
+
+    const otherSessionScope = modelPresetScopeKey({
+      connectionId: activeGatewayConnectionId(),
+      draftId: 'draft-test',
+      profile: 'default',
+      sessionId: 'runtime-other'
+    })
+
+    setModelPreset(otherSessionScope, 'foo', 'fixture', { effort: 'high' })
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [{ models: ['fixture'], name: 'Foo', slug: 'foo' }]
+    })
+
+    const { content } = renderPanel()
+    const row = (await content.findByText('Fixture')).closest('[role="menuitem"]')!
+    fireEvent.keyDown(row, { key: 'ArrowRight' })
+
+    expect(screen.queryByRole('menuitem', { name: /apply options/i })).toBeNull()
   })
 
   it('keeps the checkmark on the live SessionView model when a stale options response disagrees', async () => {

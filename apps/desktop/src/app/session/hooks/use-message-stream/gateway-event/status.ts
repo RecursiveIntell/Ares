@@ -138,6 +138,7 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
     // frame's structured classification when present, else the wire text that
     // every surface already emits.
     const errorSurface = (payload?.error_surface ?? undefined) as { code?: string; retryable?: boolean } | undefined
+
     // Narrow on purpose: only the admission-refusal code is transient. Matching
     // any `retryable` surface would also swallow failed-turn treatment for
     // future error classes that happen to carry that flag. The text fallback
@@ -160,6 +161,7 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
 
     if (isActiveEvent) {
       setPetActivity({ reasoning: false, toolRunning: false })
+
       if (!transientAdmissionRefusal) {
         flashPetActivity({ error: true })
       }
@@ -218,7 +220,9 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
         // could not be recovered, keep the bubble as the record of the attempt.
         updateSessionState(sessionId, state => ({
           ...state,
-          messages: unadmitted ? state.messages.filter(message => message.id !== unadmitted.optimisticId) : state.messages,
+          messages: unadmitted
+            ? state.messages.filter(message => message.id !== unadmitted.optimisticId)
+            : state.messages,
           awaitingResponse: false,
           busy: false,
           reconnecting: false,

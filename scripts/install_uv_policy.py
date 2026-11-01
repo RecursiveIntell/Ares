@@ -29,6 +29,72 @@ def local_path(value):
     return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9_./ -]+", value)) and not value.startswith("//")
 
 
+# PEP 508 environment-marker variables. A marker may only compare these to
+# short quoted literals; it can never introduce a URL, path, or direct reference.
+MARKER_VARIABLES = frozenset({
+    "os_name", "sys_platform", "platform_machine", "platform_python_implementation",
+    "platform_release", "platform_system", "platform_version", "python_version",
+    "python_full_version", "implementation_name", "implementation_version",
+})
+_MARKER_TOKEN = re.compile(r"""\s*(?:(?P<lit>'[A-Za-z0-9_.*+ -]*'|"[A-Za-z0-9_.*+ -]*")|(?P<op>===|==|!=|<=|>=|~=|<|>)|(?P<paren>[()])|(?P<word>[A-Za-z_]+))""")
+
+
+def supported_marker(marker):
+    """Accept only `variable op 'literal'` comparisons joined by and/or."""
+    position, tokens = 0, []
+    marker = marker.strip()
+    while position < len(marker):
+        match = _MARKER_TOKEN.match(marker, position)
+        if not match or match.end() == position:
+            return False
+        position = match.end()
+        kind = match.lastgroup
+        tokens.append((kind, match.group(kind)))
+    depth, expect_operand, index = 0, True, 0
+    while index < len(tokens):
+        kind, text = tokens[index]
+        if expect_operand:
+            if kind == "paren" and text == "(":
+                depth += 1
+                index += 1
+                continue
+            # operand op operand, where one side is a marker variable and the other a literal
+            if index + 2 >= len(tokens):
+                return False
+            left, op, right = tokens[index], tokens[index + 1], tokens[index + 2]
+            if op[0] != "op":
+                return False
+            sides = {left[0], right[0]}
+            variable = left if left[0] == "word" else right
+            if sides != {"word", "lit"} or variable[1] not in MARKER_VARIABLES:
+                return False
+            index += 3
+            expect_operand = False
+        else:
+            if kind == "paren" and text == ")":
+                depth -= 1
+                if depth < 0:
+                    return False
+                index += 1
+                continue
+            if kind == "word" and text in ("and", "or"):
+                expect_operand = True
+                index += 1
+                continue
+            return False
+    return depth == 0 and not expect_operand
+
+
+def supported_override(value):
+    """A registry requirement string, optionally with a PEP 508 environment marker."""
+    if not isinstance(value, str) or value.count(";") > 1:
+        return False
+    requirement, separator, marker = value.partition(";")
+    if not re.fullmatch(r"[A-Za-z0-9_.<>=!,~ -]+", requirement) or not requirement.strip():
+        return False
+    return not separator or supported_marker(marker)
+
+
 def reject_inline_credentials(value):
     if isinstance(value, dict):
         for item in value.values():
@@ -58,10 +124,7 @@ def project_policy(data):
     ):
         raise PolicyError("Unsupported package age policy")
     overrides = policy.get("override-dependencies", [])
-    if not isinstance(overrides, list) or any(
-        not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.<>=!,~ -]+", value)
-        for value in overrides
-    ):
+    if not isinstance(overrides, list) or any(not supported_override(value) for value in overrides):
         raise PolicyError("Unsupported native dependency override")
     sources = policy.get("sources", {})
     if not isinstance(sources, dict) or any(
