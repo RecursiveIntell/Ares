@@ -54,7 +54,7 @@ def test_host_session_build_starts_discovery_before_agent_snapshot(host, monkeyp
     assert order == ["discovery", "make_agent"]
 
 
-def test_discovery_start_failure_never_blocks_the_build(host, monkeypatch):
+def test_discovery_start_failure_never_blocks_the_build(host, monkeypatch, caplog):
     def _boom():
         raise RuntimeError("mcp sdk unavailable")
 
@@ -62,9 +62,20 @@ def test_discovery_start_failure_never_blocks_the_build(host, monkeypatch):
     built = []
     monkeypatch.setattr(server, "_make_agent", lambda sid, key, **kw: built.append(sid) or _Agent())
 
-    host._ensure_server_session(server, {"sid": "s2", "session_key": "k2"})
+    with caplog.at_level("WARNING", logger=server.logger.name):
+        host._ensure_server_session(server, {"sid": "s2", "session_key": "k2"})
 
     assert built == ["s2"]
+    warnings = [
+        record for record in caplog.records
+        if record.name == server.logger.name
+        and record.getMessage() == "compute-host MCP discovery startup failed"
+    ]
+    assert warnings
+    assert warnings[0].levelname == "WARNING"
+    assert warnings[0].exc_info is not None
+    assert warnings[0].exc_info[0] is RuntimeError
+    assert str(warnings[0].exc_info[1]) == "mcp sdk unavailable"
 
 
 def test_existing_host_session_is_reused_without_new_discovery(host, monkeypatch):
