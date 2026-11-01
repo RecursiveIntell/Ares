@@ -20,11 +20,13 @@ import {
 } from './session'
 import { $sessionStates, knownOwnerForSession, sessionTileDelegate } from './session-states'
 
-const STORAGE_KEY = 'hermes.desktop.model-presets'
+// Versioned scope: the v1 provider/model-only values had no session owner and
+// are deliberately not assigned to any conversation.
+const STORAGE_KEY = 'hermes.desktop.session-model-presets.v2'
 
-/** Per-model reasoning/fast preset, remembered globally across sessions and
- *  re-applied to the session whenever that model is selected. Unset dimensions
- *  fall back to the Hermes default (medium effort, no fast). */
+/** Per-session/per-model target-row preference. Active runtime choices are
+ *  authoritative in the backend session; this value is a local projection used
+ *  only when selecting a target model in that same session. */
 export interface ModelPreset {
   effort?: string
   fast?: boolean
@@ -32,8 +34,26 @@ export interface ModelPreset {
 
 type RequestGateway = <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 
-/** Stable `provider::model` key (matches the visibility-store format). */
-export const modelPresetKey = (provider: string, model: string): string => `${provider}::${model}`
+export interface ModelPresetScope {
+  connectionId: null | string
+  draftId: string
+  profile: string
+  sessionId: null | string
+}
+
+/** One draft or live session, including its owning backend/profile. */
+export function modelPresetScopeKey({ connectionId, draftId, profile, sessionId }: ModelPresetScope): string {
+  return JSON.stringify([
+    sessionId ? 'session' : 'draft',
+    connectionId === null ? 'local' : connectionId.trim(),
+    profile.trim() || 'default',
+    sessionId || draftId
+  ])
+}
+
+/** Stable per-session/provider/model key. */
+export const modelPresetKey = (scopeKey: string, provider: string, model: string): string =>
+  JSON.stringify([scopeKey, provider, model])
 
 function load(): Record<string, ModelPreset> {
   const raw = storedString(STORAGE_KEY)
@@ -53,14 +73,41 @@ function load(): Record<string, ModelPreset> {
 
 export const $modelPresets = atom<Record<string, ModelPreset>>(load())
 
-export function getModelPreset(provider: string, model: string): ModelPreset {
-  return $modelPresets.get()[modelPresetKey(provider, model)] ?? {}
+/** Same stable target tuple is used by optimistic writes and model-switch
+ *  continuations, so a stale selection cannot reclaim a newer option intent. */
+export function runtimeOptionsTargetForSession(runtimeId: string): string {
+  const state = $sessionStates.get()[runtimeId]
+  const owner = knownOwnerForSession(runtimeId)
+
+  const connectionId = owner && typeof owner === 'object' ? owner.connectionId : activeGatewayConnectionId()
+  const profile = typeof owner === 'string' ? owner : (owner?.profile ?? $activeGatewayProfile.get())
+  const targetProfile = owner && typeof owner === 'object' ? owner.targetProfile || owner.profile : profile
+
+  return JSON.stringify([
+    state?.storedSessionId || runtimeId,
+    state?.storedSessionId ?? null,
+    connectionId,
+    profile,
+    targetProfile
+  ])
 }
 
-/** Merge a partial preset for one model and persist. */
-export function setModelPreset(provider: string, model: string, patch: ModelPreset): void {
-  const key = modelPresetKey(provider, model)
-  const next = { ...$modelPresets.get(), [key]: { ...$modelPresets.get()[key], ...patch } }
+export function getModelPreset(scopeKey: string, provider: string, model: string): ModelPreset {
+  return $modelPresets.get()[modelPresetKey(scopeKey, provider, model)] ?? {}
+}
+
+/** Merge a partial option preference for one session/model and persist it. */
+export function setModelPreset(scopeKey: string, provider: string, model: string, patch: ModelPreset): void {
+  const definedPatch = Object.fromEntries(
+    Object.entries(patch).filter(([, value]) => value !== undefined)
+  ) as ModelPreset
+
+  if (Object.keys(definedPatch).length === 0) {
+    return
+  }
+
+  const key = modelPresetKey(scopeKey, provider, model)
+  const next = { ...$modelPresets.get(), [key]: { ...$modelPresets.get()[key], ...definedPatch } }
 
   $modelPresets.set(next)
   persistString(STORAGE_KEY, JSON.stringify(next))
@@ -107,38 +154,22 @@ export async function applyModelPreset(
   const runtimeId = ctx.sessionId
   const primary = (ctx.primary ?? true) && $activeSessionId.get() === runtimeId
   const state = $sessionStates.get()[runtimeId]
-  const owner = knownOwnerForSession(runtimeId)
-
-  const target = JSON.stringify([
-    runtimeId,
-    state?.storedSessionId ?? null,
-    owner && typeof owner === 'object' ? owner.connectionId : activeGatewayConnectionId(),
-    typeof owner === 'string' ? owner : (owner?.profile ?? $activeGatewayProfile.get())
-  ])
+  const target = runtimeOptionsTargetForSession(runtimeId)
 
   const tokens = beginRuntimeOptionIntent(target, [
     ...(effort !== undefined ? ['effort'] : []),
     ...(fast !== undefined ? ['fast'] : [])
   ])
 
-  const owns = (dimension: string) => {
-    const current = $sessionStates.get()[runtimeId]
-    const currentOwner = knownOwnerForSession(runtimeId)
-
-    const currentTarget = JSON.stringify([
-      runtimeId,
-      current?.storedSessionId ?? null,
-      currentOwner && typeof currentOwner === 'object' ? currentOwner.connectionId : activeGatewayConnectionId(),
-      typeof currentOwner === 'string' ? currentOwner : (currentOwner?.profile ?? $activeGatewayProfile.get())
-    ])
-
-    return Boolean(current) && currentTarget === target && ownsRuntimeOptionIntent(target, dimension, tokens[dimension])
-  }
+  const owns = (dimension: string) =>
+    Boolean($sessionStates.get()[runtimeId]) &&
+    runtimeOptionsTargetForSession(runtimeId) === target &&
+    ownsRuntimeOptionIntent(target, dimension, tokens[dimension])
 
   const previousEffort = state?.reasoningEffort ?? (primary ? $currentReasoningEffort.get() : '')
   const previousFast = state?.fast ?? (primary ? $currentFastMode.get() : false)
 
-  const paint = (patch: Partial<{ reasoningEffort: string; fast: boolean }>, persist = true) => {
+  const paint = (patch: Partial<{ reasoningEffort: string; fast: boolean }>, persist = false) => {
     sessionTileDelegate()?.updateSession(runtimeId, current => ({ ...current, ...patch }))
 
     if (primary && $activeSessionId.get() === runtimeId && $selectedStoredSessionId.get() === state?.storedSessionId) {
@@ -204,7 +235,7 @@ export async function applyModelPreset(
       }
 
       // Older backend: nothing was applied. Use its established per-option
-      // writes, in the same order, so a mid-upgrade user keeps the feature.
+      // writes, in the same user-dispatch order, so a mid-upgrade user keeps the feature.
       if (effort !== undefined) {
         const response = await ctx.request<{ deferred?: boolean }>('config.set', {
           key: 'reasoning',
