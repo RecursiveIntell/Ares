@@ -108,6 +108,7 @@ def _record_external_secret_snapshot(
     data: Mapping[str, str],
     status: str,
     error_kind: str | None = None,
+    source_identity: str | None = None,
 ) -> ExternalSecretSnapshot:
     home = home.resolve()
     home_key = str(home)
@@ -122,7 +123,10 @@ def _record_external_secret_snapshot(
             status=status,
             generation=generation,
             error_kind=error_kind,
-            source_identity=_external_secret_source_identity(home),
+            source_identity=(
+                source_identity if source_identity is not None
+                else _external_secret_source_identity(home)
+            ),
         )
         _SECRET_SOURCE_SNAPSHOTS_BY_HOME[home_key] = snapshot
         _SECRET_SOURCE_VALUES_BY_HOME[home_key] = dict(snapshot.data)
@@ -289,6 +293,8 @@ def get_secret_source_values(
 
 def hydrate_profile_secret_sources(
     hermes_home: str | os.PathLike,
+    *,
+    _policy_snapshot=None,
 ) -> dict[str, str]:
     """Resolve one profile's configured sources without mutating ``os.environ``.
 
@@ -301,12 +307,24 @@ def hydrate_profile_secret_sources(
     ``_apply_external_secret_sources``.  The returned mapping contains only
     values actually contributed by external sources, never the profile's
     plaintext ``.env`` entries.
+
+    An internal caller may supply a strict owner-built policy snapshot. It
+    must belong to this exact lexical profile and still be current; invalid
+    inputs are refused rather than falling back to another config read.
     """
     with _SECRET_SOURCE_CACHE_LOCK:
-        return _hydrate_profile_secret_sources(Path(hermes_home))
+        home = Path(hermes_home)
+        if _policy_snapshot is not None:
+            from hermes_cli.config import SecurityPolicySnapshot
+
+            if not isinstance(_policy_snapshot, SecurityPolicySnapshot):
+                raise TypeError("_policy_snapshot must be a SecurityPolicySnapshot")
+            _policy_snapshot.assert_profile_owner(home)
+            _policy_snapshot.assert_current()
+        return _hydrate_profile_secret_sources(home, _policy_snapshot=_policy_snapshot)
 
 
-def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
+def _hydrate_profile_secret_sources(home: Path, *, _policy_snapshot=None) -> dict[str, str]:
     """Locked implementation for :func:`hydrate_profile_secret_sources`."""
     home_key = str(home.resolve())
     if home_key in _APPLIED_HOMES:
@@ -319,8 +337,16 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
         _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
         _SECRET_SOURCE_SNAPSHOTS_BY_HOME.pop(home_key, None)
 
+    # Bind the eventual result to inputs observed BEFORE loading configuration
+    # or calling any external source.  Capturing only after the fetch could
+    # label values from old inputs as if they came from newly changed inputs.
+    source_identity = _external_secret_source_identity(home)
     try:
-        cfg = _load_secrets_config(home)
+        if _policy_snapshot is None:
+            cfg = _load_secrets_config(home)
+        else:
+            _policy_snapshot.assert_current()
+            cfg = _policy_snapshot.config.get("secrets") or {}
     except Exception:  # noqa: BLE001 — external sources must not block routing
         _record_external_secret_snapshot(
             home,
@@ -330,7 +356,15 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
         )
         return {}
     if not cfg:
-        _record_external_secret_snapshot(home, data={}, status="absent")
+        if _external_secret_source_identity(home) != source_identity:
+            _record_external_secret_snapshot(
+                home, data={}, status="failed", error_kind="source_changed",
+                source_identity=source_identity,
+            )
+            return {}
+        _record_external_secret_snapshot(
+            home, data={}, status="absent", source_identity=source_identity,
+        )
         return {}
 
     try:
@@ -363,8 +397,17 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
         )
         return {}
 
+    if _external_secret_source_identity(home) != source_identity:
+        _record_external_secret_snapshot(
+            home, data={}, status="failed", error_kind="source_changed",
+            source_identity=source_identity,
+        )
+        return {}
+
     if not report.sources:
-        _record_external_secret_snapshot(home, data={}, status="empty")
+        _record_external_secret_snapshot(
+            home, data={}, status="empty", source_identity=source_identity,
+        )
         return {}
 
     _APPLIED_HOMES.add(home_key)
@@ -379,6 +422,7 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
         home,
         data=values,
         status="ready" if values else "empty",
+        source_identity=source_identity,
     )
     return dict(values)
 

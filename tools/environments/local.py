@@ -402,14 +402,28 @@ def _build_model_provider_env_names() -> frozenset[str]:
 _MODEL_PROVIDER_ENV_NAMES_UPPER = _build_model_provider_env_names()
 
 
-def _is_blocked_provider_env(key: str) -> bool:
+def _provider_env_blocklist_snapshot() -> frozenset[str]:
+    """Capture current provider policy for one child environment only."""
+    return frozenset(name.upper() for name in _build_provider_env_blocklist())
+
+
+def _verify_provider_env_blocklist_snapshot(snapshot: frozenset[str]) -> None:
+    """Refuse an environment built across an observed provider-policy change."""
+    if _provider_env_blocklist_snapshot() != snapshot:
+        raise RuntimeError("provider environment policy changed during child construction")
+
+
+def _is_blocked_provider_env(
+    key: str, *, _blocklist_snapshot: frozenset[str] | None = None
+) -> bool:
     """Match provider credentials case-insensitively and through wrappers.
 
     Windows environment keys are case-insensitive, and Apptainer/Singularity
     can rename ``APPTAINERENV_*`` / ``SINGULARITYENV_*`` entries inside the
     container.  Both representations must resolve to the same policy key.
     """
-    current = frozenset(name.upper() for name in _build_provider_env_blocklist())
+    current = (_provider_env_blocklist_snapshot() if _blocklist_snapshot is None
+               else _blocklist_snapshot)
     return _credential_target_env_name(key).upper() in current
 
 # Active-virtualenv markers that must NOT leak into terminal subprocesses.
@@ -438,7 +452,9 @@ def _is_blocked_provider_env(key: str) -> bool:
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONHOME")
 
 
-def _is_hermes_internal_secret(key: str) -> bool:
+def _is_hermes_internal_secret(
+    key: str, *, bws_token_env: str | frozenset[str] | None = None
+) -> bool:
     """Return True for Hermes-internal secrets injected under *dynamic* names.
 
     ``_HERMES_PROVIDER_ENV_BLOCKLIST`` is name-based and derived from the
@@ -496,34 +512,59 @@ def _is_hermes_internal_secret(key: str) -> bool:
         return True
     if "BWS" in upper and upper.endswith("_TOKEN"):
         return True
-    if upper == "BWS_ACCESS_TOKEN" or upper == _get_configured_bws_token_env().upper():
-        # Bitwarden Secrets Manager bootstrap token — the exact configured
-        # access_token_env name (default BWS_ACCESS_TOKEN; may be remapped to
-        # a non-suffix name like MY_BWS_TOKEN), plus the default name itself.
-        # A remapped profile sharing one process with a default profile must
-        # not let the default profile's BWS_ACCESS_TOKEN (which the shared
-        # os.environ carries across profile turns) cross its child boundary
-        # either — the Bitwarden rule holds in both directions.
+    if upper == "BWS_ACCESS_TOKEN":
         return True
+    if bws_token_env is None:
+        token_names = (_get_configured_bws_token_env(),)
+    elif isinstance(bws_token_env, str):
+        token_names = (bws_token_env,)
+    else:
+        token_names = bws_token_env
+    # Check the literal key AND every forwarding layer. The configured name
+    # may itself start with a container prefix, in which case comparing only
+    # the fully unwrapped target misses the real bootstrap variable.
+    protected_names = {name.upper() for name in token_names}
+    candidate = str(key).upper()
+    while True:
+        if candidate in protected_names:
+            return True
+        for prefix in _CONTAINER_ENV_FORWARD_PREFIXES:
+            if candidate.startswith(prefix):
+                candidate = candidate[len(prefix):]
+                break
+        else:
+            break
     return False
 
 
-def _get_configured_bws_token_env() -> str:
+def _get_configured_bws_token_env(
+    profile_home: str | os.PathLike | None = None,
+    *,
+    _config_snapshot: dict | None = None,
+) -> str:
     """Resolve the exact Bitwarden token env name for the active profile.
 
-    ``read_raw_config`` is already cached by profile-aware config path and file
-    revision. Adding another per-home cache here would hide runtime remaps and
-    leave the newly configured bootstrap token unclassified.
+    The canonical security reader refuses malformed or unreadable sources.
+    No per-home cache is added here: a later remap must be visible at the next
+    child decision. A supplied snapshot belongs only to the current spawn.
     """
-    name = "BWS_ACCESS_TOKEN"
     try:
-        from hermes_cli.config import cfg_get, read_raw_config
+        from hermes_cli.config import cfg_get, read_security_policy_config
+        from agent.secret_sources.bitwarden import BitwardenSource
 
-        configured = cfg_get(
-            read_raw_config(), "secrets", "bitwarden", "access_token_env"
-        )
-        if isinstance(configured, str) and configured.strip():
-            name = configured.strip()
+        if _config_snapshot is not None and profile_home is not None:
+            raise ValueError("config snapshot cannot be combined with an explicit profile")
+        config = (_config_snapshot if _config_snapshot is not None
+                  else read_security_policy_config(profile_home))
+        bitwarden_config = cfg_get(config, "secrets", "bitwarden", default={})
+        protected = BitwardenSource().protected_env_vars(bitwarden_config)
+        # This resolver has a one-name contract. A source-owner expansion must
+        # be handled explicitly rather than silently discarding protection.
+        if len(protected) != 1:
+            raise ValueError("unexpected Bitwarden protected-name count")
+        name = next(iter(protected))
+        if not isinstance(name, str) or not name:
+            raise ValueError("invalid Bitwarden protected name")
     except Exception as exc:
         # A remapped bootstrap name may have no credential-looking suffix. If
         # config authority is unavailable, returning the default would let that
@@ -560,6 +601,8 @@ def _finalize_child_env_policy(
     explicit_force_targets=(),
     *,
     enforce_password_policy: bool = False,
+    bws_token_env: str | frozenset[str] | None = None,
+    _blocklist_snapshot: frozenset[str] | None = None,
 ) -> dict[str, str]:
     """Reapply generic policy after profile values are overlaid.
 
@@ -582,13 +625,13 @@ def _finalize_child_env_policy(
         )
         if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             env.pop(key, None)
-        elif _is_hermes_internal_secret(target_key):
+        elif _is_hermes_internal_secret(key, bws_token_env=bws_token_env):
             env.pop(key, None)
         elif target_upper in always_strip:
             env.pop(key, None)
         elif target_upper in plugin_strip:
             env.pop(key, None)
-        elif _is_blocked_provider_env(target_key) and not allow_credential:
+        elif _is_blocked_provider_env(target_key, _blocklist_snapshot=_blocklist_snapshot) and not allow_credential:
             env.pop(key, None)
         elif (
             enforce_password_policy
@@ -699,15 +742,45 @@ def _sanitize_subprocess_env(
             ) from exc
         logger.debug("profile environment boundary unavailable outside multiplex", exc_info=True)
 
+    provider_blocklist = _provider_env_blocklist_snapshot()
+    # Do not equate symlink aliases: each lexical owner is checked separately.
+    # One snapshot per distinct spelling avoids duplicate parses while binding
+    # ambient, explicit source and explicit target to their own policy bytes.
+    from hermes_constants import get_hermes_home
+    try:
+        from hermes_cli.config import capture_security_policy_config
+
+        ambient_home = get_hermes_home()
+        ambient_snapshot = capture_security_policy_config()
+        ambient_snapshot.assert_profile_owner(ambient_home)
+        policy_snapshots = {Path(ambient_home): ambient_snapshot}
+        protected_bws_names = {
+            _get_configured_bws_token_env(
+                _config_snapshot=policy_snapshots[Path(ambient_home)].config
+            )
+        }
+        for home in (profile_home, source_profile_home):
+            if home is None:
+                continue
+            key = Path(home)
+            if key not in policy_snapshots:
+                policy_snapshots[key] = capture_security_policy_config(home)
+                policy_snapshots[key].assert_profile_owner(home)
+            protected_bws_names.add(
+                _get_configured_bws_token_env(_config_snapshot=policy_snapshots[key].config)
+            )
+        bws_token_env: str | frozenset[str] = frozenset(protected_bws_names)
+    except Exception as exc:
+        raise RuntimeError("Bitwarden token policy unavailable") from exc
     try:
         from tools.env_passthrough import (
-            is_env_passthrough as _is_passthrough_for_profile,
+            get_all_passthrough,
             resolve_passthrough_value as _resolve_passthrough_value,
         )
-        _is_passthrough = lambda name: _is_passthrough_for_profile(  # noqa: E731
-            name,
-            profile_home=profile_home,
-        )
+        _is_passthrough = get_all_passthrough(
+            profile_home=profile_home, bws_token_env=bws_token_env,
+            _blocklist_snapshot=provider_blocklist,
+        ).__contains__
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
@@ -718,12 +791,12 @@ def _sanitize_subprocess_env(
     for key, value in protected_base.items():
         if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
-        if _is_hermes_internal_secret(key):
+        if _is_hermes_internal_secret(key, bws_token_env=bws_token_env):
             continue
         if key in _plugin_strip:
             continue
         passthrough = _is_passthrough(key)
-        if _is_blocked_provider_env(key) and not passthrough:
+        if _is_blocked_provider_env(key, _blocklist_snapshot=provider_blocklist) and not passthrough:
             continue
         if cross_profile and _is_credential_shaped_password(key) and not passthrough:
             continue
@@ -734,16 +807,16 @@ def _sanitize_subprocess_env(
     for key, value in (extra_env or {}).items():
         if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
+            if _is_hermes_internal_secret(real_key, bws_token_env=bws_token_env):
                 continue
             sanitized[real_key] = value
-        elif _is_hermes_internal_secret(key):
+        elif _is_hermes_internal_secret(key, bws_token_env=bws_token_env):
             continue
         elif key in _plugin_strip:
             continue
         else:
             passthrough = _is_passthrough(key)
-            if _is_blocked_provider_env(key) and not passthrough:
+            if _is_blocked_provider_env(key, _blocklist_snapshot=provider_blocklist) and not passthrough:
                 continue
             if cross_profile and _is_credential_shaped_password(key) and not passthrough:
                 continue
@@ -761,6 +834,8 @@ def _sanitize_subprocess_env(
             boundary,
             is_passthrough=_is_passthrough,
             plugin_strip=_plugin_strip,
+            bws_token_env=bws_token_env,
+            _blocklist_snapshot=provider_blocklist,
         )
     sanitized = _finalize_child_env_policy(
         sanitized,
@@ -771,6 +846,8 @@ def _sanitize_subprocess_env(
             if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX)
         },
         enforce_password_policy=cross_profile,
+        bws_token_env=bws_token_env,
+        _blocklist_snapshot=provider_blocklist,
     )
 
     # An explicit target profile is authoritative for both HERMES_HOME and the
@@ -806,7 +883,12 @@ def _sanitize_subprocess_env(
     _apply_windows_msys_bash_env_defaults(sanitized)
 
     sanitized = _scrub_delegated_child_kanban_env(sanitized)
-
+    _verify_provider_env_blocklist_snapshot(provider_blocklist)
+    try:
+        for policy_snapshot in policy_snapshots.values():
+            policy_snapshot.assert_current()
+    except Exception as exc:
+        raise RuntimeError("Bitwarden token policy unavailable") from exc
     return sanitized
 
 
@@ -816,6 +898,8 @@ def _materialize_target_passthrough_values(
     *,
     is_passthrough,
     plugin_strip: frozenset[str] | set[str],
+    bws_token_env: str | frozenset[str] | None = None,
+    _blocklist_snapshot: frozenset[str] | None = None,
 ) -> dict[str, str]:
     """Add exact target-authored passthrough grants absent from ambient env.
 
@@ -830,9 +914,9 @@ def _materialize_target_passthrough_values(
     for key, value in boundary.compiled_target_values().items():
         if not is_passthrough(key):
             continue
-        if _is_hermes_internal_secret(key) or key in plugin_strip:
+        if _is_hermes_internal_secret(key, bws_token_env=bws_token_env) or key in plugin_strip:
             continue
-        if _is_blocked_provider_env(key):
+        if _is_blocked_provider_env(key, _blocklist_snapshot=_blocklist_snapshot):
             continue
         # ``boundary.target_values`` is already an immutable, identity-bound
         # target-profile snapshot. Re-resolving it through the ambient
@@ -1652,24 +1736,32 @@ def _path_env_key(run_env: dict) -> str | None:
 
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
-    try:
-        from tools.env_passthrough import (
-            is_env_passthrough as _is_passthrough,
-            resolve_passthrough_value as _resolve_passthrough_value,
-        )
-    except Exception:
-        _is_passthrough = lambda _: False  # noqa: E731
-        _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
-
     merged = dict(os.environ | env)
     _multiplex_active = False
     _boundary = None
+    # Capture the target once before secret-scope hydration so the same
+    # owner-bound bytes can be used at that boundary and for filtering.
+    from hermes_constants import get_hermes_home
+    try:
+        _ambient_home = Path(get_hermes_home())
+    except Exception as exc:
+        raise RuntimeError(
+            "profile environment boundary could not be constructed; "
+            "profile home unavailable"
+        ) from exc
+    try:
+        from hermes_cli.config import capture_security_policy_config
+
+        _policy_snapshot = capture_security_policy_config()
+        _policy_snapshot.assert_profile_owner(_ambient_home)
+    except Exception as exc:
+        raise RuntimeError("Bitwarden token policy unavailable") from exc
     try:
         from agent.secret_scope import build_profile_env_boundary, is_multiplex_active
 
         _multiplex_active = is_multiplex_active()
         if _multiplex_active:
-            _boundary = build_profile_env_boundary()
+            _boundary = build_profile_env_boundary(_target_policy_snapshot=_policy_snapshot)
             merged = _boundary.sanitize(merged)
     except Exception as exc:
         if _multiplex_active:
@@ -1678,6 +1770,42 @@ def _make_run_env(env: dict) -> dict:
                 "to run with ambient environment"
             ) from exc
         logger.debug("profile environment boundary unavailable outside multiplex", exc_info=True)
+    # Capture each distinct profile policy used by the admitted boundary.
+    # A source bootstrap name can originate in the launch environment without
+    # being recorded in its dotenv ownership set. Protect both source and
+    # target identities throughout filtering and recheck each before return.
+    try:
+        _policy_snapshots = {_ambient_home.absolute(): _policy_snapshot}
+        _config_snapshot = _policy_snapshot.config
+        _protected_bws_names = {
+            _get_configured_bws_token_env(_config_snapshot=_config_snapshot)
+        }
+        if _boundary is not None:
+            for _home in (_boundary.source_home, _boundary.target_home):
+                _key = Path(_home).absolute()
+                if _key not in _policy_snapshots:
+                    _policy_snapshots[_key] = capture_security_policy_config(_home)
+                    _policy_snapshots[_key].assert_profile_owner(_home)
+                _protected_bws_names.add(_get_configured_bws_token_env(
+                    _config_snapshot=_policy_snapshots[_key].config
+                ))
+        bws_token_env = frozenset(_protected_bws_names)
+    except Exception as exc:
+        raise RuntimeError("Bitwarden token policy unavailable") from exc
+    provider_blocklist = _provider_env_blocklist_snapshot()
+    try:
+        from tools.env_passthrough import (
+            get_all_passthrough,
+            resolve_passthrough_value as _resolve_passthrough_value,
+        )
+        _passthrough_names = get_all_passthrough(
+            bws_token_env=bws_token_env, _config_snapshot=_config_snapshot,
+            _blocklist_snapshot=provider_blocklist,
+        )
+        _is_passthrough = _passthrough_names.__contains__
+    except Exception:
+        _is_passthrough = lambda _: False  # noqa: E731
+        _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
     run_env = {}
     explicit_force_names = {
         key
@@ -1689,14 +1817,14 @@ def _make_run_env(env: dict) -> dict:
             if k not in explicit_force_names:
                 continue
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
+            if _is_hermes_internal_secret(real_key, bws_token_env=bws_token_env):
                 continue
             run_env[real_key] = v
-        elif _is_hermes_internal_secret(k):
+        elif _is_hermes_internal_secret(k, bws_token_env=bws_token_env):
             continue
         else:
             passthrough = _is_passthrough(k)
-            if _is_blocked_provider_env(k) and not passthrough:
+            if _is_blocked_provider_env(k, _blocklist_snapshot=provider_blocklist) and not passthrough:
                 continue
             if _multiplex_active and _is_credential_shaped_password(k) and not passthrough:
                 continue
@@ -1710,6 +1838,8 @@ def _make_run_env(env: dict) -> dict:
             _boundary,
             is_passthrough=_is_passthrough,
             plugin_strip=_plugin_terminal_env_strip_keys(),
+            bws_token_env=bws_token_env,
+            _blocklist_snapshot=provider_blocklist,
         )
     run_env = _finalize_child_env_policy(
         run_env,
@@ -1719,6 +1849,8 @@ def _make_run_env(env: dict) -> dict:
             for key in explicit_force_names
         },
         enforce_password_policy=_multiplex_active,
+        bws_token_env=bws_token_env,
+        _blocklist_snapshot=provider_blocklist,
     )
 
     path_key = _path_env_key(run_env)
@@ -1751,7 +1883,12 @@ def _make_run_env(env: dict) -> dict:
     _apply_windows_msys_bash_env_defaults(run_env)
 
     run_env = _scrub_delegated_child_kanban_env(run_env)
-
+    _verify_provider_env_blocklist_snapshot(provider_blocklist)
+    try:
+        for _policy_snapshot in _policy_snapshots.values():
+            _policy_snapshot.assert_current()
+    except Exception as exc:
+        raise RuntimeError("Bitwarden token policy unavailable") from exc
     return run_env
 
 
