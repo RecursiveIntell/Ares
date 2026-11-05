@@ -32,6 +32,26 @@ def hermes_home(tmp_path, monkeypatch):
     return home
 
 
+@pytest.fixture
+def timeout_admission(hermes_home):
+    """Use the diagnostic's own temporary home as the admission owner."""
+    from types import SimpleNamespace
+    from agent.orchestration_runtime import admit_worker
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import SessionDB
+
+    (hermes_home / "config.yaml").write_text('delegation:\n  provider: ""\n  model: ""\n')
+    token = set_hermes_home_override(hermes_home)
+    db = SessionDB(hermes_home / "state.db")
+    db.create_session("timeout-diagnostic-parent", "cli", model="test-model")
+    parent = SimpleNamespace(session_id="timeout-diagnostic-parent", _session_db=db)
+    try:
+        yield admit_worker(parent)
+    finally:
+        db.close()
+        reset_hermes_home_override(token)
+
+
 class _StubChild:
     """Minimal stand-in for an AIAgent subagent."""
     def __init__(
@@ -183,7 +203,7 @@ class TestRunSingleChildTimeoutDump:
         """Run _run_single_child with a tiny timeout to force the timeout branch."""
         from tools import delegate_tool
         # Force a 0.3s timeout so the test is fast
-        monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.3)
+        monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda config: 0.3)
 
         parent = MagicMock()
         parent._touch_activity = MagicMock()
@@ -195,8 +215,9 @@ class TestRunSingleChildTimeoutDump:
             parent_agent=parent,
         )
 
-    def test_zero_api_calls_writes_dump_and_surfaces_path(self, hermes_home, monkeypatch):
+    def test_zero_api_calls_writes_dump_and_surfaces_path(self, hermes_home, monkeypatch, timeout_admission):
         child = _StubChild(api_call_count=0, hang_seconds=10.0)
+        child._orchestration_admission = timeout_admission
         result = self._invoke_with_short_timeout(child, monkeypatch)
 
         assert result["status"] == "timeout"
@@ -215,13 +236,14 @@ class TestRunSingleChildTimeoutDump:
     # ── explicit timeout metadata (#51690, salvaged from PR #60378) ────
 
 
-    def test_non_timeout_error_has_null_timeout_metadata(self, hermes_home, monkeypatch):
+    def test_non_timeout_error_has_null_timeout_metadata(self, hermes_home, monkeypatch, timeout_admission):
         """The metadata fields are timeout-specific — a child that raises
         must report them as None so consumers can key on presence."""
         from tools import delegate_tool
-        monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 30.0)
+        monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda config: 30.0)
 
         child = _StubChild(api_call_count=1, hang_seconds=0.0)
+        child._orchestration_admission = timeout_admission
 
         def _boom(*a, **kw):
             raise RuntimeError("child crashed")

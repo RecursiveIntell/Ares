@@ -111,17 +111,19 @@ def inference_call_scope(agent, payload, *, purpose="conversation", route=None):
     The managed-call owner may return an explicit qualification failure. Observe
     consumers may record that failure; enforce consumers must reject it.
     """
-    from ares_runtime.managed_calls import produce_dispatch_materialization
+    from ares_runtime.managed_calls import produce_dispatch_materialization, _model_call_owner
+    from agent.orchestration_runtime import physical_worker_binding
 
-    token = _call.set(
-        produce_dispatch_materialization(
-            agent,
-            payload,
-            purpose=purpose,
-            route=route,
-            execution_id=getattr(agent, "_current_dispatch_attempt_id", None),
-        )
-    )
+    owner = agent if agent is not None else _model_call_owner.get()
+    binding = physical_worker_binding(owner)
+    basis = produce_dispatch_materialization(
+        agent, payload, purpose=purpose, route=route,
+        execution_id=getattr(agent, "_current_dispatch_attempt_id", None))
+    # Ephemeral host reference carried by the existing lazy-stream owner, not
+    # serialized authority supplied by the provider or tool arguments.
+    if binding is not None:
+        basis = dict(basis, _orchestration_binding=binding)
+    token = _call.set(basis)
     try:
         yield _call.get()
     finally:
@@ -278,6 +280,15 @@ def _begin_buffered(request):
     if type(body) is not bytes or not body:
         body_error = "UNSUPPORTED_TRANSPORT"
     basis = _call.get()
+    from agent.orchestration_runtime import admit_physical_worker_send
+    from agent.orchestration_policy import OrchestrationError
+    try:
+        admit_physical_worker_send(
+            basis.get("_orchestration_binding") if basis is not None else None, body)
+    except OrchestrationError as error:
+        # Cross SDK retry handlers without turning an authority refusal into
+        # a connection failure that the SDK would retry on its own.
+        _raise_governance(error)
     observation = {
         "schema": "ares.physical-send/v1",
         "dispatch_intent_ref": "ares-dispatch-intent:" + uuid.uuid4().hex,

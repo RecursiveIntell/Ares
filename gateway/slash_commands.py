@@ -573,6 +573,26 @@ class GatewaySlashCommandsMixin:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
 
+    async def _handle_orchestration_command(self, event: MessageEvent) -> str:
+        """Current authenticated operator event; never reconstructed history."""
+        import json
+        from hermes_cli.orchestration import apply_operator_control
+        from agent.orchestration_policy import OrchestrationError
+        from hermes_state import SessionDB
+        try:
+            entry = await self.async_session_store.get_or_create_session(event.source)
+            db = getattr(self._session_db, "_db", self._session_db)
+            if not isinstance(db, SessionDB):
+                raise OrchestrationError("policy_store_unavailable")
+            if await asyncio.to_thread(db.get_session, entry.session_id) is None:
+                await asyncio.to_thread(db.create_session, entry.session_id,
+                    event.source.platform.value)
+            result = await asyncio.to_thread(apply_operator_control, db, entry.session_id,
+                event.get_command_args() or "show", source_message_id=str(event.message_id))
+            return json.dumps(result)
+        except OrchestrationError as error:
+            return json.dumps({"status": "blocked", "error": str(error)})
+
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
         from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model

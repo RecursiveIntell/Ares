@@ -12367,6 +12367,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._toggle_yolo()
         elif canonical == "approvals":
             self._handle_approvals_command(cmd_original)
+        elif canonical == "orchestration":
+            from agent.orchestration_policy import OrchestrationError
+            from hermes_cli.orchestration import handle_cli_command
+            try:
+                result = handle_cli_command(self, cmd_original)
+                self._console_print(json.dumps(result, indent=2), highlight=False, markup=False)
+            except (OrchestrationError, ValueError) as exc:
+                self._console_print(f"Orchestration control blocked: {exc}", highlight=False, markup=False)
         elif canonical == "reasoning":
             self._handle_reasoning_command(cmd_original)
         elif canonical == "fast":
@@ -16407,6 +16415,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Returns:
             The agent's response, or None on error
         """
+        # Recognize only a complete current operator control, not a quoted
+        # instruction embedded in a larger request. Local commands have no LLM
+        # turn and do not touch the cached system prefix or main model.
+        from hermes_cli.orchestration import operator_control_text
+        control = operator_control_text(message) if persist_user_display_kind is None and not images else None
+        if control is not None:
+            from hermes_cli.orchestration import handle_cli_command
+            from agent.orchestration_policy import OrchestrationError
+            try:
+                result = json.dumps(handle_cli_command(self, "/orchestration " + control))
+            except OrchestrationError as error:
+                result = json.dumps({"status": "blocked", "error": str(error)})
+            _cprint(result)
+            return result
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)

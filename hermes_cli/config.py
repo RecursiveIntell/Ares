@@ -15,6 +15,7 @@ This module provides:
 """
 
 import copy
+import hashlib
 from decimal import Decimal, InvalidOperation
 from hermes_cli.cli_output import line_input
 import json
@@ -3737,6 +3738,216 @@ def apply_terminal_config_to_env(
     return target
 
 
+class ConfigAdmissionError(ValueError):
+    """Current effective configuration cannot authorize an execution."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+@dataclass(frozen=True)
+class ConfigAdmissionSnapshot:
+    """Detached owner-built configuration; never aliases the display cache."""
+
+    profile_home: str
+    fingerprint: str
+    _value: Dict[str, Any]
+    managed_keys: tuple[str, ...] = ()
+
+    @property
+    def config(self) -> Dict[str, Any]:
+        return copy.deepcopy(self._value)
+
+
+def _merge_user_config_layer(user_config: Dict[str, Any]) -> Dict[str, Any]:
+    user_config = copy.deepcopy(user_config)
+    if "max_turns" in user_config:
+        agent_user_config = dict(user_config.get("agent") or {})
+        if agent_user_config.get("max_turns") is None:
+            agent_user_config["max_turns"] = user_config["max_turns"]
+        user_config["agent"] = agent_user_config
+        user_config.pop("max_turns", None)
+    return _deep_merge(copy.deepcopy(DEFAULT_CONFIG), user_config)
+
+
+def _finish_config_layers(config, managed_config):
+    """Shared normalization/expansion owner for display and admission reads."""
+    normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+    expanded = _expand_env_vars(normalized)
+    if managed_config:
+        managed_normalized = _normalize_root_model_keys(managed_config)
+        if isinstance(managed_normalized.get("model"), str):
+            managed_normalized = dict(managed_normalized)
+            managed_normalized["model"] = {"default": managed_normalized["model"]}
+        expanded = _deep_merge(expanded, _expand_env_vars(managed_normalized))
+    return expanded, normalized
+
+
+def _read_admission_bytes(path: Path):
+    """Capture raw bytes and their admission identity, without parsing YAML."""
+    try:
+        raw = path.read_bytes()
+        return raw, (str(path.resolve()), hashlib.sha256(raw).hexdigest())
+    except FileNotFoundError:
+        return None, (str(path.absolute()), None)
+    except OSError as exc:
+        raise ConfigAdmissionError("CONFIG_ADMISSION_SOURCE_UNAVAILABLE") from exc
+
+
+def _read_admission_config(path: Path):
+    """Capture exact current bytes; missing and unreadable are different states."""
+    raw, identity = _read_admission_bytes(path)
+    if raw is None:
+        return {}, identity
+    try:
+        import yaml
+
+        class UniqueKeys(yaml.SafeLoader):
+            def construct_mapping(self, node, deep=False):
+                seen = set()
+                for key_node, _value_node in node.value:
+                    if key_node.tag == "tag:yaml.org,2002:merge":
+                        continue
+                    key = self.construct_object(key_node, deep=deep)
+                    if key in seen:
+                        raise ValueError("duplicate configuration key")
+                    seen.add(key)
+                return super().construct_mapping(node, deep=deep)
+
+        value = yaml.load(raw.decode("utf-8"), Loader=UniqueKeys)
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise ValueError("configuration root must be a mapping")
+    except Exception as exc:
+        raise ConfigAdmissionError("CONFIG_ADMISSION_INVALID_SOURCE") from exc
+    return value, identity
+
+
+def _reject_dangling_security_config(path: Path, identity: tuple) -> None:
+    if identity[1] is None:
+        # A dangling symlink is not a deliberately absent config.
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ConfigAdmissionError("CONFIG_ADMISSION_SOURCE_UNAVAILABLE") from exc
+        else:
+            raise ConfigAdmissionError("CONFIG_ADMISSION_SOURCE_UNAVAILABLE")
+
+
+@dataclass(frozen=True)
+class SecurityPolicySnapshot:
+    """Strict parsed policy bound to one path and its captured source bytes."""
+
+    _path: Path
+    _identity: tuple
+    _ambient: bool
+    _value: Dict[str, Any]
+
+    @property
+    def config(self) -> Dict[str, Any]:
+        return copy.deepcopy(self._value)
+
+    def assert_profile_owner(self, profile_home: str | os.PathLike) -> None:
+        """Require the exact lexical profile owner used to capture this policy.
+
+        Do not resolve symlink aliases: an alias can be retargeted separately.
+        """
+        if (Path(profile_home) / "config.yaml").absolute() != self._path:
+            raise ConfigAdmissionError("CONFIG_ADMISSION_OWNER_MISMATCH")
+
+    def assert_current(self) -> None:
+        """Reject observed profile/source changes without re-parsing YAML.
+
+        This is a check at one instant, not a lock across subprocess launch;
+        a change-and-revert between checks is not detectable.
+        """
+        with _CONFIG_LOCK:
+            if self._ambient and get_config_path().absolute() != self._path:
+                raise ConfigAdmissionError("CONFIG_ADMISSION_SOURCE_CHANGED")
+            _raw, identity = _read_admission_bytes(self._path)
+            _reject_dangling_security_config(self._path, identity)
+            if identity != self._identity:
+                raise ConfigAdmissionError("CONFIG_ADMISSION_SOURCE_CHANGED")
+
+
+def capture_security_policy_config(
+    profile_home: str | os.PathLike | None = None,
+) -> SecurityPolicySnapshot:
+    """Capture a strict policy with owner-bound identity for later rechecking."""
+    with _CONFIG_LOCK:
+        path = (get_config_path() if profile_home is None
+                else Path(profile_home) / "config.yaml").absolute()
+        value, identity = _read_admission_config(path)
+        _reject_dangling_security_config(path, identity)
+        return SecurityPolicySnapshot(path, identity, profile_home is None, value)
+
+
+def read_security_policy_config(profile_home: str | os.PathLike | None = None) -> Dict[str, Any]:
+    """Read one strict raw user-policy snapshot without using display caches.
+
+    Missing files keep the existing empty-config semantics; inaccessible,
+    invalid, non-mapping, and duplicate-key sources are refused by the shared
+    admission reader. The returned mapping is newly parsed and caller-owned.
+    This deliberately does not borrow last-known-good or process-global policy.
+    """
+    with _CONFIG_LOCK:
+        path = get_config_path() if profile_home is None else Path(profile_home) / "config.yaml"
+        value, identity = _read_admission_config(path)
+        _reject_dangling_security_config(path, identity)
+        return value
+
+
+def load_config_for_admission() -> ConfigAdmissionSnapshot:
+    """Strict effective-source snapshot, with the normal owner's precedence.
+
+    Does not use, repair or update last-known-good/display caches. Every source
+    is captured and rechecked; a missing explicitly selected managed scope,
+    malformed YAML, nonmapping root, I/O refusal or source/profile change is a
+    typed refusal. No raw-file diagnostic reader is promoted into behavior.
+    """
+    from hermes_cli import managed_scope
+    from hermes_constants import get_hermes_home
+
+    with _CONFIG_LOCK:
+        home = str(get_hermes_home().resolve())
+        path = get_config_path()
+        try:
+            managed_dir = managed_scope.get_managed_dir_for_admission()
+            user, user_identity = _read_admission_config(path)
+            managed_path = managed_dir / "config.yaml" if managed_dir else None
+            managed, managed_identity = (
+                _read_admission_config(managed_path) if managed_path else ({}, None)
+            )
+            env_refs = _env_ref_snapshot(user)
+            _env_ref_snapshot(managed, env_refs)
+            effective, _normalized = _finish_config_layers(
+                _merge_user_config_layer(user), managed
+            )
+            if (
+                str(get_hermes_home().resolve()) != home
+                or get_config_path() != path
+                or managed_scope.get_managed_dir_for_admission() != managed_dir
+                or _read_admission_config(path)[1] != user_identity
+                or (managed_path and _read_admission_config(managed_path)[1] != managed_identity)
+                or any(os.environ.get(key) != value for key, value in env_refs.items())
+            ):
+                raise ConfigAdmissionError("CONFIG_ADMISSION_SOURCE_CHANGED")
+        except ConfigAdmissionError:
+            raise
+        except Exception as exc:
+            raise ConfigAdmissionError("CONFIG_ADMISSION_OWNER_UNAVAILABLE") from exc
+        fingerprint = hashlib.sha256(json.dumps(
+            {"home": home, "user": user_identity, "managed": managed_identity,
+             "env_refs": env_refs}, sort_keys=True, default=str,
+        ).encode("utf-8")).hexdigest()
+        return ConfigAdmissionSnapshot(home, fingerprint, copy.deepcopy(effective),
+            tuple(sorted(managed_scope._flatten_keys(managed))))
+
+
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         ensure_hermes_home()
@@ -3794,14 +4005,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 with open(config_path, encoding="utf-8") as f:
                     user_config = fast_safe_load(f) or {}
 
-                if "max_turns" in user_config:
-                    agent_user_config = dict(user_config.get("agent") or {})
-                    if agent_user_config.get("max_turns") is None:
-                        agent_user_config["max_turns"] = user_config["max_turns"]
-                    user_config["agent"] = agent_user_config
-                    user_config.pop("max_turns", None)
-
-                config = _deep_merge(config, user_config)
+                if not isinstance(user_config, dict):
+                    raise ValueError("configuration root must be a mapping")
+                config = _merge_user_config_layer(user_config)
             except Exception as e:
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
@@ -3843,28 +4049,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
-        normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-        expanded = _expand_env_vars(normalized)
-        # Managed scope wins at the leaf. Applied AFTER user expansion so a user
-        # ${VAR} cannot shadow a managed literal: managed values are expanded only
-        # against the process environment, never against user-config-defined refs.
-        # This deliberately inverts the usual env-over-config precedence for the
-        # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
         managed_config = managed_scope.load_managed_config()
-        if managed_config:
-            # Normalize the managed overlay through the same canonicalization as
-            # the user config BEFORE merging (parity with
-            # managed_scope.apply_managed_overlay): a dict-valued
-            # ``model.default`` (``{provider: ..., model: ...}``) or a bare
-            # ``model: <string>`` must be flattened to a string ``default``
-            # paired with ``provider`` so the merged result never exposes a
-            # nested dict to status/fallback/runtime readers.
-            managed_normalized = _normalize_root_model_keys(managed_config)
-            if isinstance(managed_normalized.get("model"), str):
-                managed_normalized = dict(managed_normalized)
-                managed_normalized["model"] = {"default": managed_normalized["model"]}
-            managed_expanded = _expand_env_vars(managed_normalized)
-            expanded = _deep_merge(expanded, managed_expanded)
+        expanded, normalized = _finish_config_layers(config, managed_config)
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``

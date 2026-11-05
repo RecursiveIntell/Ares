@@ -49,6 +49,60 @@ def test_writer_precreates_file_with_header():
     assert w.path.parent.parent == live_transcript_root()
 
 
+@pytest.mark.parametrize('name', ['tool\nforged', 'tool\rforged', 'tool\u2028forged', 'tool name', 'x' * 129])
+def test_untrusted_tool_names_are_single_bounded_tokens(tmp_path, name):
+    w = LiveTranscriptWriter('deleg_names', 0, 'goal', root=tmp_path)
+    before = w.path.read_text(encoding='utf-8').splitlines()
+    w.tool_start(name, 'args')
+    w.tool_result(name, 'result', duration=1.0)
+    added = w.path.read_text(encoding='utf-8').splitlines()[len(before):]
+    assert len(added) == 2
+    assert '-> ?(args)' in added[0]
+    assert '| ? ok 1.0s: result' in added[1]
+
+
+@pytest.mark.parametrize('method', ['completed', 'timeout', 'error', 'finalize'])
+def test_terminal_marker_closes_timing_but_keeps_prior_samples(tmp_path, method):
+    w = LiveTranscriptWriter('deleg_timing', 0, 'g', root=tmp_path)
+    w.observe('subagent.api_timing', duration_seconds=1.0)
+    if method == 'finalize':
+        w.finalize({'status': 'timeout'})
+    else:
+        w.observe('subagent.complete', status=method)
+    w.observe('subagent.api_timing', duration_seconds=2.0)
+    text = w.path.read_text(encoding='utf-8')
+    assert 'api-window 1.000s' in text
+    assert 'api-window 2.000s' not in text
+
+
+def test_inflight_timing_cannot_append_after_terminal_marker(tmp_path, monkeypatch):
+    w = LiveTranscriptWriter('deleg_race', 0, 'g', root=tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    original = dll._redact
+
+    def pause_timing(text):
+        if text.startswith('api-window'):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError('timing callback not released')
+        return original(text)
+
+    monkeypatch.setattr(dll, '_redact', pause_timing)
+    worker = threading.Thread(target=w.observe, args=('subagent.api_timing',),
+                              kwargs={'duration_seconds': 3.0}, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        w.observe('subagent.complete', status='timeout')
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    text = w.path.read_text(encoding='utf-8')
+    assert 'status=timeout' in text
+    assert 'api-window 3.000s' not in text
+
+
 def test_stream_deltas_buffer_and_flush_as_one_line():
     w = LiveTranscriptWriter("deleg_stream", 0, "g")
     w.add_stream_delta("Hello ")

@@ -17683,6 +17683,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not await self._accept_gateway_context_input(event, controls_resolved=not _tool_approval_live):
             return None
 
+        # Explicit operator controls must reach the owner even while a turn is
+        # busy. Preserve existing platform/admin access before any transition.
+        if event.get_command() == "orchestration":
+            denied = self._check_slash_access(source, "orchestration")
+            if denied is not None:
+                return denied
+            return await self._handle_orchestration_command(event)
+
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
         # are handled with minimal latency.

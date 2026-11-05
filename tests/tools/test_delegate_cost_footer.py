@@ -18,7 +18,24 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
+from tests.tools.delegation_policy_fixture import temporary_policy_owner
 from tools.delegate_tool import delegate_task
+
+
+class _WithPolicyOwner(unittest.TestCase):
+    """Exercise cost accounting behind the real temporary session owner."""
+
+    def setUp(self):
+        db, session_id = self.enterContext(temporary_policy_owner())
+        original = _make_mock_parent
+
+        def with_owner(depth=0):
+            parent = original(depth)
+            parent._session_db = db
+            parent.session_id = session_id
+            return parent
+
+        self.enterContext(patch.dict(globals(), {"_make_mock_parent": with_owner}))
 
 
 def _make_mock_parent(depth=0):
@@ -63,7 +80,7 @@ def _make_mock_child(cost=0.1234567, cost_status="estimated"):
     return child
 
 
-class TestCostInResultEntry(unittest.TestCase):
+class TestCostInResultEntry(_WithPolicyOwner):
     def _run(self, child):
         parent = _make_mock_parent()
         with patch("run_agent.AIAgent", return_value=child):

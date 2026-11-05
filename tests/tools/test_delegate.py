@@ -15,7 +15,10 @@ import threading
 import time
 import types
 import unittest
+import uuid
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
@@ -33,6 +36,28 @@ from tools.delegate_tool import (
 )
 from hermes_state import SessionDB
 
+_POLICY_TEST_DBS = []
+
+
+@pytest.fixture(autouse=True)
+def _close_policy_test_databases():
+    yield
+    while _POLICY_TEST_DBS:
+        _POLICY_TEST_DBS.pop().close()
+
+
+def _run_admitted_test_child(**kwargs):
+    """Legacy lease/heartbeat fixtures explicitly satisfy the new host contract.
+
+    This grants real temporary-owner admission; it does not replace, disable or
+    mock the production guard. Denied/unknown/stale cases live in the dedicated
+    orchestration dispatch suite and still exercise the unwrapped entry point.
+    """
+    from agent.orchestration_runtime import admit_worker
+    from tools.delegate_tool import _run_single_child
+    kwargs["child"]._orchestration_admission = admit_worker(kwargs["parent_agent"])
+    return _run_single_child(**kwargs)
+
 
 def _make_mock_parent(depth=0):
     """Create a mock parent agent with the fields delegate_task expects."""
@@ -47,7 +72,10 @@ def _make_mock_parent(depth=0):
     parent.providers_ignored = None
     parent.providers_order = None
     parent.provider_sort = None
-    parent._session_db = None
+    parent.session_id = f"test-parent-{uuid.uuid4().hex}"
+    parent._session_db = SessionDB()
+    parent._session_db.create_session(parent.session_id, "cli", model=parent.model)
+    _POLICY_TEST_DBS.append(parent._session_db)
     parent._delegate_depth = depth
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
@@ -393,32 +421,18 @@ class TestDelegateTask(unittest.TestCase):
         finally:
             parent_db.close()
 
-    def test_child_without_parent_db_still_degrades_to_none(self):
-        """Parent without a SessionDB -> child gets None (pre-fix behaviour).
-
-        The dedicated-handle path must not change the degradation contract:
-        a parent that never opened a session store (headless/oneshot runs,
-        test doubles) still yields ``session_db=None`` children.
-        """
+    def test_child_without_policy_owner_is_refused_before_construction(self):
+        """The new enforcement contract replaces the old store-less fail-open path."""
+        from agent.orchestration_policy import OrchestrationError
         parent = _make_mock_parent(depth=0)
         parent._session_db = None
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            MockAgent.return_value = mock_child
-
-            _build_child_agent(
-                task_index=0,
-                goal="test",
-                context=None,
-                toolsets=None,
-                model="test-model",
-                max_iterations=5,
-                parent_agent=parent,
-                task_count=1,
-            )
-
-            _, kwargs = MockAgent.call_args
-            self.assertIsNone(kwargs["session_db"])
+        with patch("run_agent.AIAgent") as constructor:
+            with self.assertRaises(OrchestrationError) as caught:
+                _build_child_agent(task_index=0, goal="test", context=None,
+                    toolsets=None, model="test-model", max_iterations=5,
+                    parent_agent=parent, task_count=1)
+        self.assertEqual(caught.exception.code, "policy_store_unavailable")
+        constructor.assert_not_called()
 
     def test_child_dedicated_db_follows_parents_db_path(self):
         """Per-profile parents: the child's dedicated handle must target the
@@ -439,6 +453,7 @@ class TestDelegateTask(unittest.TestCase):
             profile_db_path.parent.mkdir(parents=True)
             parent = _make_mock_parent(depth=0)
             parent_db = SessionDB(db_path=profile_db_path)
+            parent_db.create_session(parent.session_id, "cli", model=parent.model)
             parent._session_db = parent_db
             child_db = None
             try:
@@ -1112,7 +1127,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
             "messages": [],
         }
 
-        result = _run_single_child(
+        result = _run_admitted_test_child(
             task_index=0,
             goal="Investigate rate limits",
             child=child,
@@ -1133,7 +1148,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child._credential_pool.current.return_value = MagicMock(id="cred-a")
         child.run_conversation.side_effect = RuntimeError("boom")
 
-        result = _run_single_child(
+        result = _run_admitted_test_child(
             task_index=1,
             goal="Trigger failure",
             child=child,
@@ -1183,7 +1198,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
 
         # Patch the heartbeat interval to fire quickly
         with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.01):
-            _run_single_child(
+            _run_admitted_test_child(
                 task_index=0,
                 goal="Test heartbeat",
                 child=child,
@@ -1217,7 +1232,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         }
 
         with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.01):
-            _run_single_child(
+            _run_admitted_test_child(
                 task_index=0,
                 goal="Test cleanup",
                 child=child,
@@ -1283,7 +1298,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
             patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IDLE", 2),
             patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IN_TOOL", 40),
         ):
-            _run_single_child(
+            _run_admitted_test_child(
                 task_index=0,
                 goal="Test long-running tool",
                 child=child,
@@ -1348,7 +1363,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
             patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IDLE", 2),
             patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IN_TOOL", 40),
         ):
-            _run_single_child(
+            _run_admitted_test_child(
                 task_index=0,
                 goal="Test slow model wait",
                 child=child,
@@ -1387,6 +1402,9 @@ class TestDelegationReasoningEffort(unittest.TestCase):
     def test_override_reasoning_effort_from_config(self, MockAgent, mock_cfg):
         """delegation.reasoning_effort overrides the parent's level."""
         mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": "low"}
+        # Execution now reads the strict current source, not a display-loader mock.
+        from hermes_cli.config import get_config_path
+        get_config_path().write_text("delegation:\n  max_iterations: 50\n  reasoning_effort: low\n")
         MockAgent.return_value = MagicMock()
         parent = _make_mock_parent()
         parent.reasoning_config = {"enabled": True, "effort": "xhigh"}

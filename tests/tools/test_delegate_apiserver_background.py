@@ -22,6 +22,9 @@ import pytest
 
 from gateway.session_context import set_session_vars
 from tools.process_registry import process_registry
+from hermes_state import SessionDB
+
+_POLICY_OWNERS = []
 
 
 @pytest.fixture(autouse=True)
@@ -33,6 +36,8 @@ def _clean_queue_and_context(monkeypatch):
         except Exception:
             break
     yield
+    while _POLICY_OWNERS:
+        _POLICY_OWNERS.pop().close()
     # Restore ContextVars to the pristine "never set" sentinel rather than
     # clear_session_vars()'s explicit-"" state, which would mask env vars for
     # unrelated tests running later in the same worker.
@@ -67,6 +72,9 @@ def _fake_parent():
     parent = MagicMock()
     parent._delegate_depth = 0
     parent.session_id = "sess"
+    parent._session_db = SessionDB()
+    parent._session_db.create_session(parent.session_id, "api_server")
+    _POLICY_OWNERS.append(parent._session_db)
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None

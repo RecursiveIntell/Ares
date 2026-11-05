@@ -559,7 +559,24 @@ assert ad.mark_completion_delivered({delegation_id!r})
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------
 
-def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
+@pytest.fixture
+def background_policy_db(tmp_path, monkeypatch):
+    """Exercise real admission without touching the operator's profile."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import SessionDB
+
+    (tmp_path / 'config.yaml').write_text('delegation:\n  provider: ""\n  model: ""\n')
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    token = set_hermes_home_override(tmp_path)
+    db = SessionDB(tmp_path / 'state.db')
+    try:
+        yield db
+    finally:
+        db.close()
+        reset_hermes_home_override(token)
+
+
+def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch, background_policy_db):
     """delegate_task(background=True) returns a handle without running the
     child synchronously, and the child completes on the background thread.
     A single task is dispatched as a one-item background batch unit."""
@@ -569,6 +586,8 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     parent = MagicMock()
     parent._delegate_depth = 0
     parent.session_id = "sess"
+    parent._session_db = background_policy_db
+    background_policy_db.create_session(parent.session_id, 'cli', model='fixture')
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
@@ -595,22 +614,21 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", slow_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
-    out = dt.delegate_task(
-        goal="the real task", context="ctx",
-        background=True, parent_agent=parent,
-    )
+    try:
+        out = dt.delegate_task(
+            goal="the real task", context="ctx",
+            background=True, parent_agent=parent,
+        )
 
-    import json
-    parsed = json.loads(out)
-    assert parsed["status"] == "dispatched"
-    assert parsed["mode"] == "background"
-    assert parsed["delegation_id"].startswith("deleg_")
-    # Non-blocking invariant: delegate_task returned while the child is STILL
-    # blocked on the closed gate, so no completion event exists yet.
-    assert process_registry.completion_queue.empty()
-    assert ad.active_count() == 1  # one background batch unit, not finished
-
-    gate.set()
+        parsed = json.loads(out)
+        assert parsed["status"] == "dispatched"
+        assert parsed["mode"] == "background"
+        assert parsed["delegation_id"].startswith("deleg_")
+        # The closed gate proves the child is still running at return.
+        assert process_registry.completion_queue.empty()
+        assert ad.active_count() == 1
+    finally:
+        gate.set()
     evt = _drain_one()
     assert evt is not None
     assert evt["type"] == "async_delegation"
@@ -623,7 +641,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert "the real task" in text
 
 
-def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
+def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch, background_policy_db):
     """TUI async delegation must route to the live/compressed agent id.
 
     Regression: delegate_task captured the stale approval/session context key
@@ -639,6 +657,8 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     parent = MagicMock()
     parent._delegate_depth = 0
     parent.session_id = "post-compress-tip"
+    parent._session_db = background_policy_db
+    background_policy_db.create_session(parent.session_id, 'tui', model='fixture')
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
