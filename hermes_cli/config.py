@@ -15,6 +15,7 @@ This module provides:
 """
 
 import copy
+import hashlib
 from decimal import Decimal, InvalidOperation
 from hermes_cli.cli_output import line_input
 import json
@@ -3735,6 +3736,132 @@ def apply_terminal_config_to_env(
         if (should_override and cfg_key in explicit_keys) or env_var not in target:
             target[env_var] = _terminal_env_value(value)
     return target
+
+
+class ConfigAdmissionError(ValueError):
+    """Current effective configuration cannot authorize an execution."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+def _read_admission_bytes(path: Path):
+    """Capture raw bytes and their admission identity, without parsing YAML."""
+    try:
+        raw = path.read_bytes()
+        return raw, (str(path.resolve()), hashlib.sha256(raw).hexdigest())
+    except FileNotFoundError:
+        return None, (str(path.absolute()), None)
+    except OSError as exc:
+        raise ConfigAdmissionError("CONFIG_ADMISSION_SOURCE_UNAVAILABLE") from exc
+
+
+def _read_admission_config(path: Path):
+    """Capture exact current bytes; missing and unreadable are different states."""
+    raw, identity = _read_admission_bytes(path)
+    if raw is None:
+        return {}, identity
+    try:
+        import yaml
+
+        class UniqueKeys(yaml.SafeLoader):
+            def construct_mapping(self, node, deep=False):
+                seen = set()
+                for key_node, _value_node in node.value:
+                    if key_node.tag == "tag:yaml.org,2002:merge":
+                        continue
+                    key = self.construct_object(key_node, deep=deep)
+                    if key in seen:
+                        raise ValueError("duplicate configuration key")
+                    seen.add(key)
+                return super().construct_mapping(node, deep=deep)
+
+        value = yaml.load(raw.decode("utf-8"), Loader=UniqueKeys)
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise ValueError("configuration root must be a mapping")
+    except Exception as exc:
+        raise ConfigAdmissionError("CONFIG_ADMISSION_INVALID_SOURCE") from exc
+    return value, identity
+
+
+def _reject_dangling_security_config(path: Path, identity: tuple) -> None:
+    if identity[1] is None:
+        # A dangling symlink is not a deliberately absent config.
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ConfigAdmissionError("CONFIG_ADMISSION_SOURCE_UNAVAILABLE") from exc
+        else:
+            raise ConfigAdmissionError("CONFIG_ADMISSION_SOURCE_UNAVAILABLE")
+
+
+@dataclass(frozen=True)
+class SecurityPolicySnapshot:
+    """Strict parsed policy bound to one path and its captured source bytes."""
+
+    _path: Path
+    _identity: tuple
+    _ambient: bool
+    _value: Dict[str, Any]
+
+    @property
+    def config(self) -> Dict[str, Any]:
+        return copy.deepcopy(self._value)
+
+    def assert_profile_owner(self, profile_home: str | os.PathLike) -> None:
+        """Require the exact lexical profile owner used to capture this policy.
+
+        Do not resolve symlink aliases: an alias can be retargeted separately.
+        """
+        if (Path(profile_home) / "config.yaml").absolute() != self._path:
+            raise ConfigAdmissionError("CONFIG_ADMISSION_OWNER_MISMATCH")
+
+    def assert_current(self) -> None:
+        """Reject observed profile/source changes without re-parsing YAML.
+
+        This is a check at one instant, not a lock across subprocess launch;
+        a change-and-revert between checks is not detectable.
+        """
+        with _CONFIG_LOCK:
+            if self._ambient and get_config_path().absolute() != self._path:
+                raise ConfigAdmissionError("CONFIG_ADMISSION_SOURCE_CHANGED")
+            _raw, identity = _read_admission_bytes(self._path)
+            _reject_dangling_security_config(self._path, identity)
+            if identity != self._identity:
+                raise ConfigAdmissionError("CONFIG_ADMISSION_SOURCE_CHANGED")
+
+
+def capture_security_policy_config(
+    profile_home: str | os.PathLike | None = None,
+) -> SecurityPolicySnapshot:
+    """Capture a strict policy with owner-bound identity for later rechecking."""
+    with _CONFIG_LOCK:
+        path = (get_config_path() if profile_home is None
+                else Path(profile_home) / "config.yaml").absolute()
+        value, identity = _read_admission_config(path)
+        _reject_dangling_security_config(path, identity)
+        return SecurityPolicySnapshot(path, identity, profile_home is None, value)
+
+
+def read_security_policy_config(profile_home: str | os.PathLike | None = None) -> Dict[str, Any]:
+    """Read one strict raw user-policy snapshot without using display caches.
+
+    Missing files keep the existing empty-config semantics; inaccessible,
+    invalid, non-mapping, and duplicate-key sources are refused by the shared
+    admission reader. The returned mapping is newly parsed and caller-owned.
+    This deliberately does not borrow last-known-good or process-global policy.
+    """
+    with _CONFIG_LOCK:
+        path = get_config_path() if profile_home is None else Path(profile_home) / "config.yaml"
+        value, identity = _read_admission_config(path)
+        _reject_dangling_security_config(path, identity)
+        return value
+
 
 
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:

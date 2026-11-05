@@ -1423,7 +1423,7 @@ class TestSanePathIncludesHomebrew:
 
 
     @pytest.mark.windows_only
-    def test_make_run_env_preserves_windows_mixed_case_path_key(self, monkeypatch):
+    def test_make_run_env_preserves_windows_mixed_case_path_key(self, monkeypatch, tmp_path):
         """Windows-only: ``_path_env_key`` looks for a case-insensitive PATH
         key only on Windows, so the mixed-case ``Path`` preservation this
         asserts is a genuinely Windows-native behaviour.
@@ -1435,13 +1435,16 @@ class TestSanePathIncludesHomebrew:
         from tools.environments.local import _make_run_env
         windows_env = {"Path": r"C:\Windows\System32;C:\Program Files\Git\bin"}
         monkeypatch.setattr(local_mod, "_git_bash_bin_dirs", lambda: [])
-        # Isolate the Bitwarden token policy: this test is about PATH key
-        # casing, not secrets.  The real resolver reads the operator's config
-        # and fails closed when it is unavailable, so pin it to the default
-        # name instead of letting the host environment leak in.
-        monkeypatch.setattr(local_mod, "_get_configured_bws_token_env", lambda: "BWS_ACCESS_TOKEN")
-        with patch.object(local_mod.os, "environ", windows_env):
-            result = _make_run_env({})
+        # Bind the real policy owner before replacing the environment: on
+        # Windows that replacement also removes USERPROFILE/HOMEDRIVE.
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        (tmp_path / "config.yaml").write_text("{}\n")
+        token = set_hermes_home_override(tmp_path)
+        try:
+            with patch.object(local_mod.os, "environ", windows_env):
+                result = _make_run_env({})
+        finally:
+            reset_hermes_home_override(token)
         assert result["Path"] == windows_env["Path"]
         assert "PATH" not in result
 
