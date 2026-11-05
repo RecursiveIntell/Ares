@@ -16202,6 +16202,20 @@ def _run_prompt_submit(
                                     session.get("_turn_cancel_requested")
                                     and before == stopped_generation > admission_generation))):
                             settlement_generation = after
+                    # F2.2: a mid-turn rotation re-binds the admission's goal
+                    # snapshot so the ContextDispatchError pause below lands on
+                    # the POST-rotation durable key, not the ended parent row.
+                    # Rebind only when this admission still owns the session;
+                    # a lost admission keeps its (stale) snapshot untouched.
+                    with session["history_lock"]:
+                        if owns_admission() and _sessions.get(sid) is session:
+                            new_key = str(session.get("session_key") or "")
+                            if new_key and new_key != (admission_goal.session_id if admission_goal is not None else ""):
+                                try:
+                                    from hermes_cli.goals import GoalManager as _GM
+                                    admission_goal = _GM(new_key)
+                                except Exception:
+                                    pass
 
                 raw = result.get("final_response", "")
                 status = (
@@ -16619,7 +16633,19 @@ def _run_prompt_submit(
                 _emit("error", sid, {"message": str(e)})
             if refusal_notice:
                 try:
-                    _emit("status.update", sid, {"kind": "goal", "text": refusal_notice})
+                    # F2.2: structured twin alongside the text. The desktop's
+                    # goal-state handler keys off goal_state, not prose — the
+                    # happy-path judge emit (status_payload twin) already does
+                    # this; the error path was the last text-only emitter.
+                    _goal_refusal_event = {"kind": "goal", "text": refusal_notice}
+                    if admission_goal is not None:
+                        try:
+                            _payload = admission_goal.status_payload()
+                            if _payload is not None:
+                                _goal_refusal_event["goal_state"] = _payload
+                        except Exception:
+                            pass
+                    _emit("status.update", sid, _goal_refusal_event)
                 except Exception:
                     logger.debug("context refusal goal notice delivery failed", exc_info=True)
         finally:
