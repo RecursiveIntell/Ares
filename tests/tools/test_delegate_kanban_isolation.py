@@ -87,7 +87,7 @@ def test_delegated_child_context_suppresses_env_gated_kanban_tools(monkeypatch, 
     assert {n for n in names if n and n.startswith("kanban_")} == set()
 
 
-def test_build_child_agent_strips_kanban_toolset_even_when_parent_is_worker(monkeypatch):
+def test_build_child_agent_strips_kanban_toolset_even_when_parent_is_worker(monkeypatch, delegation_policy_parent):
     """Child construction must fail closed even if the parent exposes kanban."""
     captured = {}
 
@@ -113,6 +113,9 @@ def test_build_child_agent_strips_kanban_toolset_even_when_parent_is_worker(monk
         platform = "cli"
         session_id = "parent-session"
 
+    parent = Parent()
+    parent._session_db = delegation_policy_parent._session_db
+    parent.session_id = delegation_policy_parent.session_id
     child = delegate_tool._build_child_agent(
         task_index=0,
         goal="review only",
@@ -121,7 +124,7 @@ def test_build_child_agent_strips_kanban_toolset_even_when_parent_is_worker(monk
         model=None,
         max_iterations=3,
         task_count=1,
-        parent_agent=Parent(),
+        parent_agent=parent,
     )
 
     assert child.valid_tool_names == {"terminal"}
@@ -282,7 +285,22 @@ def test_child_attempting_default_complete_does_not_finish_parent_or_delete_work
         def close(self):
             return None
 
-    result = delegate_tool._run_single_child(0, "try to complete parent", Child(), Parent())
+    from agent.orchestration_runtime import admit_worker
+    from hermes_state import SessionDB
+
+    home = tmp_path / ".hermes"
+    (home / "config.yaml").write_text('delegation:\n  provider: ""\n  model: ""\n')
+    db = SessionDB(home / "state.db")
+    db.create_session("kanban-parent", "cli", model="test-model")
+    parent = Parent()
+    parent.session_id = "kanban-parent"
+    parent._session_db = db
+    child = Child()
+    child._orchestration_admission = admit_worker(parent)
+    try:
+        result = delegate_tool._run_single_child(0, "try to complete parent", child, parent)
+    finally:
+        db.close()
 
     conn = kb.connect()
     try:

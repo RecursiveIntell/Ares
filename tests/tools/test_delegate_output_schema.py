@@ -16,6 +16,8 @@ import json
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.delegate_tool import (
     DELEGATE_TASK_SCHEMA,
     _run_single_child,
@@ -198,6 +200,18 @@ def _run(child):
 
 
 class TestRunSingleChildSchemaValidation:
+    @pytest.fixture(autouse=True)
+    def _admit_child(self, delegation_policy_parent, monkeypatch):
+        from agent.orchestration_runtime import admit_worker
+
+        original = _run
+
+        def run_admitted(child):
+            child._orchestration_admission = admit_worker(delegation_policy_parent)
+            return original(child)
+
+        monkeypatch.setitem(globals(), "_run", run_admitted)
+
     def test_valid_first_try_no_retry(self):
         child = _StubChild(['{"city": "Berlin"}'])
         child._delegate_output_schema = ADDRESS_SCHEMA
@@ -245,6 +259,91 @@ class TestRunSingleChildSchemaValidation:
         assert entry["schema_valid"] is False
         assert entry["schema_errors"]
 
+    def test_schema_retry_respects_same_child_deadline(self, monkeypatch):
+        from tools import delegate_tool
+
+        monkeypatch.setattr(delegate_tool, '_get_child_timeout', lambda config: 0.3)
+        child = _StubChild([])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        retry_started = threading.Event()
+        release_retry = threading.Event()
+        done = threading.Event()
+        box = {}
+
+        def run_conversation(user_message, task_id=None, **_kwargs):
+            child.calls.append(user_message)
+            if len(child.calls) == 1:
+                return {'final_response': 'invalid json', 'completed': True,
+                        'api_calls': 1, 'messages': []}
+            retry_started.set()
+            release_retry.wait(8)
+            return {'final_response': '{"city":"late"}', 'completed': True,
+                    'api_calls': 1, 'messages': []}
+
+        child.run_conversation = run_conversation
+
+        def execute():
+            try:
+                box['entry'] = _run(child)
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=execute, daemon=True)
+        thread.start()
+        try:
+            assert retry_started.wait(5), 'schema retry did not start'
+            assert done.wait(3), 'schema retry outlived the child timeout'
+            entry = box['entry']
+            assert entry['status'] == 'timeout'
+            assert entry['summary_is_partial'] is True
+            assert entry['summary'] == 'invalid json'
+            assert entry['schema_valid'] is False
+        finally:
+            release_retry.set()
+            thread.join(5)
+        assert not thread.is_alive()
+
+    def test_revoked_admission_prevents_schema_retry(self, delegation_policy_parent):
+        from agent.orchestration_policy import OrchestrationPolicy
+
+        child = _StubChild([])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+
+        def run_conversation(user_message, task_id=None, **_kwargs):
+            child.calls.append(user_message)
+            if len(child.calls) == 1:
+                delegation_policy_parent._session_db.set_orchestration_policy(
+                    delegation_policy_parent.session_id,
+                    OrchestrationPolicy(allow_delegation=False).to_dict(),
+                    expected_revision=0, origin='operator-command',
+                )
+                return {'final_response': 'invalid json', 'completed': True,
+                        'api_calls': 1, 'messages': []}
+            raise AssertionError('retry must not start after revocation')
+
+        child.run_conversation = run_conversation
+        entry = _run(child)
+        assert entry['status'] == 'blocked'
+        assert entry['code'] == 'orchestration_revision_changed'
+        assert len(child.calls) == 1
+
+    def test_expired_budget_does_not_submit_or_count_schema_retry(self, monkeypatch):
+        import time
+        from tools import delegate_tool, delegation_output_schema
+
+        monkeypatch.setattr(delegate_tool, '_get_child_timeout', lambda config: 0.1)
+        def slow_validation(_text, _schema):
+            time.sleep(0.2)
+            return False, ['invalid fixture']
+        monkeypatch.setattr(delegation_output_schema, 'validate_output', slow_validation)
+        child = _StubChild(['invalid json', '{"city":"must-not-run"}'])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        result = _run(child)
+        assert result['status'] == 'timeout'
+        assert result['schema_valid'] is False
+        assert result['schema_retries'] == 0
+        assert len(child.calls) == 1
+
     def test_no_schema_keeps_legacy_result_shape(self):
         """Schema-less calls must not gain new keys (wire-shape pinning)."""
         child = _StubChild(['{"city": "Berlin"}'])
@@ -278,6 +377,10 @@ def _make_mock_parent():
 
 
 class TestDelegateTaskDispatch:
+    @pytest.fixture(autouse=True)
+    def _admit_parent(self, delegation_policy_parent, monkeypatch):
+        monkeypatch.setitem(globals(), "_make_mock_parent", lambda: delegation_policy_parent)
+
     def test_non_dict_output_schema_rejected(self):
         with (
             patch("tools.delegate_tool._load_config", return_value={}),

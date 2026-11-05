@@ -4,7 +4,10 @@ Pure-data leaf module: DEFAULT_CONFIG and OPTIONAL_ENV_VARS, extracted
 verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 """
 
+from agent.orchestration_policy import OrchestrationPolicy
+
 DEFAULT_CONFIG = {
+    "orchestration": OrchestrationPolicy().to_dict(),
     "model": "",
     "providers": {},
     "fallback_providers": [],

@@ -29,6 +29,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import tools.delegate_tool as dt
+from hermes_state import SessionDB
 
 
 def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
@@ -110,7 +111,8 @@ def test_cron_sync_fallback_returns_and_spawns_no_review_fork(monkeypatch):
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
-    parent._session_db = None
+    parent._session_db = SessionDB()
+    parent._session_db.create_session(parent.session_id, "cron")
 
     creds = {
         "model": "m", "provider": None, "base_url": None, "api_key": None,
@@ -177,3 +179,4 @@ def test_cron_sync_fallback_returns_and_spawns_no_review_fork(monkeypatch):
         # Unblock a stray fork thread if the regression reappears, so it
         # cannot outlive this test and pollute the rest of the session.
         release_fork.set()
+        parent._session_db.close()

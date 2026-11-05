@@ -51,7 +51,10 @@ def _get_allowed() -> set[str]:
 _config_passthrough: frozenset[str] | None = None
 
 
-def _is_hermes_provider_credential(name: str) -> bool:
+def _is_hermes_provider_credential(
+    name: str, *, bws_token_env: str | frozenset[str] | None = None,
+    _blocklist_snapshot: frozenset[str] | None = None,
+) -> bool:
     """True if ``name`` is a Hermes-managed provider credential (API key,
     token, or similar) per ``_HERMES_PROVIDER_ENV_BLOCKLIST``.
 
@@ -89,9 +92,9 @@ def _is_hermes_provider_credential(name: str) -> bool:
     # credentials the static blocklist can't enumerate — they're injected per
     # task/relay at gateway startup. A skill must not be able to register them
     # as passthrough and tunnel them into an execute_code / terminal child.
-    if _is_hermes_internal_secret(name):
+    if _is_hermes_internal_secret(name, bws_token_env=bws_token_env):
         return True
-    return _is_blocked_provider_env(name)
+    return _is_blocked_provider_env(name, _blocklist_snapshot=_blocklist_snapshot)
 
 
 def register_env_passthrough(var_names: Iterable[str]) -> None:
@@ -129,6 +132,10 @@ def register_env_passthrough(var_names: Iterable[str]) -> None:
 
 def _load_config_passthrough(
     profile_home: str | os.PathLike[str] | None = None,
+    *,
+    bws_token_env: str | frozenset[str] | None = None,
+    _config_snapshot: dict | None = None,
+    _blocklist_snapshot: frozenset[str] | None = None,
 ) -> frozenset[str]:
     """Load the active profile's ``terminal.env_passthrough`` exactly now.
 
@@ -138,14 +145,16 @@ def _load_config_passthrough(
     reloads through the canonical profile-aware config owner on every call.
     """
     global _config_passthrough
+    if _config_snapshot is not None and profile_home is not None:
+        raise ValueError("config snapshot cannot be combined with an explicit profile")
     result: set[str] = set()
     try:
         from hermes_cli.config import read_raw_config, read_user_config_raw
 
         cfg = (
+            _config_snapshot if _config_snapshot is not None else
             read_user_config_raw(Path(profile_home) / "config.yaml")
-            if profile_home is not None
-            else read_raw_config()
+            if profile_home is not None else read_raw_config()
         )
         passthrough = cfg_get(cfg, "terminal", "env_passthrough")
         if isinstance(passthrough, list):
@@ -158,7 +167,10 @@ def _load_config_passthrough(
                 # through to execute_code / terminal children, regardless of
                 # whether the request came from a skill or from config.yaml.
                 # See GHSA-rhgp-j443-p4rf.
-                if _is_hermes_provider_credential(name):
+                if _is_hermes_provider_credential(
+                    name, bws_token_env=bws_token_env,
+                    _blocklist_snapshot=_blocklist_snapshot,
+                ):
                     logger.warning(
                         "env passthrough: refusing to register Hermes "
                         "provider credential %r from config.yaml (blocked "
@@ -195,9 +207,15 @@ def is_env_passthrough(
 def get_all_passthrough(
     *,
     profile_home: str | os.PathLike[str] | None = None,
+    bws_token_env: str | frozenset[str] | None = None,
+    _config_snapshot: dict | None = None,
+    _blocklist_snapshot: frozenset[str] | None = None,
 ) -> frozenset[str]:
     """Return the union of skill-registered and config-based passthrough vars."""
-    return frozenset(_get_allowed()) | _load_config_passthrough(profile_home)
+    return frozenset(_get_allowed()) | _load_config_passthrough(
+        profile_home, bws_token_env=bws_token_env, _config_snapshot=_config_snapshot,
+        _blocklist_snapshot=_blocklist_snapshot,
+    )
 
 
 def resolve_passthrough_value(

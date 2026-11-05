@@ -22,7 +22,7 @@ from tools.file_operations import (
     normalize_read_pagination,
     normalize_search_pagination,
 )
-from tools import file_state
+from tools import file_state, delegation_result_write
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -189,6 +189,11 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
         with _env_lock:
             env = _active_environments.get(container_key) or _active_environments.get(task_id)
         if env is not None:
+            # Plugin providers stamp the registered backend identity at
+            # construction. Class-name guesses can conflict with that owner.
+            stamped = getattr(env, "_hermes_backend_name", None)
+            if isinstance(stamped, str) and stamped:
+                return stamped
             name = env.__class__.__name__.lower()
             if "local" in name:
                 return "local"
@@ -202,9 +207,6 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
                 return "modal"
             if "daytona" in name:
                 return "daytona"
-            stamped = getattr(env, "_hermes_backend_name", None)
-            if isinstance(stamped, str) and stamped:
-                return stamped
         cfg = _get_env_config()
         return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
     except Exception:
@@ -2300,6 +2302,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _resolved = None
 
         if _resolved is None:
+            # A path that failed resolution may alias this task's reservation.
+            # Conservatively bound all of its unresolved writes until cleanup.
+            delegation_result_write.enforce_reserved_write_limit(
+                path, content, unresolved_task_id=task_id
+            )
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(path, content)
@@ -2323,6 +2330,16 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
             file_ops = _get_file_ops(task_id)
+            try:
+                result_write_grant = delegation_result_write.begin_result_write(
+                    task_id, session_id, _resolved
+                )
+            except Exception:
+                result_write_grant = None
+                logger.debug("Result-write grant lookup failed", exc_info=True)
+            # The reservation stays size-limited after timeout/freeze until
+            # both controller and worker have finished. Fail closed here.
+            delegation_result_write.enforce_reserved_write_limit(_resolved, content)
             result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning or cwd_warning
@@ -2340,6 +2357,17 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _update_read_timestamp(path, task_id)
             if not result_dict.get("error"):
                 file_state.note_write(task_id, _resolved)
+                # Optional run-owned timeout-result observation. The owner
+                # independently requires an exact registered identity, local
+                # backend, verified write and live deadline. Missing evidence
+                # only withholds recovery; it must not fail a normal write.
+                try:
+                    delegation_result_write.record_verified_local_write(
+                        result_write_grant, task_id, session_id, _resolved,
+                        content, result_dict, file_ops
+                    )
+                except Exception:
+                    logger.debug("Result-write observation failed", exc_info=True)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):

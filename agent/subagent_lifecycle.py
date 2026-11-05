@@ -201,6 +201,8 @@ class SubagentLifecycleService:
             raise SubagentLifecycleError(
                 "No active Hermes parent session is available."
             )
+        from agent.orchestration_runtime import admit_worker
+        admission = admit_worker(parent)
         self._validate_request(request, parent)
         parent_session_id = str(getattr(parent, "session_id", "") or "") or None
         if request.parent_session_id and request.parent_session_id != parent_session_id:
@@ -222,6 +224,16 @@ class SubagentLifecycleService:
             DEFAULT_MAX_ITERATIONS,
         )
 
+        from tools.delegate_tool import _resolve_delegation_credentials
+        routing_config = admission.routing_config
+        selected = admission.policy.secondary_route
+        if request.model is not None:
+            if selected is not None and request.model != selected.model:
+                from agent.orchestration_policy import OrchestrationError
+                raise OrchestrationError("secondary_route_conflict")
+            routing_config["model"] = request.model
+        credentials = _resolve_delegation_credentials(routing_config, parent)
+        admission.assert_current()
         child = _build_child_preserving_parent_tools(
             task_index=0,
             goal=request.goal,
@@ -229,12 +241,23 @@ class SubagentLifecycleService:
             toolsets=list(request.allowed_toolsets)
             if request.allowed_toolsets
             else None,
-            model=request.model,
+            model=credentials.get("model"),
             max_iterations=DEFAULT_MAX_ITERATIONS,
             task_count=1,
             parent_agent=parent,
             role=request.role,
+            override_provider=credentials.get("provider"),
+            override_base_url=credentials.get("base_url"),
+            override_api_key=credentials.get("api_key"),
+            override_api_mode=credentials.get("api_mode"),
+            override_request_overrides=credentials.get("request_overrides"),
+            override_acp_command=credentials.get("command"),
+            override_acp_args=credentials.get("args"),
+            override_reasoning_effort=routing_config.get("reasoning_effort"),
+            _orchestration_admission=admission,
+            _routing_config=routing_config,
         )
+        child._orchestration_admission = admission
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:
             raise SubagentLifecycleError("Hermes failed to assign a child identity.")

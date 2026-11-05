@@ -20,6 +20,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import stat
 import threading
 from pathlib import Path
 from typing import Dict, Optional
@@ -69,6 +70,28 @@ def get_managed_dir() -> Optional[Path]:
     if _under_pytest():
         return None
     return _DEFAULT_MANAGED_DIR if _DEFAULT_MANAGED_DIR.is_dir() else None
+
+
+def get_managed_dir_for_admission() -> Optional[Path]:
+    """Resolve the same layer without treating an unavailable selection as absent.
+
+    This is an execution read, not the intentionally lenient display/startup
+    path. No directory, config or environment is created or modified.
+    """
+    override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
+    if not override and _under_pytest():
+        return None
+    path = Path(override) if override else _DEFAULT_MANAGED_DIR
+    try:
+        if not stat.S_ISDIR(path.stat().st_mode):
+            raise ValueError("MANAGED_CONFIG_SCOPE_NOT_DIRECTORY")
+    except FileNotFoundError:
+        if override:
+            raise ValueError("MANAGED_CONFIG_SCOPE_UNAVAILABLE") from None
+        return None
+    except OSError as exc:
+        raise ValueError("MANAGED_CONFIG_SCOPE_UNAVAILABLE") from exc
+    return path
 
 
 def invalidate_managed_cache() -> None:

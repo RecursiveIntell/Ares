@@ -2241,6 +2241,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
+            ("GET", "/api/sessions/{session_id}/orchestration", self._handle_session_orchestration),
+            ("POST", "/api/sessions/{session_id}/orchestration", self._handle_session_orchestration),
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
@@ -4431,6 +4433,35 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+
+    async def _handle_session_orchestration(self, request: "web.Request") -> "web.Response":
+        """Authenticated exact-profile/session control; not a model-facing tool."""
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err is not None:
+            return err
+        control = "show"
+        if request.method != "GET":
+            body, err = await self._read_json_body(request)
+            if err is not None:
+                return err
+            if type(body) is not dict or set(body) != {"control"} or type(body["control"]) is not str:
+                return web.json_response(_openai_error("Exactly one string control field required", code="invalid_orchestration_control"), status=400)
+            control = body["control"]
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+        from hermes_cli.orchestration import apply_operator_control
+        from agent.orchestration_policy import OrchestrationError
+        try:
+            result = await asyncio.to_thread(apply_operator_control, db, session_id,
+                control, source_message_id="api-control:" + uuid.uuid4().hex)
+        except OrchestrationError as error:
+            return web.json_response(_openai_error(str(error), code=error.code), status=409)
+        return web.json_response({"object": "hermes.orchestration", "policy": result})
 
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""

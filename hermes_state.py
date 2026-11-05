@@ -5979,6 +5979,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             if system_prompt_hash is not None:
                 self._delete_unreferenced_system_prompts(conn)
             if parent_session_id:
+                # Fork/continuation policy is copied in the SAME owner transaction
+                # as session publication. Corrupt parent state aborts publication;
+                # repeated publication must never reset an existing child control.
+                if conn.execute("SELECT 1 FROM sessions WHERE id=?", (parent_session_id,)).fetchone():
+                    inherited = self._read_orchestration_record(
+                        conn, parent_session_id, require_qualified_lineage=True,
+                    )
+                    if inherited is None:
+                        # Snapshot the declared effective default permission
+                        # record for a legacy parent; never a sibling override.
+                        from agent.orchestration_runtime import _config_for_owner
+                        from agent.orchestration_policy import OrchestrationPolicy
+                        snapshot = _config_for_owner(self)
+                        inherited = {"policy": OrchestrationPolicy.from_dict(
+                            snapshot.config["orchestration"]).to_dict(),
+                            "revision": 0, "source_message_id": None}
+                    if inherited is not None:
+                        conn.execute("""INSERT OR IGNORE INTO session_orchestration_policy
+                            (session_id,revision,policy_json,origin,source_message_id)
+                            VALUES(?,1,?,?,?)""", (session_id,
+                            json.dumps(inherited["policy"], sort_keys=True, separators=(",", ":")),
+                            f"inherit:{parent_session_id}:{inherited['revision']}",
+                            inherited["source_message_id"]))
                 conn.execute(
                     """UPDATE sessions
                        SET cwd = COALESCE(sessions.cwd,
@@ -8198,6 +8221,186 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             last_activity_description=row.get("last_activity_description"),
             last_activity_provenance=row.get("last_activity_provenance"),
         )
+
+    def _init_schema(self):
+        """Add the owner-scoped orchestration record without rewriting sessions.
+
+        This additive, idempotent schema extension is installed only by the
+        normal writable SessionDB migration path. Older read-only snapshots
+        lacking the table are unavailable for orchestration admission, not an
+        implicit empty/default policy.
+        """
+        super()._init_schema()
+        with self._lock:
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS session_orchestration_policy (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                revision INTEGER NOT NULL CHECK(revision > 0),
+                policy_json TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                source_message_id TEXT
+            )""")
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS session_orchestration_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                revision INTEGER NOT NULL,
+                effect TEXT NOT NULL CHECK(effect IN ('delegation','graph')),
+                route_json TEXT NOT NULL,
+                config_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('admitted','returned','failed','unknown')),
+                admitted_at REAL NOT NULL
+            )""")
+
+    def claim_orchestration_effect(self, session_id, *, expected_revision, effect,
+                                   route, config_fingerprint):
+        """Linearize one irreversible dispatch admission against policy updates.
+
+        Commit is the boundary: an admitted request may already be in flight
+        when a later opt-out acknowledges. No lock is held across network I/O,
+        and an owner crash leaves 'admitted', NOT successful or replayable.
+        Config freshness and observed request binding are checked by the caller.
+        """
+        from agent.orchestration_policy import OrchestrationError
+        import uuid
+        if effect not in {"delegation", "graph"} or type(expected_revision) is not int or expected_revision < 0:
+            raise OrchestrationError("orchestration_effect_invalid")
+        if type(route) is not dict or type(config_fingerprint) is not str or not config_fingerprint:
+            raise OrchestrationError("orchestration_effect_invalid")
+        if route.keys() - {"provider", "model", "reasoning_effort", "service_tier", "request_sha256"}:
+            raise OrchestrationError("orchestration_effect_invalid")
+        encoded = json.dumps(route, sort_keys=True, separators=(",", ":"))
+        attempt_id = uuid.uuid4().hex
+        def claim(conn):
+            record = self._read_orchestration_record(conn, session_id, require_qualified_lineage=True)
+            if effect == "graph":
+                # Use the same BEGIN IMMEDIATE transaction as the attempt and
+                # policy CAS. A pre-read outside this owner cannot order an end
+                # or native-enrollment transition against provider admission.
+                session = conn.execute(
+                    "SELECT ended_at FROM sessions WHERE id=?", (session_id,),
+                ).fetchone()
+                if session is None or session["ended_at"] is not None:
+                    raise OrchestrationError("graph_session_not_live")
+                try:
+                    native = self._native_context_authority_on_conn(conn, session_id)
+                except Exception as exc:
+                    raise OrchestrationError("graph_admission_owner_unavailable") from exc
+                if native is not None:
+                    # Native context participation has no qualified Graph
+                    # effect lane yet. Do not silently bypass its owner.
+                    raise OrchestrationError("graph_native_context_unqualified")
+            revision = record["revision"] if record else 0
+            if revision != expected_revision:
+                raise OrchestrationError("orchestration_revision_changed")
+            if record is not None and not record["policy"]["allow_" + effect]:
+                raise OrchestrationError(effect + "_disabled")
+            conn.execute("""INSERT INTO session_orchestration_attempts
+                VALUES(?,?,?,?,?,?,?,?)""", (attempt_id, session_id, revision,
+                    effect, encoded, config_fingerprint, "admitted", time.time()))
+            return {"attempt_id": attempt_id, "session_id": session_id,
+                    "revision": revision, "effect": effect, "status": "admitted"}
+        try:
+            return self._execute_write(claim)
+        except OrchestrationError:
+            raise
+        except (sqlite3.Error, AttributeError) as exc:
+            raise OrchestrationError("policy_store_unavailable") from exc
+
+    @staticmethod
+    def _read_orchestration_record(conn, session_id, *, require_qualified_lineage=False):
+        from agent.orchestration_policy import OrchestrationError, OrchestrationPolicy
+
+        row = conn.execute("""SELECT s.id, s.parent_session_id, p.session_id AS policy_session_id,
+            p.revision, p.policy_json, p.origin, p.source_message_id
+            FROM sessions s LEFT JOIN session_orchestration_policy p ON p.session_id=s.id
+            WHERE s.id=?""", (session_id,)).fetchone()
+        if row is None:
+            raise OrchestrationError("session_not_found")
+        if row["policy_session_id"] is None:
+            if require_qualified_lineage and row["parent_session_id"] is not None:
+                # A pre-policy runtime can create a child without inheriting
+                # its parent's restrictions. Never invent that child's policy.
+                raise OrchestrationError("orchestration_lineage_unqualified")
+            return None
+
+        def unique_keys(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("duplicate stored policy key")
+                value[key] = item
+            return value
+
+        try:
+            policy = OrchestrationPolicy.from_dict(json.loads(
+                row["policy_json"], object_pairs_hook=unique_keys,
+            ))
+            if (type(row["revision"]) is not int or row["revision"] <= 0
+                    or type(row["origin"]) is not str or not row["origin"]
+                    or (row["source_message_id"] is not None
+                        and type(row["source_message_id"]) is not str)):
+                raise ValueError("invalid stored policy metadata")
+        except (ValueError, TypeError, KeyError) as exc:
+            raise OrchestrationError("policy_corrupt") from exc
+        return {"session_id": row["id"], "revision": row["revision"],
+                "policy": policy.to_dict(), "origin": row["origin"],
+                "source_message_id": row["source_message_id"]}
+
+    def get_orchestration_policy(self, session_id, *, require_qualified_lineage=False):
+        """Strict exact-identity read; absence is distinct from unknown state."""
+        from agent.orchestration_policy import OrchestrationError
+
+        if type(session_id) is not str or not session_id:
+            raise OrchestrationError("session_not_found")
+        try:
+            with self._read_ctx() as conn:
+                return self._read_orchestration_record(
+                    conn, session_id, require_qualified_lineage=require_qualified_lineage,
+                )
+        except OrchestrationError:
+            raise
+        except (sqlite3.Error, AttributeError) as exc:
+            raise OrchestrationError("policy_store_unavailable") from exc
+
+    def set_orchestration_policy(self, session_id, policy, *, expected_revision,
+                                 origin, source_message_id=None):
+        """Commit one host-authorized control transition with atomic revision CAS.
+
+        This storage API does not infer authorization from an origin label.
+        Operator ingress owns that decision; this owner validates identity,
+        schema and durability without touching main-model configuration.
+        """
+        from agent.orchestration_policy import OrchestrationError, OrchestrationPolicy
+
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise OrchestrationError("revision_invalid")
+        if type(session_id) is not str or not session_id:
+            raise OrchestrationError("session_not_found")
+        value = OrchestrationPolicy.from_dict(policy).to_dict()
+        if (type(origin) is not str or not origin or len(origin) > 1024
+                or (source_message_id is not None and type(source_message_id) is not str)):
+            raise OrchestrationError("policy_invalid")
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+        def write(conn):
+            current = self._read_orchestration_record(conn, session_id)
+            revision = current["revision"] if current else 0
+            if revision != expected_revision:
+                raise OrchestrationError("revision_conflict")
+            conn.execute("""INSERT INTO session_orchestration_policy
+                (session_id,revision,policy_json,origin,source_message_id)
+                VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
+                revision=excluded.revision,policy_json=excluded.policy_json,
+                origin=excluded.origin,source_message_id=excluded.source_message_id""",
+                (session_id, revision + 1, encoded, origin, source_message_id))
+            return {"session_id": session_id, "revision": revision + 1,
+                    "policy": value, "origin": origin, "source_message_id": source_message_id}
+
+        try:
+            return self._execute_write(write)
+        except OrchestrationError:
+            raise
+        except (sqlite3.Error, AttributeError) as exc:
+            raise OrchestrationError("policy_store_unavailable") from exc
 
     def update_session_meta(
         self,

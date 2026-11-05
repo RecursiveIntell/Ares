@@ -1439,7 +1439,7 @@ class TestSanePathIncludesHomebrew:
         # casing, not secrets.  The real resolver reads the operator's config
         # and fails closed when it is unavailable, so pin it to the default
         # name instead of letting the host environment leak in.
-        monkeypatch.setattr(local_mod, "_get_configured_bws_token_env", lambda: "BWS_ACCESS_TOKEN")
+        monkeypatch.setattr(local_mod, "_get_configured_bws_token_env", lambda **_kwargs: "BWS_ACCESS_TOKEN")
         with patch.object(local_mod.os, "environ", windows_env):
             result = _make_run_env({})
         assert result["Path"] == windows_env["Path"]

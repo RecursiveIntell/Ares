@@ -16,6 +16,25 @@ from agent.subagent_lifecycle import (
 )
 
 
+from hermes_state import SessionDB
+
+_OWNERS = []
+
+
+@pytest.fixture(autouse=True)
+def _close_policy_owners():
+    yield
+    while _OWNERS:
+        _OWNERS.pop().close()
+
+
+def _owned_parent(**kwargs):
+    owner = SessionDB()
+    owner.create_session(kwargs["session_id"], "cli")
+    _OWNERS.append(owner)
+    return SimpleNamespace(**kwargs, _session_db=owner)
+
+
 class FakeChild:
     def __init__(self, ident="sa-test"):
         self._subagent_id = ident
@@ -41,7 +60,7 @@ class FakeChild:
 
 @pytest.fixture
 def lifecycle(monkeypatch):
-    parent = SimpleNamespace(session_id="parent-1", enabled_toolsets=["file"])
+    parent = _owned_parent(session_id="parent-1", enabled_toolsets=["file"])
     counter = iter(range(1000))
 
     def build(**_kwargs):
@@ -107,7 +126,7 @@ def test_cancel_uses_explicit_hard_interrupt(lifecycle):
 
 def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     memory = Mock()
-    parent = SimpleNamespace(
+    parent = _owned_parent(
         session_id="parent-aggregate",
         enabled_toolsets=["file"],
         _memory_manager=memory,

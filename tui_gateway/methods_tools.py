@@ -440,6 +440,28 @@ def _(rid, params: dict) -> dict:
         name = resolved
     session = _sessions.get(params.get("session_id", ""))
 
+    if name == "orchestration":
+        # Existing authenticated RPC channel selects a live host-owned session;
+        # params.profile or a model-supplied session ID cannot choose its DB.
+        if session is None:
+            return _err(rid, 4011, "session_not_found")
+        from hermes_cli.orchestration import apply_operator_control
+        from agent.orchestration_policy import OrchestrationError
+        from hermes_state import SessionDB
+        _ensure_session_db_row(session)
+        home = session.get("profile_home") or _hermes_home
+        db = None
+        try:
+            db = SessionDB(db_path=Path(home) / "state.db")
+            result = apply_operator_control(db, session.get("session_key"), arg or "show",
+                source_message_id="rpc:" + str(rid))
+            return _ok(rid, {"type": "orchestration", "output": json.dumps(result), "policy": result})
+        except (OrchestrationError, OSError) as exc:
+            return _err(rid, 4011, str(exc))
+        finally:
+            if db is not None:
+                db.close()
+
     qcmds = _load_cfg().get("quick_commands", {})
     if name in qcmds:
         qc = qcmds[name]

@@ -23,7 +23,7 @@ class _Sd03bChild:
 
 
 @pytest.fixture
-def sd03b_delegate_state(monkeypatch):
+def sd03b_delegate_state(monkeypatch, delegation_policy_parent):
     import tools.delegate_tool as caller
     import tools.async_delegation as async_owner
     import tools.approval as approval
@@ -62,8 +62,10 @@ def sd03b_delegate_state(monkeypatch):
     unrelated = _Sd03bChild("sd03b-already-running", "unrelated accepted steer")
     parent = SimpleNamespace(
         _delegate_depth=0, session_id="sd03b-parent", _interrupt_requested=False,
+        _session_db=delegation_policy_parent._session_db,
         _active_children=[unrelated], _active_children_lock=None,
     )
+    parent._session_db.create_session(parent.session_id, "cli", model="sd03b-inert")
     unrelated_record = {
         "subagent_id": unrelated._subagent_id, "agent": unrelated,
         "accepting_steer": True, "status": "running", "goal": "already running",

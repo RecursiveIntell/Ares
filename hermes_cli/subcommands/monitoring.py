@@ -32,5 +32,18 @@ def build_monitoring_parser(subparsers, *, cmd_monitoring: Callable) -> None:
         "status",
         help="Show monitoring settings, export state, and redaction posture",
     )
+    delegation = sub.add_parser(
+        "delegation",
+        help="Summarize the active profile's recent delegation outcomes",
+    )
+    delegation.add_argument("--hours", type=float, default=24,
+                            help="dispatch window in hours (default: 24)")
+    output_mode = delegation.add_mutually_exclusive_group()
+    output_mode.add_argument("--tool-timing", action="store_true",
+                             help="include partial, transcript-reported tool duration quantiles")
+    output_mode.add_argument(
+        "--alert-only", action="store_true",
+        help="emit a concise warning only when below threshold or indeterminate",
+    )
 
     p.set_defaults(func=cmd_monitoring)

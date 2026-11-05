@@ -12912,6 +12912,26 @@ def cmd_monitoring(args):
     from hermes_cli.config import load_config
 
     action = getattr(args, "monitoring_action", None) or "status"
+    if action == "delegation":
+        import json
+        import sqlite3
+        from hermes_constants import get_hermes_home
+        from hermes_cli.delegation_health import format_alert, read_summary, read_tool_timing
+
+        try:
+            result = read_summary(get_hermes_home() / "state.db", args.hours)
+            if getattr(args, "tool_timing", False):
+                result["tool_timing"] = read_tool_timing(get_hermes_home() / "state.db", args.hours)
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            print(f"Delegation health unavailable: {exc}", file=sys.stderr)
+            return 1
+        if getattr(args, "alert_only", False):
+            warning = format_alert(result)
+            if warning is not None:
+                print(warning)
+        else:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     config = load_config()
     mon_raw = config.get("monitoring")
     mon: dict = mon_raw if isinstance(mon_raw, dict) else {}
@@ -13626,6 +13646,8 @@ def main():
     # config command  (parser built in hermes_cli/subcommands/config.py)
     # =========================================================================
     build_config_parser(subparsers, cmd_config=cmd_config)
+    from hermes_cli.orchestration import register_cli as register_orchestration_cli
+    register_orchestration_cli(subparsers)
 
     # =========================================================================
     # skin command  (parser built in hermes_cli/subcommands/skin.py)

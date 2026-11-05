@@ -59,6 +59,11 @@ def daytona_sdk(monkeypatch):
 @pytest.fixture()
 def make_env(daytona_sdk, monkeypatch):
     """Factory that creates a DaytonaEnvironment with a mocked SDK."""
+    # The SDK is intentionally provided by daytona_sdk above.  The production
+    # lazy dependency gate checks installed distributions, not sys.modules;
+    # stub that gate only for this mocked-SDK fixture so these unit tests do
+    # not require an installed SDK or trigger an installation.
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda feature, prompt=False: None)
     # Prevent is_interrupted from interfering — patch where it's used (base.py)
     monkeypatch.setattr("tools.environments.base.is_interrupted", lambda: False)
     # Prevent skills/credential sync from consuming mock exec calls

@@ -17,7 +17,24 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
+from tests.tools.delegation_policy_fixture import temporary_policy_owner
 from tools.delegate_tool import delegate_task
+
+
+class _WithPolicyOwner(unittest.TestCase):
+    """Exercise validation behind admission under pytest and unittest."""
+
+    def setUp(self):
+        db, session_id = self.enterContext(temporary_policy_owner())
+        original = _make_mock_parent
+
+        def with_owner(depth=0):
+            parent = original(depth)
+            parent._session_db = db
+            parent.session_id = session_id
+            return parent
+
+        self.enterContext(patch.dict(globals(), {"_make_mock_parent": with_owner}))
 
 
 def _make_mock_parent(depth=0):
@@ -50,7 +67,7 @@ GOOD_A = "Refactor the login handler to use the new session helper"
 GOOD_B = "Write regression tests for the session expiry watcher"
 
 
-class TestBatchDuplicateGoalsAllowed(unittest.TestCase):
+class TestBatchDuplicateGoalsAllowed(_WithPolicyOwner):
     """Identical-goal fan-outs are legitimate (best-of-N / ensemble sampling).
 
     The original gate from #81141 rejected duplicates; the post-merge audit
@@ -76,11 +93,12 @@ class TestBatchDuplicateGoalsAllowed(unittest.TestCase):
         self.assertEqual(len(result["results"]), 2)
 
 
-class TestBatchPlaceholderGoals(unittest.TestCase):
+class TestBatchPlaceholderGoals(_WithPolicyOwner):
     def test_bare_todo_rejected_case_insensitive(self):
         for todo in ("TODO", "todo", "ToDo"):
             result = _call([{"goal": GOOD_A}, {"goal": todo}])
             self.assertIn("error", result, todo)
+            self.assertIn("placeholder", result["error"].lower())
 
     def test_task_n_placeholder_rejected(self):
         # 'Task 123456789' is >10 chars, so only the bare-'task N' shape
@@ -135,6 +153,7 @@ class TestBatchPlaceholderGoals(unittest.TestCase):
     def test_too_short_goal_rejected(self):
         result = _call([{"goal": GOOD_A}, {"goal": "fix bug"}])
         self.assertIn("error", result)
+        self.assertIn("too short", result["error"].lower())
 
     def test_placeholder_error_is_actionable(self):
         result = _call([{"goal": GOOD_A}, {"goal": "TODO"}])
@@ -143,7 +162,7 @@ class TestBatchPlaceholderGoals(unittest.TestCase):
         self.assertIn("specific", result["error"].lower())
 
 
-class TestSingleTaskBatch(unittest.TestCase):
+class TestSingleTaskBatch(_WithPolicyOwner):
     def test_one_task_batch_is_valid_single_task_shape(self):
         """A one-entry tasks[] array is the canonical single-task call (the
         advertised interface is tasks-only), so it must NOT be rejected —
@@ -157,7 +176,7 @@ class TestSingleTaskBatch(unittest.TestCase):
         self.assertNotIn("error", result)
 
 
-class TestValidBatchStillRuns(unittest.TestCase):
+class TestValidBatchStillRuns(_WithPolicyOwner):
     def test_two_distinct_goals_pass_validation(self):
         with patch("tools.delegate_tool._run_single_child") as mock_run:
             mock_run.side_effect = [
