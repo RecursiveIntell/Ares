@@ -1,6 +1,6 @@
 """Bound config reads while retaining child-environment security decisions."""
 from hermes_cli import config
-from tools.environments.local import _make_run_env, _sanitize_subprocess_env
+from tools.environments.local import _make_run_env, _sanitize_subprocess_env, hermes_subprocess_env
 import pytest
 
 
@@ -332,3 +332,97 @@ def test_explicit_profile_cannot_be_combined_with_snapshot(tmp_path):
 
     with pytest.raises(ValueError, match='cannot be combined'):
         get_all_passthrough(profile_home=tmp_path, _config_snapshot={})
+
+
+@pytest.mark.parametrize('count', [10, 300])
+@pytest.mark.parametrize('inherit', [False, True])
+def test_nonterminal_spawn_raw_reads_are_bounded(tmp_path, monkeypatch, count, inherit):
+    import os
+    from pathlib import Path
+    from agent import secret_scope
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.environments import local
+
+    policy = tmp_path / 'config.yaml'
+    policy.write_text('secrets:\n  bitwarden:\n    access_token_env: PRIVATE_BOOT\n')
+    monkeypatch.setattr(secret_scope, '_MULTIPLEX_ACTIVE', False)
+    env = {'HOME': str(tmp_path), 'HERMES_HOME': str(tmp_path),
+           'PRIVATE_BOOT': 'synthetic-canary', 'OPENAI_API_KEY': 'synthetic-provider'}
+    env.update({f'PLAIN_{i}': 'safe' for i in range(count)})
+    monkeypatch.setattr(os, 'environ', env)
+    reads, builds = [], []
+    original_read = Path.read_bytes
+    original_build = local._build_provider_env_blocklist
+    def read(self):
+        if self == policy:
+            reads.append(True)
+        return original_read(self)
+    def build():
+        builds.append(True)
+        return original_build()
+    monkeypatch.setattr(Path, 'read_bytes', read)
+    monkeypatch.setattr(local, '_build_provider_env_blocklist', build)
+    token = set_hermes_home_override(tmp_path)
+    try:
+        result = hermes_subprocess_env(inherit_credentials=inherit)
+    finally:
+        reset_hermes_home_override(token)
+    assert result['PLAIN_0'] == 'safe'
+    assert 'PRIVATE_BOOT' not in result
+    assert ('OPENAI_API_KEY' in result) is inherit
+    assert 1 <= len(reads) <= 2, len(reads)
+    assert 1 <= len(builds) <= 2, len(builds)
+
+
+@pytest.mark.parametrize('change', ['remap', 'delete', 'provider'])
+def test_nonterminal_spawn_rechecks_policy_after_filter(tmp_path, monkeypatch, change):
+    import os
+    from agent import secret_scope
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.environments import local
+
+    policy = tmp_path / 'config.yaml'
+    policy.write_text('{}\n')
+    monkeypatch.setattr(secret_scope, '_MULTIPLEX_ACTIVE', False)
+    monkeypatch.setattr(os, 'environ', {'HOME': str(tmp_path), 'SAFE': 'kept'})
+    original = local._scrub_delegated_child_kanban_env
+    def change_before_return(env):
+        result = original(env)
+        if change == 'remap':
+            policy.write_text('secrets:\n  bitwarden:\n    access_token_env: LATE_BOOT\n')
+        elif change == 'delete':
+            policy.unlink()
+        else:
+            monkeypatch.setitem(config.OPTIONAL_ENV_VARS, 'LATE_PROVIDER', {'category': 'tool'})
+        return result
+    monkeypatch.setattr(local, '_scrub_delegated_child_kanban_env', change_before_return)
+    token = set_hermes_home_override(tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match='policy'):
+            hermes_subprocess_env(inherit_credentials=True)
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_nonterminal_explicit_boundary_protects_all_profile_bootstraps(tmp_path, monkeypatch):
+    import os
+    from agent import secret_scope
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    homes = [tmp_path / name for name in ('ambient', 'source', 'target')]
+    for home in homes:
+        home.mkdir()
+        (home / 'config.yaml').write_text(
+            f'secrets:\n  bitwarden:\n    access_token_env: {home.name.upper()}_BOOT\n')
+    monkeypatch.setattr(secret_scope, '_MULTIPLEX_ACTIVE', False)
+    monkeypatch.setattr(os, 'environ', {'HOME': str(homes[0]), 'HERMES_HOME': str(homes[0]),
+        'AMBIENT_BOOT': 'synthetic', 'SOURCE_BOOT': 'synthetic', 'TARGET_BOOT': 'synthetic', 'SAFE': 'kept'})
+    token = set_hermes_home_override(homes[0])
+    try:
+        boundary = secret_scope.build_profile_env_boundary(homes[1], homes[2])
+        result = hermes_subprocess_env(inherit_credentials=True, profile_boundary=boundary)
+    finally:
+        reset_hermes_home_override(token)
+    assert result['SAFE'] == 'kept'
+    assert result['HERMES_HOME'] == str(homes[2])
+    assert not {'AMBIENT_BOOT', 'SOURCE_BOOT', 'TARGET_BOOT'} & result.keys()

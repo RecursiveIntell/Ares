@@ -1031,18 +1031,42 @@ def hermes_subprocess_env(
     env = os.environ.copy()
 
     from agent.secret_scope import build_profile_env_boundary, is_multiplex_active
+    from hermes_constants import get_hermes_home
+    from hermes_cli.config import capture_security_policy_config
 
+    ambient_home = Path(get_hermes_home())
+    try:
+        ambient_policy = capture_security_policy_config()
+        ambient_policy.assert_profile_owner(ambient_home)
+    except Exception as exc:
+        raise RuntimeError("Bitwarden token policy unavailable") from exc
+    policies = {ambient_home.absolute(): ambient_policy}
+    provider_blocklist = _provider_env_blocklist_snapshot()
     multiplex_active = is_multiplex_active()
     boundary = profile_boundary
     boundary_active = multiplex_active or boundary is not None
     if boundary_active:
-        boundary = boundary or build_profile_env_boundary()
+        boundary = boundary or build_profile_env_boundary(_target_policy_snapshot=ambient_policy)
         env = boundary.sanitize(env)
         if inherit_credentials:
+            model_provider_names = _build_model_provider_env_names()
             for key, value in boundary.compiled_target_values().items():
                 target_name = _credential_target_env_name(key).upper()
-                if target_name in _build_model_provider_env_names():
+                if target_name in model_provider_names:
                     env[str(key)] = str(value)
+    try:
+        if boundary is not None:
+            for home in (boundary.source_home, boundary.target_home):
+                key = Path(home).absolute()
+                if key not in policies:
+                    policies[key] = capture_security_policy_config(home)
+                    policies[key].assert_profile_owner(home)
+        bws_token_env = frozenset(
+            _get_configured_bws_token_env(_config_snapshot=policy.config)
+            for policy in policies.values()
+        )
+    except Exception as exc:
+        raise RuntimeError("Bitwarden token policy unavailable") from exc
 
     # Tier 1 — always strip, including mixed-case Windows keys and
     # Apptainer/Singularity forwarding wrappers around a Tier-1 target.
@@ -1073,13 +1097,13 @@ def hermes_subprocess_env(
     for key in list(env):
         if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             env.pop(key, None)
-        elif _is_hermes_internal_secret(key):
+        elif _is_hermes_internal_secret(key, bws_token_env=bws_token_env):
             env.pop(key, None)
 
     if not inherit_credentials:
         # Tier 2 — strip provider/tool credentials unless explicitly inherited.
         for key in list(env):
-            if _is_blocked_provider_env(key):
+            if _is_blocked_provider_env(key, _blocklist_snapshot=provider_blocklist):
                 env.pop(key, None)
 
     # Windows UTF-8 safety for spawned processes (#31420).
@@ -1111,7 +1135,12 @@ def hermes_subprocess_env(
     # context that later imports Kanban DB code in the spawned process would
     # still see the parent's HERMES_HOME but lose the DB mutation guard.
     env = _scrub_delegated_child_kanban_env(env)
-
+    _verify_provider_env_blocklist_snapshot(provider_blocklist)
+    try:
+        for policy in policies.values():
+            policy.assert_current()
+    except Exception as exc:
+        raise RuntimeError("Bitwarden token policy unavailable") from exc
     return env
 
 
