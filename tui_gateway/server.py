@@ -235,11 +235,21 @@ def _resolve_ws_orphan_reap_grace() -> float:
             raw = (load_config().get("dashboard") or {}).get(
                 "ws_orphan_reap_grace_s"
             )
-        except Exception:
+        except Exception as exc:
             raw = None
+            # A silent fallback here hides the operator's configured grace and
+            # makes aggressive reaps look like mysterious session theft. Name it.
+            logger.warning(
+                "ws_orphan_reap_grace_s config read failed (%s); using 20s default",
+                type(exc).__name__,
+            )
     try:
         grace = float(raw) if raw is not None else 20.0
     except (ValueError, TypeError):
+        logger.warning(
+            "ws_orphan_reap_grace_s could not be parsed (value_type=%s); using 20s default",
+            type(raw).__name__,
+        )
         grace = 20.0
     return max(0.0, grace)
 
