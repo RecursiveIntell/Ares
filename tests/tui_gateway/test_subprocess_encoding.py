@@ -37,16 +37,13 @@ def _make_completed_process() -> MagicMock:
 
 # ── _SlashWorker.Popen path ──────────────────────────────────────────────
 
-def test_slash_worker_popen_uses_utf8_replace():
-    """The slash-worker subprocess.Popen must pass encoding="utf-8" and
-    errors="replace" so invalid bytes in child stdout/stderr don't raise
-    UnicodeDecodeError inside the drain threads (#53137).
-    """
-    with patch.dict("sys.modules", {
-        "hermes_constants": MagicMock(
-            get_hermes_home=MagicMock(return_value="/tmp/hermes_test")
-        ),
-    }):
+def test_slash_worker_popen_uses_utf8_replace(tmp_path):
+    """Keep UTF-8 replacement while exercising a real temporary policy owner."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+    token = set_hermes_home_override(tmp_path)
+    try:
         with patch("subprocess.Popen") as mock_popen:
             mock_popen.return_value.stdout = MagicMock()
             mock_popen.return_value.stderr = MagicMock()
@@ -66,6 +63,8 @@ def test_slash_worker_popen_uses_utf8_replace():
             assert kwargs.get("errors") == "replace", (
                 f"slash-worker Popen must set errors='replace' (got {kwargs.get('errors')!r})"
             )
+    finally:
+        reset_hermes_home_override(token)
 
 
 # ── cli.exec handler ─────────────────────────────────────────────────────
