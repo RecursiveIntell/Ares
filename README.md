@@ -193,9 +193,9 @@ After setup, the generated launcher resolves through `current`; it does not
 fall back to the checkout that was used to create the release. Each selected
 release has its own `.venv`, is cloned at an immutable Git revision, and is
 built in a staging directory before the release becomes visible. The launch
-environment removes `PYTHONPATH`, `PYTHONHOME`, `PYTHONUSERBASE`, `VIRTUAL_ENV`,
-and `UV_PROJECT_ENVIRONMENT`, sets `PYTHONNOUSERSITE=1`, and marks the process
-with `ARES_RUNTIME_MODE=stable` plus the selected release identity.
+environment removes `PYTHONHOME`, `PYTHONPATH`, `PYTHONUSERBASE`, `VIRTUAL_ENV`,
+and `UV_PROJECT_ENVIRONMENT`, points `HERMES_HOME` at the Ares agent home, and
+marks the process with `ARES_MANAGED_RUNTIME=1`.
 
 `ares setup` may copy `config.yaml`, `.env`, `auth.json`, `active_profile`,
 `profiles/`, `skills/`, and `plugins/` once from `--seed-from` (default
