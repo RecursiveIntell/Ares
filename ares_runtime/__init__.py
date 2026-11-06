@@ -64,6 +64,7 @@ _EXPORT_MODULES = {
     'replay_mutations': '.collaboration',
     'specialist_descriptor_ref': '.collaboration',
     'validate_specialist_descriptor_set': '.collaboration',
+    'decide_specialist_nonactivation': '.specialist_routing',
     'MANAGED_MODEL_CALL_KINDS': '.governed_context',
     'GovernedContextMaterializer': '.governed_context',
     'ManagedCallKind': '.governed_context',

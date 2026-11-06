@@ -239,6 +239,9 @@ def test_scan_still_resolves_its_own_anchors() -> None:
     tiers = _classify()
     for symbol in ("dispatcher_boundary", "ContractError", "DaemonPermitReceiptAdapter"):
         assert symbol in tiers["A"], f"{symbol} should be Tier A (product-integrated)"
+    assert "decide_specialist_nonactivation" in tiers["B"], (
+        "decide_specialist_nonactivation must be consumed by another ares_runtime module"
+    )
     assert len(tiers["A"]) >= 5, "Tier A collapsed - the scanner, not the product, broke"
 
 
