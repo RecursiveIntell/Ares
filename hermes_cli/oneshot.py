@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +33,10 @@ from hermes_cli.fallback_config import get_fallback_chain
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
+    # An empty library sequence is explicit zero tools; blank CLI text retains
+    # its existing config/default semantics. Do not conflate absence with [].
+    if isinstance(toolsets, (list, tuple)) and not toolsets:
+        return []
     if not toolsets:
         return None
 
@@ -86,6 +90,8 @@ def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | No
     normalized = _normalize_toolsets(toolsets)
     if normalized is None:
         return None, None
+    if normalized == []:
+        return [], None
 
     try:
         from toolsets import validate_toolset
@@ -189,6 +195,8 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
             # paying for actually went out on the wire (July 2026 incident:
             # a config-matching bug silently dropped flex -> 2.3x billing).
             "service_tier": result.get("service_tier"),
+            # Opt-in exact-body observations; null is not a zero-send claim.
+            "native_request_evidence": result.get("native_request_evidence"),
         }
         if failure is not None:
             report["failure"] = failure
@@ -206,6 +214,7 @@ def run_oneshot(
     toolsets: object = None,
     skills: object = None,
     usage_file: Optional[str] = None,
+    reasoning: object = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -273,27 +282,41 @@ def run_oneshot(
     response: Optional[str] = None
     result: dict = {}
     failure: BaseException | None = None
+    native_capture = None
     try:
-        with redirect_stdout(devnull), redirect_stderr(devnull):
-            try:
-                response, result = _run_agent(
-                    prompt,
-                    model=model,
-                    provider=provider,
-                    toolsets=explicit_toolsets,
-                    use_config_toolsets=use_config_toolsets,
-                    skills=skills,
-                )
-            except BaseException as exc:  # noqa: BLE001
-                # Capture anything that escapes the agent (including OSError
-                # from prompt_toolkit/Vt100 when stdout is a non-TTY pipe,
-                # KeyboardInterrupt, SystemExit, etc.) so we can surface it on
-                # the real stderr instead of crashing past the redirect with a
-                # traceback that the caller never sees. A silent exit in a
-                # cron / SSH / subprocess context is the worst failure mode.
-                # See #30623.
-                failure = exc
+        with ExitStack() as stack:
+            if usage_file:
+                from ares_runtime.physical_dispatch import capture_physical_dispatch
+
+                native_capture = stack.enter_context(capture_physical_dispatch())
+            with redirect_stdout(devnull), redirect_stderr(devnull):
+                try:
+                    response, result = _run_agent(
+                        prompt,
+                        model=model,
+                        provider=provider,
+                        toolsets=explicit_toolsets,
+                        use_config_toolsets=use_config_toolsets,
+                        skills=skills,
+                        reasoning=reasoning,
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    # Preserve failures and any physical observations before
+                    # surfacing them outside redirected stdout/stderr.
+                    failure = exc
     finally:
+        if native_capture is not None:
+            from hermes_constants import parse_reasoning_effort
+
+            result["native_request_evidence"] = {
+                "schema": "ares.oneshot-native-request-evidence/v1",
+                **native_capture.evidence_snapshot(),
+                "requested_reasoning": parse_reasoning_effort(reasoning),
+                "provider_response_model": None,
+                "coverage": "bound buffered inference HTTP sends in this capture and explicitly registered observer handoffs",
+                "limits": ["No provider-internal effort attestation; SDK-returned model selectors are per-request observations.",
+                           "No proof of disabled memory/hooks from tool-schema count alone."],
+            }
         try:
             devnull.close()
         except Exception:
@@ -382,6 +405,7 @@ def _run_agent(
     toolsets: object = None,
     use_config_toolsets: bool = True,
     skills: object = None,
+    reasoning: object = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -453,6 +477,17 @@ def _run_agent(
                 if detected:
                     effective_provider, effective_model = detected
 
+    # Same config/model precedence as interactive chat; an explicit invocation
+    # override is run-local. Reject invalid explicit input before resolving any
+    # credentials or constructing an agent rather than silently using a default.
+    from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+
+    reasoning_config = resolve_reasoning_config(cfg, effective_model)
+    if reasoning is not None:
+        reasoning_config = parse_reasoning_effort(reasoning)
+        if reasoning_config is None:
+            raise ValueError(f"Invalid --reasoning value: {reasoning!r}")
+
     runtime = resolve_runtime_provider(
         requested=effective_provider,
         target_model=effective_model or None,
@@ -475,10 +510,11 @@ def _run_agent(
     # there is only ONE turn and no between-turns late-binding refresh (#38448).
     from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-    ensure_mcp_discovery_before_agent_build(
-        logger=logging.getLogger(__name__),
-        single_query=True,
-    )
+    if toolsets_list != []:
+        ensure_mcp_discovery_before_agent_build(
+            logger=logging.getLogger(__name__),
+            single_query=True,
+        )
 
     skills_prompt = _build_preloaded_skills_prompt(skills)
 
@@ -503,6 +539,7 @@ def _run_agent(
             model=effective_model,
             session_id=os.getenv("HERMES_ONESHOT_SESSION_ID", "").strip(),
             enabled_toolsets=toolsets_list,
+            reasoning_config=reasoning_config,
             quiet_mode=True,
             platform="cli",
             session_db=session_db,

@@ -115,9 +115,71 @@ def resolve_dispatch_route(body: bytes, *, route: str) -> dict:
         raise EgressDispatchDenied("MODEL_IDENTITY_UNAVAILABLE") from error
 
 
+def request_controls(body: bytes, *, route: str) -> dict:
+    """Redacted observations from serialized bytes, never configured defaults.
+
+    This is not authority, a provider-internal effort attestation, or proof that
+    hooks/memory were disabled. Context digests permit comparison with isolated
+    controls without copying prompt content into an observer's receipt.
+    """
+    family, _, _ = _wire_family(route)
+    if family not in {"openai.chat_completions", "openai.responses", "anthropic.messages"}:
+        raise ValueError("native controls protocol not qualified")
+    payload = _json_object(body)
+    result: dict[str, object] = {"schema": "ares.native-request-controls/v1"}
+    for name in ("reasoning", "thinking", "output_config"):
+        if name not in payload:
+            continue
+        value = payload[name]
+        if type(value) is not dict:
+            raise ValueError("ambiguous native control object")
+        fields = {}
+        allowed = {
+            "reasoning": ("effort", "enabled"),
+            "thinking": ("type", "budget_tokens"),
+            "output_config": ("effort",),
+        }[name]
+        for field in allowed:
+            if field not in value:
+                continue
+            item = value[field]
+            if field == "enabled":
+                valid = type(item) is bool
+            elif field == "budget_tokens":
+                valid = type(item) is int and item > 0
+            else:
+                valid = type(item) is str and re.fullmatch(r"[a-z0-9_.-]{1,32}", item)
+            if not valid:
+                raise ValueError("unqualified native control value")
+            fields[field] = item
+        result[name] = fields
+    if "reasoning_effort" in payload:
+        effort = payload["reasoning_effort"]
+        if type(effort) is not str or not re.fullmatch(r"[a-z0-9_.-]{1,32}", effort):
+            raise ValueError("unqualified native effort")
+        result["reasoning_effort"] = effort
+    tools = payload.get("tools", [])
+    if type(tools) is not list or any(type(tool) is not dict for tool in tools):
+        raise ValueError("unqualified tools array")
+    result["tools_count"] = len(tools)
+    context = {key: payload[key] for key in ("messages", "system", "instructions", "input") if key in payload}
+    # Explicit serializer, not an RFC8785/JCS or semantic-equivalence claim.
+    import hashlib
+
+    encoded = json.dumps(context, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    result["context_fields"] = sorted(context)
+    result["context_sha256"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return result
+
+
 def request_metadata(body: bytes, *, route: str) -> dict:
-    result = {"resolved_route":None, "route_qualification_error":None,
-              "output_token_ceiling":None, "output_bound_error":None}
+    result: dict[str, object] = {"resolved_route":None, "route_qualification_error":None,
+              "output_token_ceiling":None, "output_bound_error":None,
+              "native_controls":None, "controls_qualification_error":None}
+    try:
+        result["native_controls"] = request_controls(body, route=route)
+    except (EgressDispatchDenied, ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+        result["controls_qualification_error"] = "REQUEST_CONTROLS_UNAVAILABLE"
     try:
         result["resolved_route"] = resolve_dispatch_route(body, route=route)
     except EgressDispatchDenied as error:

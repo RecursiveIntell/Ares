@@ -39,6 +39,231 @@ from hermes_cli.middleware import (
 )
 
 _call = contextvars.ContextVar("ares_inference_call", default=None)
+_capture: contextvars.ContextVar[PhysicalDispatchCapture | None] = contextvars.ContextVar("ares_physical_capture", default=None)
+_sdk_capture_tickets: contextvars.ContextVar[Any] = contextvars.ContextVar("ares_sdk_capture_tickets", default=None)
+_capture_handoff: contextvars.ContextVar[Any] = contextvars.ContextVar("ares_capture_handoff", default=None)
+
+
+class PhysicalDispatchCapture:
+    """Run-local, detached evidence; no plugin registration or durable state."""
+
+    def __init__(self):
+        from threading import RLock
+
+        self._lock = RLock()
+        self._records = []
+        self._handoffs = {}
+        self._handoff_conflict = False
+
+    def evidence_snapshot(self):
+        """One detached cut of registered observer work, never universal coverage."""
+        from copy import deepcopy
+
+        with self._lock:
+            requests = deepcopy(self._records)
+            handoffs = deepcopy(list(self._handoffs.values()))
+            return {"requests": requests, "handoffs": handoffs,
+                    "handoff_conflict": self._handoff_conflict,
+                    "registered_work_settled": (
+                        not self._handoff_conflict
+                        and all(item["state"] in {"returned", "raised"} for item in handoffs)
+                        and all(item["outcome"] is not None for item in requests))}
+
+    def snapshot(self):
+        from copy import deepcopy
+
+        with self._lock:
+            return deepcopy(self._records)
+
+    def begin(self, payload):
+        from copy import deepcopy
+
+        fields = ("dispatch_intent_ref", "execution_id", "qualification_error",
+                  "provider_request_digest", "provider_request_sha256", "provider_request_bytes",
+                  "resolved_route", "route_qualification_error", "output_token_ceiling",
+                  "output_bound_error", "native_controls", "controls_qualification_error")
+        record = {key: deepcopy(payload.get(key)) for key in fields}
+        record.update(schema="ares.physical-capture/v1", outcome=None, response=None,
+                      error_type=None, error_code=None, provider_response_model=None)
+        with self._lock:
+            binding = _capture_handoff.get()
+            record["capture_handoff_id"] = (
+                binding[1] if binding is not None and binding[0] is self else None)
+            self._records.append(record)
+        ticket = _CaptureTicket(self, record)
+        sdk_tickets = _sdk_capture_tickets.get()
+        if sdk_tickets is not None:
+            sdk_tickets.append(ticket)
+        return ticket
+
+
+def bind_capture_observer(callback, *, purpose):
+    """Share only an opt-in observer collector with one scheduled callback.
+
+    No logical call, SDK tickets, secret scope, credentials, policy, lease or
+    other ContextVar is copied. Purpose is an observational label supplied by
+    the scheduling source, not execution authority. Register before scheduling
+    so a never-started or late callback cannot disappear from the snapshot.
+    """
+    from functools import wraps
+    import re
+
+    owner = _capture.get()
+    if owner is None:
+        return callback
+    if not callable(callback) or type(purpose) is not str or not re.fullmatch(r"[a-z][a-z0-9_.:-]{0,63}", purpose):
+        raise ValueError("capture handoff needs a callable and bounded purpose")
+    registered_id = uuid.uuid4().hex
+    with owner._lock:
+        owner._handoffs[registered_id] = {"id": registered_id, "purpose": purpose,
+                                         "state": "scheduled", "error_type": None}
+
+    @wraps(callback)
+    def observed(*args, **kwargs):
+        active_id = registered_id
+        with owner._lock:
+            if owner._handoffs[registered_id]["state"] != "scheduled":
+                # Observe unexpected re-use without suppressing the callback or
+                # overwriting the original invocation's settlement evidence.
+                owner._handoff_conflict = True
+                active_id = uuid.uuid4().hex
+                owner._handoffs[active_id] = {
+                    "id": active_id, "purpose": purpose, "state": "scheduled",
+                    "error_type": None, "reused_registration": registered_id}
+            owner._handoffs[active_id]["state"] = "running"
+        capture_token = _capture.set(owner)
+        handoff_token = _capture_handoff.set((owner, active_id))
+        try:
+            result = callback(*args, **kwargs)
+        except BaseException as error:
+            with owner._lock:
+                owner._handoffs[active_id].update(state="raised", error_type=type(error).__name__[:128])
+            raise
+        else:
+            # Returning a coroutine/generator/opaque work handle is not an
+            # admitted completion witness. Preserve its value and leave the
+            # handoff explicitly unsettled; only synchronous scalar/None values
+            # and HTTPX responses with separately observed body tickets have a
+            # bounded settlement interpretation here.
+            deferred = (result is not None
+                        and type(result) not in {bool, int, float, str, bytes}
+                        and not isinstance(result, httpx.Response))
+            with owner._lock:
+                owner._handoffs[active_id]["state"] = "returned_deferred" if deferred else "returned"
+            return result
+        finally:
+            _capture_handoff.reset(handoff_token)
+            _capture.reset(capture_token)
+
+    return observed
+
+
+def _note_sdk_model(ticket, value):
+    candidates = (value, getattr(value, "message", None), getattr(value, "response", None))
+    model = next((getattr(item, "model", None) for item in candidates
+                  if type(getattr(item, "model", None)) is str), None)
+    if not model or len(model.encode("utf-8")) > 4096:
+        return
+    with ticket.owner._lock:
+        previous = ticket.record["provider_response_model"]
+        if ticket.record.get("response_model_conflict"):
+            return  # Already ambiguous: never choose a winner.
+        if previous is not None and previous != model:
+            ticket.record["response_model_conflict"] = True
+            ticket.record["provider_response_model"] = None
+        else:
+            ticket.record["provider_response_model"] = model
+
+
+class _ObservedSdkStream:
+    """Metadata-only view of actual SDK events; event objects are unchanged."""
+
+    def __init__(self, inner, ticket):
+        self.inner, self.ticket = inner, ticket
+        self._iterator = self._aiterator = None
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._iterator is None:
+            self._iterator = iter(self.inner)
+        event = next(self._iterator)
+        _note_sdk_model(self.ticket, event)
+        return event
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._aiterator is None:
+            self._aiterator = self.inner.__aiter__()
+        event = await self._aiterator.__anext__()
+        _note_sdk_model(self.ticket, event)
+        return event
+
+    def __enter__(self):
+        self.inner.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self.inner.__exit__(*args)
+
+    async def __aenter__(self):
+        await self.inner.__aenter__()
+        return self
+
+    async def __aexit__(self, *args):
+        return await self.inner.__aexit__(*args)
+
+
+def _observe_sdk_response_model(response):
+    tickets = _sdk_capture_tickets.get()
+    if tickets:
+        ticket = tickets[-1]  # Earlier SDK retry attempts have no returned object.
+        _note_sdk_model(ticket, response)
+        if isinstance(getattr(response, "response", None), httpx.Response):
+            return _ObservedSdkStream(response, ticket)
+    return response
+
+
+class _CaptureTicket:
+    def __init__(self, owner, record):
+        self.owner, self.record = owner, record
+
+    def settle(self, *, outcome, response=None, error=None):
+        from copy import deepcopy
+
+        with self.owner._lock:
+            if self.record["outcome"] is not None:
+                self.record["settlement_conflict"] = True
+                return
+            self.record["outcome"] = outcome
+            # The physical owner supplies digest/status metadata only, never a
+            # provider message or body. Do not broaden this to SDK responses.
+            self.record["response"] = deepcopy(response) if isinstance(response, dict) else None
+            self.record["error_type"] = type(error).__name__ if error is not None else None
+            self.record["error_code"] = error.code if isinstance(error, EgressDispatchDenied) else None
+
+
+@contextlib.contextmanager
+def capture_physical_dispatch():
+    """Observe buffered inference sends in this context; never authorize one.
+
+    A prepared entry with no outcome is unsettled, not proof of transmission.
+    Deferred response bodies keep their original capture owner after exit.
+    """
+    capture = PhysicalDispatchCapture()
+    token = _capture.set(capture)
+    try:
+        yield capture
+    finally:
+        _capture.reset(token)
+
+
 _sdk_active = contextvars.ContextVar("ares_inference_sdk_request", default=False)
 _unsupported_bridge = contextvars.ContextVar(
     "ares_unqualified_thread_bridge", default=None
@@ -302,7 +527,19 @@ def _begin_buffered(request):
                             "output_token_ceiling": None, "output_bound_error": "UNSUPPORTED_TRANSPORT"})
     # Observers see honest missing facts; enforce governors may refuse them.
     # Off/observe must not be blocked before the governor sees qualification.
-    tickets = begin_llm_dispatch(observation, dispatch_phase="physical_send")
+    capture = _capture.get()
+    capture_ticket = capture.begin(observation) if capture is not None else None
+    try:
+        tickets = begin_llm_dispatch(observation, dispatch_phase="physical_send")
+    except BaseException as error:
+        if capture_ticket is not None:
+            outcome, cause = _dispatch_error_settlement(error)
+            if isinstance(error, EgressDispatchDenied):
+                outcome = "denied_by_peer"
+            capture_ticket.settle(outcome=outcome, error=cause)
+        raise
+    if capture_ticket is not None:
+        tickets.append(capture_ticket)
     owned = _DispatchTickets(tickets)
     owned.started = time.monotonic()
     try:
@@ -725,22 +962,26 @@ def bind_inference_client(client):
 
         async def request(self, *args, **kwargs):
             token = _sdk_active.set(True)
+            capture_token = _sdk_capture_tickets.set([] if _capture.get() is not None else None)
             try:
-                return await original(*args, **kwargs)
+                return _observe_sdk_response_model(await original(*args, **kwargs))
             except _GovernanceEscape as escape:
                 raise escape.original from None
             finally:
+                _sdk_capture_tickets.reset(capture_token)
                 _sdk_active.reset(token)
 
     else:
 
         def request(self, *args, **kwargs):
             token = _sdk_active.set(True)
+            capture_token = _sdk_capture_tickets.set([] if _capture.get() is not None else None)
             try:
-                return original(*args, **kwargs)
+                return _observe_sdk_response_model(original(*args, **kwargs))
             except _GovernanceEscape as escape:
                 raise escape.original from None
             finally:
+                _sdk_capture_tickets.reset(capture_token)
                 _sdk_active.reset(token)
 
     client.request = types.MethodType(request, client)
