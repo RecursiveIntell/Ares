@@ -35,8 +35,7 @@ INIT_PATH = REPO_ROOT / "ares_runtime" / "__init__.py"
 # Tier C, classified: symbol -> (remedy, task, rationale).
 ORPHAN_LEDGER: dict[str, tuple[str, str, str]] = {
     # --- remedy "wire": the owning module has no product caller at all ---
-    "AresReleaseActivator": ("wire", "4.3", "activation owner reconciliation"),
-    "AresRuntimeResolver": ("wire", "4.3", "stable runtime resolution owner"),
+
     "GovernedContextMaterializer": ("wire", "2.2", "pre-egress materialization"),
     "MANAGED_MODEL_CALL_KINDS": ("wire", "3.1", "managed-call kind registry"),
     "plan_legacy_memory_import": ("wire", "3.1", "legacy memory import planner"),
@@ -49,8 +48,6 @@ ORPHAN_LEDGER: dict[str, tuple[str, str, str]] = {
     "DesktopProductionApprovalWitnessProvider": ("wire", "2.2", "approval witness"),
     # --- remedy "unexport": used inside its own module, over-advertised ---
     "ACTIVATION_GRANT_SCHEMA": ("unexport", "1.3", "internal schema constant"),
-    "ActivationResult": ("unexport", "4.3", "internal activation record"),
-    "ActivationState": ("unexport", "4.3", "internal activation state enum"),
     "BaselineResultV1": ("unexport", "1.3", "internal contract artifact"),
     "DesktopProductionApprovalController": ("unexport", "1.3", "internal controller"),
     "DesktopProductionApprovalEnvelope": ("unexport", "1.3", "internal envelope"),
@@ -58,7 +55,6 @@ ORPHAN_LEDGER: dict[str, tuple[str, str, str]] = {
     "FindingV1": ("unexport", "1.3", "internal contract artifact"),
     "FrozenReplayCorpusV1": ("unexport", "1.3", "internal contract artifact"),
     "HandoffPacketV1": ("unexport", "1.3", "internal contract artifact"),
-    "INSTALLED_RUNTIME_POINTER_SCHEMA": ("unexport", "1.3", "internal schema constant"),
     "ManagedCallKind": ("unexport", "2.2", "internal enum used by the materializer"),
     "ManagedMaterialization": ("unexport", "2.2", "internal result envelope"),
     "MaterializationReceiptStore": ("unexport", "2.3", "internal receipt store"),
@@ -69,8 +65,6 @@ ORPHAN_LEDGER: dict[str, tuple[str, str, str]] = {
     "PermitBridgeState": ("unexport", "1.3", "internal permit enum"),
     "PersistedManagedMaterialization": ("unexport", "2.3", "internal persisted record"),
     "RELEASE_MANIFEST_SCHEMA": ("unexport", "1.3", "internal schema constant"),
-    "RUNTIME_IDENTITY_SCHEMA": ("unexport", "1.3", "internal schema constant"),
-    "ResolvedRuntime": ("unexport", "4.3", "internal resolution record"),
     "RoleContractV1": ("unexport", "1.3", "internal contract artifact"),
     "RuntimeImage": ("unexport", "1.3", "internal image record"),
     "SemanticMemoryObservationV1": ("unexport", "2.2", "internal observation"),
@@ -79,6 +73,7 @@ ORPHAN_LEDGER: dict[str, tuple[str, str, str]] = {
     "freeze_replay_corpus": ("unexport", "1.3", "internal helper"),
     "make_artifact": ("unexport", "1.3", "internal artifact factory"),
     "materialize_candidate_release": ("unexport", "4.3", "internal materializer entry"),
+    "MaterializedRelease": ("unexport", "4.3", "internal materializer result; its only other consumer was the removed activator"),
 }
 
 _USABLE_REMEDIES = {"wire", "unexport"}
