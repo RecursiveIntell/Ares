@@ -910,6 +910,18 @@ class ComputeHost:
                 )
                 if persisted_history:
                     history = server.sanitize_replay_history(persisted_history)
+            # This child process never runs entry.main() or the dashboard
+            # startup, so nothing else starts MCP discovery here. Start it
+            # under the session's profile scope (bound above) before the agent
+            # snapshots its tools, exactly as the in-process _start_agent_build
+            # path does; _make_agent then waits the bounded discovery timeout
+            # and the late-refresh scheduler covers slower servers.
+            try:
+                from tui_gateway.entry import ensure_mcp_discovery_started
+
+                ensure_mcp_discovery_started()
+            except Exception:
+                server.logger.warning("compute-host MCP discovery startup failed", exc_info=True)
             agent = server._make_agent(
                 sid,
                 key,
@@ -1311,11 +1323,33 @@ def _default_workers() -> int:
         return 8
 
 
+def _register_config_shell_hooks() -> None:
+    """Register config shell hooks in this child, as the CLI/gateway do at startup.
+
+    Desktop turns run here when ``dashboard.turn_isolation`` is enabled.
+    Without this registration, config shell hooks are not registered by this
+    startup path for Desktop turns. Registration is bound to this process's
+    home; callbacks stay silent for turns resolving to another profile's home.
+    Registration errors are logged without preventing host startup.
+    """
+    try:
+        from hermes_cli.config import load_config
+        from agent.shell_hooks import register_from_config
+
+        register_from_config(load_config())
+    except Exception:
+        from tui_gateway import server
+
+        server.logger.warning("compute-host shell-hook registration failed", exc_info=True)
+
+
 def run_host(stdin: Any = None, stdout: Any = None) -> None:
     os.environ["HERMES_COMPUTE_HOST_CHILD"] = "1"
     stdin = stdin or sys.stdin
     host = ComputeHost(stdout=stdout or sys.stdout)
     from tui_gateway import server as _server
+
+    _register_config_shell_hooks()
 
     # Autonomous producers in this child (the notification poller, kanban
     # delivery, /loop wakeups) dispatch through this admission so owner

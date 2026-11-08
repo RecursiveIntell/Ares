@@ -769,10 +769,7 @@ export default class Ink {
     // scheduling another write: Node requires waiting for the writable's real
     // drain signal after write() returned false. A terminal that never drains
     // remains stale but cannot spin, force-write, or grow an unbounded queue.
-    if (
-      this.options.stdout.isTTY &&
-      this.pendingWriteStart !== null
-    ) {
+    if (this.options.stdout.isTTY && this.pendingWriteStart !== null) {
       this.isRendering = false
 
       return

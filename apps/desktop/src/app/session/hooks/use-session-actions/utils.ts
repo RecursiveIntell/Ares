@@ -1567,11 +1567,11 @@ interface ApplyRuntimeInfoOptions {
  *  renders from. Foreground sessions only — see ApplyRuntimeInfoOptions. */
 function publishRuntimeToComposer(state: SessionRuntimeStatePatch): void {
   if (state.model !== undefined) {
-    setCurrentModel(state.model)
+    setCurrentModel(state.model, false)
   }
 
   if (state.provider !== undefined) {
-    setCurrentProvider(state.provider)
+    setCurrentProvider(state.provider, false)
   }
 
   if (state.cwd !== undefined) {
@@ -1699,8 +1699,8 @@ export function applyStoredSessionPreviewRuntimeInfo(
   stored: { cwd?: null | string; model?: null | string } | undefined,
   storedSessionId: null | string
 ) {
-  setCurrentModel(stored?.model || '')
-  setCurrentProvider('')
+  setCurrentModel(stored?.model || '', false)
+  setCurrentProvider('', false)
   setCurrentReasoningEffort('', false)
   setCurrentServiceTier('')
   setCurrentFastMode(false, false)

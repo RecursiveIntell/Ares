@@ -755,15 +755,28 @@ class TestImageApiSurface:
         assert result["error_type"] == "auth_error"
         assert "_retryable" not in result
 
-    def test_catalog_models_are_offered_only_by_openrouter(self):
+    def test_catalog_models_are_offered_only_by_openrouter_offline(self):
         from plugins.image_gen.openrouter import _IMAGE_API_MODELS, _build_providers
 
         by_name = {p.name: p for p in _build_providers()}
-        openrouter_ids = {m["id"] for m in by_name["openrouter"].list_models()}
-        nous_ids = {m["id"] for m in by_name["nous"].list_models()}
+        # Exercise the documented offline fallback, not mutable provider catalogs.
+        with patch.object(by_name["openrouter"], "_image_api_live_models", return_value=[]), \
+             patch.object(by_name["openrouter"], "_live_models", return_value=[]), \
+             patch.object(by_name["nous"], "_live_models", return_value=[]):
+            openrouter_ids = {m["id"] for m in by_name["openrouter"].list_models()}
+            nous_ids = {m["id"] for m in by_name["nous"].list_models()}
         assert "openai/gpt-image-2" in openrouter_ids
         assert set(_IMAGE_API_MODELS) <= openrouter_ids
         assert not (set(_IMAGE_API_MODELS) & nous_ids)
+
+    def test_live_catalog_does_not_reintroduce_absent_curated_models(self):
+        from plugins.image_gen.openrouter import _build_providers
+
+        provider = {p.name: p for p in _build_providers()}["openrouter"]
+        entry = {"id": "test/live-image", "display": "Live", "strengths": "Live"}
+        with patch.object(provider, "_image_api_live_models", return_value=[entry]), \
+             patch.object(provider, "_live_models", return_value=[]):
+            assert provider.list_models() == [entry]
 
     def test_default_model_is_unchanged_by_the_new_surface(self):
         from plugins.image_gen.openrouter import DEFAULT_MODEL
