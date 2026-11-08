@@ -35,6 +35,7 @@ from hermes_cli.middleware import (
     begin_llm_dispatch,
     settle_llm_dispatch,
     _dispatch_error_outcome,
+    _dispatch_error_settlement,
 )
 
 _call = contextvars.ContextVar("ares_inference_call", default=None)
@@ -69,9 +70,8 @@ def unsupported_transport_scope(transport):
     try:
         yield
     except BaseException as error:
-        settle_llm_dispatch(
-            tickets, outcome=_dispatch_error_outcome(error), error=error
-        )
+        outcome, cause = _dispatch_error_settlement(error)
+        settle_llm_dispatch(tickets, outcome=outcome, error=cause)
         raise
     else:
         settle_llm_dispatch(tickets, outcome="ok")
@@ -395,7 +395,7 @@ class _SyncBody(httpx.SyncByteStream):
                 yield data
         except BaseException as error:
             error = _lease_failure(error, self.observation.budget)
-            self.close_with(_dispatch_error_outcome(error), error)
+            self.close_with(*_dispatch_error_settlement(error))
             if isinstance(error, (EgressDispatchDenied, EgressOutcomeUnrecorded)):
                 _raise_governance(error)
             raise
@@ -437,7 +437,7 @@ class _AsyncBody(httpx.AsyncByteStream):
                 yield data
         except BaseException as error:
             error = _lease_failure(error, self.observation.budget)
-            await self.close_with(_dispatch_error_outcome(error), error)
+            await self.close_with(*_dispatch_error_settlement(error))
             if isinstance(error, (EgressDispatchDenied, EgressOutcomeUnrecorded)):
                 _raise_governance(error)
             raise
@@ -497,7 +497,7 @@ class _SyncTransport(httpx.BaseTransport):
             if owner is not None:
                 owner[0].close()
                 owner[1].close()
-            _Observation(tickets, None).finish(_dispatch_error_outcome(error), error)
+            _Observation(tickets, None).finish(*_dispatch_error_settlement(error))
             if isinstance(error, (EgressDispatchDenied, EgressOutcomeUnrecorded)):
                 _raise_governance(error)
             raise
@@ -545,7 +545,7 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
                 with __import__("anyio").CancelScope(shield=True):
                     await owner[0].aclose()
                     owner[1].close()
-            _Observation(tickets, None).finish(_dispatch_error_outcome(error), error)
+            _Observation(tickets, None).finish(*_dispatch_error_settlement(error))
             if isinstance(error, (EgressDispatchDenied, EgressOutcomeUnrecorded)):
                 _raise_governance(error)
             raise
@@ -576,7 +576,7 @@ class _BotocoreBody:
                 yield chunk
         except BaseException as error:
             error = _lease_failure(error, self.observation.budget)
-            self.close_with(_dispatch_error_outcome(error), error)
+            self.close_with(*_dispatch_error_settlement(error))
             if isinstance(error, (EgressDispatchDenied, EgressOutcomeUnrecorded)):
                 _raise_governance(error)
             raise
@@ -588,7 +588,7 @@ class _BotocoreBody:
             chunk = self.inner.read(*args, **kwargs)
         except BaseException as error:
             error = _lease_failure(error, self.observation.budget)
-            self.close_with(_dispatch_error_outcome(error), error)
+            self.close_with(*_dispatch_error_settlement(error))
             if isinstance(error, (EgressDispatchDenied, EgressOutcomeUnrecorded)):
                 _raise_governance(error)
             raise

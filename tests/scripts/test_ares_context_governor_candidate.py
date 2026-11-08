@@ -173,13 +173,13 @@ def test_generated_python_cache_never_enters_candidate_file_map(tmp_path):
     assert [entry["path"] for entry in candidate.file_map(tmp_path)] == ["source.py"]
 
 
-def test_runtime_activation_owner_is_declared_candidate_scope():
+def test_runtime_selection_owner_is_declared_candidate_scope():
     assert (
-        candidate.classification("ares", "ares_runtime/activation.py")
+        candidate.classification("ares", "ares_runtime/local_runtime.py")
         == candidate.REQUIRED
     )
     assert (
-        candidate.classification("ares", "tests/ares_runtime/test_activation.py")
+        candidate.classification("ares", "tests/ares_runtime/test_local_runtime.py")
         == candidate.REQUIRED
     )
 
@@ -248,7 +248,7 @@ def test_candidate_builder_formats_python_beneath_ledger_directory(
     ares = payload / "ares"
     runtime = ares / "ares_runtime"
     runtime.mkdir(parents=True)
-    declared = runtime / "activation.py"
+    declared = runtime / "example.py"
     declared.write_text("x = 1\n", encoding="utf-8")
     (ares / "pyproject.toml").write_text("[tool.ruff]\n", encoding="utf-8")
     commands: list[list[str]] = []

@@ -60,6 +60,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: scan
     if: always()
+    # Task 4.2: explicit minimal — this job checks out and runs PR code; it
+    # must not inherit the workflow-level SARIF write (which exists for the
+    # scan job's CodeQL upload only).
+    permissions:
+      contents: read
     outputs:
       review_status: ${{ steps.emit.outputs.review_status }}
     steps:

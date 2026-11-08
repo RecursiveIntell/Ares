@@ -30,6 +30,7 @@ huggingface-hub = false
 overrides = [
     { name = "cryptography", specifier = ">=50,<51" },
     { name = "pynacl", specifier = ">=1.6,<1.7" },
+    { name = "tflite-runtime", marker = "python_full_version < '3.12' and sys_platform == 'linux'", specifier = ">=2.14,<3" },
 ]
 
 [[package]]
@@ -1896,6 +1897,7 @@ name = "hermes-agent"
 version = "0.20.6"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "blake3" },
     { name = "certifi" },
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'" },
@@ -1903,6 +1905,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "fire" },
+    { name = "httpcore" },
     { name = "httpx", extra = ["socks"] },
     { name = "jinja2" },
     { name = "markdown" },
@@ -2148,6 +2151,7 @@ requires-dist = [
     { name = "aiosqlite", marker = "extra == 'matrix'", specifier = "==0.22.1" },
     { name = "alibabacloud-dingtalk", marker = "extra == 'dingtalk'", specifier = "==2.2.42" },
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = "==0.87.0" },
+    { name = "anyio", specifier = "==4.12.1" },
     { name = "asyncpg", marker = "extra == 'matrix'", specifier = "==0.31.0" },
     { name = "azure-identity", marker = "extra == 'azure-identity'", specifier = "==1.25.3" },
     { name = "blake3", specifier = ">=1.0.8,<2" },
@@ -2197,6 +2201,7 @@ requires-dist = [
     { name = "hermes-agent", extras = ["youtube"], marker = "extra == 'all'" },
     { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = "==0.6.1" },
     { name = "honcho-ai", marker = "extra == 'honcho'", specifier = "==2.2.0" },
+    { name = "httpcore", specifier = "==1.0.9" },
     { name = "httplib2", marker = "extra == 'google'", specifier = "==0.32.0" },
     { name = "httpx", extras = ["socks"], specifier = "==0.28.1" },
     { name = "httpx2", marker = "extra == 'computer-use'", specifier = "==2.12.0" },
@@ -3567,7 +3572,7 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "tflite-runtime", marker = "sys_platform == 'linux'" },
+    { name = "tflite-runtime", marker = "python_full_version < '3.12' and sys_platform == 'linux'" },
     { name = "tqdm" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b5/9b/73b7d98b07f4e1f525ad39703e0c5f30ff61c3fa16c8bfe4d99eadc0567a/openwakeword-0.6.0.tar.gz", hash = "sha256:36858d90f1183e307485597a912a4e3c3384b14ea9923f83feaffae7c1565565", size = 70830, upload-time = "2024-02-11T20:56:17.854Z" }
@@ -5166,7 +5171,7 @@ name = "tflite-runtime"
 version = "2.14.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy" },
+    { name = "numpy", marker = "python_full_version < '3.12'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8f/a6/02d68cb62cd221589a0ff055073251d883936237c9c990e34a1d7cecd06f/tflite_runtime-2.14.0-cp311-cp311-manylinux2014_x86_64.whl", hash = "sha256:195ab752e7e57329a68e54dd3dd5439fad888b9bff1be0f0dc042a3237a90e4d", size = 2414486, upload-time = "2023-10-03T21:15:44.331Z" },

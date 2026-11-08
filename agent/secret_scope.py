@@ -498,6 +498,7 @@ def _profile_external_secret_snapshot(
     home: Path,
     *,
     fail_closed: bool,
+    _policy_snapshot=None,
 ) -> Any:
     """Resolve one typed external-source snapshot for this operation."""
     try:
@@ -505,7 +506,10 @@ def _profile_external_secret_snapshot(
 
         snapshot = env_loader.get_external_secret_snapshot(home)  # type: ignore[attr-defined]
         if snapshot.status in {"not_hydrated", "stale"}:
-            env_loader.hydrate_profile_secret_sources(home)
+            if _policy_snapshot is None:
+                env_loader.hydrate_profile_secret_sources(home)
+            else:
+                env_loader.hydrate_profile_secret_sources(home, _policy_snapshot=_policy_snapshot)
             snapshot = env_loader.get_external_secret_snapshot(home)  # type: ignore[attr-defined]
         if fail_closed and snapshot.status in {
             "not_hydrated",
@@ -610,6 +614,7 @@ def build_profile_secret_scope(
     *,
     fail_closed_external: bool = False,
     allow_environment_fallback: bool = True,
+    _policy_snapshot=None,
 ) -> ProfileSecretScope:
     """Build a profile's secret mapping from its ``.env`` and optional ``.op.env``.
 
@@ -655,6 +660,7 @@ def build_profile_secret_scope(
     external_snapshot = _profile_external_secret_snapshot(
         home,
         fail_closed=fail_closed_external,
+        _policy_snapshot=_policy_snapshot,
     )
 
     for key, value in external_snapshot.data.items():
@@ -840,6 +846,8 @@ def get_profile_owned_secret_names(
 def build_profile_env_boundary(
     source_home: str | os.PathLike | None = None,
     target_home: str | os.PathLike | None = None,
+    *,
+    _target_policy_snapshot=None,
 ) -> ProfileEnvBoundary:
     """Capture source/target profile identity and ownership for one execution.
 
@@ -865,6 +873,17 @@ def build_profile_env_boundary(
             target_home = source_home
     source = Path(source_home).resolve()
     target = Path(target_home).resolve()
+    if _target_policy_snapshot is not None:
+        from hermes_cli.config import SecurityPolicySnapshot
+
+        if not isinstance(_target_policy_snapshot, SecurityPolicySnapshot):
+            raise TypeError("_target_policy_snapshot must be a SecurityPolicySnapshot")
+        _target_policy_snapshot.assert_profile_owner(target_home)
+        _target_policy_snapshot.assert_current()
+        # Hydration keys are resolved paths. Do not silently equate a
+        # separately mutable lexical alias with the resolved owner.
+        if Path(target_home).absolute() != target:
+            _target_policy_snapshot = None
     active_scope = current_secret_scope()
     if active_scope is not None and active_scope.profile_home is not None:
         if active_scope.profile_home != target:
@@ -874,6 +893,7 @@ def build_profile_env_boundary(
         current_scope = build_profile_secret_scope(
             target,
             fail_closed_external=True,
+            _policy_snapshot=_target_policy_snapshot,
         )
         if active_scope.generation != current_scope.generation:
             raise RuntimeError(
@@ -884,6 +904,7 @@ def build_profile_env_boundary(
         target_scope = build_profile_secret_scope(
             target,
             fail_closed_external=True,
+            _policy_snapshot=_target_policy_snapshot,
         )
     return ProfileEnvBoundary(
         source_home=source,

@@ -9,8 +9,10 @@ from __future__ import annotations
 import asyncio
 import copy
 from dataclasses import dataclass
+import sys
 import time
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 import anyio
 import httpcore
@@ -315,6 +317,60 @@ class _SyncBackend(httpcore.NetworkBackend):
             self.runner.close()
 
 
+# bounded_transport reaches into private pool, backend and cancel-scope
+# internals of exactly these releases. pyproject.toml pins each one to the same
+# version, so any install built from this release's dependency set is
+# qualified; tests/ares_runtime/test_qualified_transport_backend.py holds the
+# two in lockstep. A mismatch means the environment did not come from that set.
+QUALIFIED_TRANSPORT_BACKEND: Mapping[str, str] = MappingProxyType({
+    "httpx": "0.28.1",
+    "httpcore": "1.0.9",
+    "anyio": "4.12.1",
+})
+QUALIFIED_TRANSPORT_PLATFORM = "linux"
+
+
+def _imported_version(package: str) -> str:
+    """Version of the code this interpreter actually imports for ``package``.
+
+    A module's own ``__version__`` wins over distribution metadata, because a
+    shadowing copy on sys.path can disagree with the installed record. anyio
+    publishes no ``__version__``, so it falls back to metadata.
+    """
+    import importlib
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        module = importlib.import_module(package)
+    except ImportError:
+        return "missing"
+    imported = getattr(module, "__version__", None)
+    if isinstance(imported, str):
+        return imported
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return "missing"
+
+
+def transport_backend_mismatches() -> tuple[str, ...]:
+    """Why this interpreter cannot run a leased transport; empty when qualified.
+
+    Callable from a plain interpreter, so ``ares doctor`` can ask the selected
+    runtime before any governed call is refused.
+    """
+    problems = []
+    for package, qualified in QUALIFIED_TRANSPORT_BACKEND.items():
+        installed = _imported_version(package)
+        if installed != qualified:
+            problems.append(f"{package} {installed} (qualified {qualified})")
+    if sys.platform != QUALIFIED_TRANSPORT_PLATFORM:
+        problems.append(
+            f"platform {sys.platform} (qualified {QUALIFIED_TRANSPORT_PLATFORM})"
+        )
+    return tuple(problems)
+
+
 def bounded_transport(
     inner: Any, budget: SendBudget, *, asynchronous: bool = False
 ) -> tuple[Any, Any]:
@@ -324,17 +380,11 @@ def bounded_transport(
     HTTP settings. Custom transports/backends must supply their own admission
     contract; their behavior cannot be inferred from a duck-typed attribute.
     """
-    from importlib.metadata import version
-    import sys
-
-    if (
-        httpx.__version__ != "0.28.1"
-        or httpcore.__version__ != "1.0.9"
-        or version("anyio") != "4.12.1"
-        or sys.platform != "linux"
-    ):
+    mismatches = transport_backend_mismatches()
+    if mismatches:
         raise EgressDispatchDenied(
-            "UNSUPPORTED_TRANSPORT", "network backend version/platform is not qualified"
+            "UNSUPPORTED_TRANSPORT",
+            "network backend version/platform is not qualified: " + "; ".join(mismatches),
         )
     expected = httpx.AsyncHTTPTransport if asynchronous else httpx.HTTPTransport
     if type(inner) is not expected or not hasattr(inner, "_pool"):

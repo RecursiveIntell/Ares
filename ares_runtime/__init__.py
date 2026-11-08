@@ -1,8 +1,7 @@
-"""Canonical installed-runtime contracts for Ares releases.
+"""Runtime image and materialization contracts for Ares releases.
 
-This package deliberately owns installation and activation semantics, while
-``hermes_cli.ares_candidate_store`` continues to own candidate custody and
-authorization.
+``ares_runtime.local_runtime`` owns installed-runtime selection and lifecycle;
+``hermes_cli.ares_candidate_store`` owns candidate custody and authorization.
 
 Public exports load on demand so SessionDB and tool dispatch do not import
 platform-specific installation/key machinery merely by importing this package.
@@ -12,21 +11,11 @@ from importlib import import_module
 
 _EXPORT_MODULES = {
     'ACTIVATION_GRANT_SCHEMA': '.contracts',
-    'INSTALLED_RUNTIME_POINTER_SCHEMA': '.contracts',
-    'RUNTIME_IDENTITY_SCHEMA': '.contracts',
     'ActivationGrant': '.contracts',
-    'InstalledRuntimePointer': '.contracts',
-    'ReleaseReference': '.contracts',
-    'RuntimeIdentity': '.contracts',
     'AresRuntimeError': '.errors',
     'AresRuntimeLayout': '.layout',
     'MaterializedRelease': '.materializer',
     'materialize_candidate_release': '.materializer',
-    'ActivationResult': '.activation',
-    'ActivationState': '.activation',
-    'AresReleaseActivator': '.activation',
-    'AresRuntimeResolver': '.resolver',
-    'ResolvedRuntime': '.resolver',
     'RELEASE_MANIFEST_SCHEMA': '.image',
     'RuntimeImage': '.image',
     'stage_runtime_image': '.image',
@@ -64,6 +53,7 @@ _EXPORT_MODULES = {
     'replay_mutations': '.collaboration',
     'specialist_descriptor_ref': '.collaboration',
     'validate_specialist_descriptor_set': '.collaboration',
+    'decide_specialist_nonactivation': '.specialist_routing',
     'MANAGED_MODEL_CALL_KINDS': '.governed_context',
     'GovernedContextMaterializer': '.governed_context',
     'ManagedCallKind': '.governed_context',
