@@ -144,13 +144,21 @@ async def test_gateway_loop_goal_note_after_explicit_retry_of_slow_db_init(tmp_p
         from hermes_cli.goals import GoalManager
 
         manager = GoalManager(session_id="sid-gateway-loop")
-        with pytest.raises(RuntimeError, match="storage unavailable"):
+        with pytest.raises(goals.GoalPersistenceError) as excinfo:
             manager.set("finish the migration")
+        # Typed honesty contract: the cause, not a message substring, is the
+        # stable signal surfaces key on.
+        assert excinfo.value.cause == goals.GoalPersistenceCause.UNAVAILABLE
         assert manager.state is None
 
         db = await asyncio.to_thread(goals._get_session_db)
         assert db is not None
-        assert goals.load_goal("sid-gateway-loop") is None
+        # Deferral contract (d50d8a52): the refused write was journaled, not
+        # dropped, so the per-surface "will flush automatically" message is
+        # true. First healthy bootstrap flushes it and drains the buffer.
+        flushed = goals.load_goal("sid-gateway-loop")
+        assert flushed is not None
+        assert flushed.goal == "finish the migration"
         assert not goals._MEMORY_DEFERRED_GOAL_WRITES
         manager.set("finish the migration")
 

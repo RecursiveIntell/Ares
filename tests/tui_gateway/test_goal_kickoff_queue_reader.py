@@ -37,7 +37,7 @@ def _make_obj(*, shim: bool, mgr):
 def test_set_kickoff_uses_shim():
     mgr = SimpleNamespace(session_id="sess", set=lambda text, contract=None: _state(text))
     obj, calls = _make_obj(shim=True, mgr=mgr)
-    mixin.CLICommandsMixin._handle_goal_command(obj, "ship the fix")
+    mixin.CLICommandsMixin._handle_goal_command(obj, "/goal ship the fix")
     assert calls == [("ship the fix", {"source": "goal_continuation"})]
 
 
@@ -45,7 +45,7 @@ def test_set_kickoff_falls_back_to_raw_queue():
     mgr = SimpleNamespace(session_id="sess", set=lambda text, contract=None: _state(text))
     obj, calls = _make_obj(shim=False, mgr=mgr)
     obj._pending_input.put = lambda text: calls.append((text, {}))
-    mixin.CLICommandsMixin._handle_goal_command(obj, "ship the fix")
+    mixin.CLICommandsMixin._handle_goal_command(obj, "/goal ship the fix")
     assert calls == [("ship the fix", {})]
 
 
