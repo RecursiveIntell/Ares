@@ -28,8 +28,8 @@ def _disable_automatic_title_provider(monkeypatch):
     )
 
 
-@pytest.fixture
-def live_turn(agent, tmp_path, endpoint, monkeypatch):
+@pytest.fixture(params=[False, True], ids=['streaming', 'nonstreaming'])
+def live_turn(agent, tmp_path, endpoint, monkeypatch, request):
     from ares_runtime import local_runtime
 
     url, bodies, statuses = endpoint
@@ -48,7 +48,7 @@ def live_turn(agent, tmp_path, endpoint, monkeypatch):
     agent.context_compressor.context_length = 256_000
     agent.context_compressor.threshold_tokens = 128_000
     agent.max_iterations = 1
-    agent._disable_streaming = True
+    agent._disable_streaming = request.param
     agent.api_key = "local-disposable-test-key"
     agent.client = client(url)
     monkeypatch.setattr(
@@ -104,6 +104,16 @@ def test_one_real_turn_settles_one_execution_record(live_turn):
     assert value["governor_mode"] == "enforce"
     assert value["governor_qualified"] is True
     assert value["dispatch_intent_refs"]
+    if not agent._disable_streaming:
+        assert value["response_digest"] is None
+        assert len(value["receipt_refs"]) == 1
+        receipt = json.loads(db.get_meta(value["receipt_refs"][0]))
+        assert receipt["schema"] == "ares.sdk-stream-completion/v1"
+        assert receipt["completion_evidence"] == "native_openai_sdk_stream_exhausted"
+        assert receipt["response_complete"] is False
+        assert receipt["dispatch_intent_ref"] in value["dispatch_intent_refs"]
+        with SessionDB(db_path=db.db_path) as reopened:
+            assert reopened.get_meta(value["receipt_refs"][0]) == db.get_meta(value["receipt_refs"][0])
 
     # The captured body must be the body the record's wire digest describes.
     import hashlib
@@ -118,6 +128,9 @@ def test_one_real_turn_settles_one_execution_record(live_turn):
     assert (
         materialization["context"]["request_digest"] == value["logical_request_digest"]
     )
+    canonical_body = json.dumps(json.loads(bodies[0]), ensure_ascii=False,
+                                sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    assert value["logical_request_digest"] == "sha256:" + hashlib.sha256(canonical_body).hexdigest()
 
 
 def test_golden_path_passes_the_independent_oracle(live_turn, tmp_path):

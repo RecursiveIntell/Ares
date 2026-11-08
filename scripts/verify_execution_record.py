@@ -18,6 +18,7 @@ import argparse
 import base64
 import hashlib
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -133,6 +134,31 @@ def verify_record(
             "MATERIALIZATION_CALL_REF_MISMATCH",
         )
 
+    for ref in record.get("receipt_refs", []):
+        if not ref.startswith("execution-sdk-completion:"):
+            continue
+        _require(ref in meta, "SDK_COMPLETION_RECEIPT_MISSING")
+        receipt = json.loads(meta[ref])
+        _require(set(receipt) == {
+            "schema", "execution_id", "dispatch_intent_ref", "completion_evidence",
+            "response_complete", "observed_prefix_digest", "observed_prefix_bytes", "http_status",
+        }, "SDK_COMPLETION_SCHEMA_MISMATCH")
+        _require(ref == "execution-sdk-completion:" + hashlib.sha256(canonical_bytes(receipt)).hexdigest(),
+                 "SDK_COMPLETION_DIGEST_MISMATCH")
+        _require(receipt["schema"] == "ares.sdk-stream-completion/v1"
+                 and receipt["completion_evidence"] == "native_openai_sdk_stream_exhausted"
+                 and receipt["response_complete"] is False,
+                 "SDK_COMPLETION_SCHEMA_MISMATCH")
+        _require(receipt["execution_id"] == execution_id
+                 and receipt["dispatch_intent_ref"] in record.get("dispatch_intent_refs", [])
+                 and receipt["http_status"] == record.get("http_status"), "SDK_COMPLETION_BINDING_MISMATCH")
+        _require(state == "settled" and record.get("terminal_outcome") == "ok"
+                 and record.get("response_digest") is None, "SDK_COMPLETION_EOF_OVERCLAIM")
+        _require(type(receipt["observed_prefix_bytes"]) is int and receipt["observed_prefix_bytes"] > 0
+                 and isinstance(receipt["observed_prefix_digest"], str)
+                 and re.fullmatch(r"sha256:[0-9a-f]{64}", receipt["observed_prefix_digest"]) is not None,
+                 "SDK_COMPLETION_PREFIX_INVALID")
+
     return record
 
 
@@ -195,17 +221,16 @@ def verify_db(db_path: Path, capture_path: Path | None) -> dict[str, Any]:
             execution_id = key[len("execution:") :]
             try:
                 record = json.loads(raw)
+                refs = [record.get("admission_ref", ""), record.get("materialization_ref", ""),
+                        *record.get("receipt_refs", [])]
                 verify_record(
                     execution_id,
                     record,
                     {
                         row["key"]: row["value"]
                         for row in conn.execute(
-                            "SELECT key,value FROM state_meta WHERE key IN (?,?)",
-                            (
-                                record.get("admission_ref", ""),
-                                record.get("materialization_ref", ""),
-                            ),
+                            "SELECT key,value FROM state_meta WHERE key IN (" + ",".join("?" for _ in refs) + ")",
+                            refs,
                         )
                     },
                 )
