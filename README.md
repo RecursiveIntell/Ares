@@ -439,8 +439,8 @@ project's `requires-python` constraint is the source of truth for admissible
 future minor versions. A failed repair leaves the existing runtime in place
 when possible and reports that the next update should retry.
 
-The current project admission range is `>=3.11,<3.15` (Python 3.11 through
-3.14). This is a packaging/source contract, not proof that every provider,
+The current project admission range is `>=3.14,<3.15` (Python 3.14).
+This is a packaging/source contract, not proof that every provider,
 native extension, Desktop build, or optional service works on every minor and
 every operating system.
 

@@ -105,3 +105,16 @@ def test_boolean_only_disable_does_not_widen_responses_protocol():
     assert denial is not None, repr(error)
     assert denial.code == "EXPLICIT_REASONING_MISMATCH"
     assert sent == []
+
+
+def test_responses_top_level_effort_is_denied_before_physical_send():
+    _, sent, error = _send(
+        {"reasoning_effort": "high"},
+        expected={"enabled": True, "effort": "high"},
+        responses=True,
+    )
+    assert error is not None
+    denial = _typed_denial(error)
+    assert denial is not None, repr(error)
+    assert denial.code == "EXPLICIT_REASONING_UNQUALIFIED"
+    assert sent == []
