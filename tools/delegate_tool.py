@@ -2513,6 +2513,7 @@ def _run_single_child(
     owner_session_id: Optional[str] = None,
     owner_transport: Any = None,
     owner_session_record: Any = None,
+    window_not_after: Any = None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -2876,12 +2877,23 @@ def _run_single_child(
                 )
 
         _child_context = contextvars.copy_context()
+        # Task 2.2: compute the effective bound BEFORE submitting the child. A closed grant
+        # window is refused here, so the child never starts.
+        from agent.delegated_expiry import child_effective_deadline as _child_deadline
+        from datetime import datetime as _dt, timezone as _tz
+        _now = _dt.now(_tz.utc)
+        _deadline = _child_deadline(
+            now=_now,
+            own_timeout_seconds=child_timeout,
+            window_not_after=window_not_after,
+        )
+        _effective_timeout = (_deadline - _now).total_seconds()
         _child_future = _timeout_executor.submit(
             _child_context.run,
             _run_with_thread_capture,
         )
         try:
-            result = _child_future.result(timeout=child_timeout)
+            result = _child_future.result(timeout=_effective_timeout)
         except Exception as _timeout_exc:
             # No consumer boundary remains once this owner stops waiting for
             # the child. Close acceptance before any completion callback and
@@ -3574,9 +3586,10 @@ def _run_child_lifecycle(
     goal: str,
     child=None,
     parent_agent=None,
+    window_not_after=None,
 ) -> Dict[str, Any]:
     """Run one child and apply the same host lifecycle used by delegate_task."""
-    result = _run_single_child(task_index, goal, child, parent_agent)
+    result = _run_single_child(task_index, goal, child, parent_agent, window_not_after=window_not_after)
     result.setdefault("task_index", task_index)
     task = {"goal": goal}
     _finalize_child_results(
@@ -3689,6 +3702,7 @@ def delegate_task(
     message: Optional[str] = None,
     parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    window_not_after=None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -4000,6 +4014,7 @@ def delegate_task(
                 _t["goal"],
                 child,
                 parent_agent,
+                window_not_after=window_not_after,
                 owner_session_id=_origin_ui_session_id or None,
                 owner_transport=_origin_owner_transport,
                 owner_session_record=_origin_owner_session_record,
@@ -5063,6 +5078,7 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
+        window_not_after=kw.get("window_not_after"),
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
