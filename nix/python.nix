@@ -42,6 +42,8 @@ let
 
   # These locked sdists need setuptools in the isolated build environment.
   # Nix CI's Python 3.14 python-olm build could not import setuptools.
+  # Resolve backend closures on the build host, including transitive Python
+  # dependencies such as cffi -> pycparser; direct derivations omit them.
   buildSystemOverrides =
     final: prev:
     builtins.mapAttrs
@@ -50,8 +52,10 @@ let
         prev.${name}.overrideAttrs (old: {
           nativeBuildInputs =
             (old.nativeBuildInputs or [ ])
-            ++ [ final.setuptools ]
-            ++ lib.optionals (name == "python-olm") [ final.cffi ];
+            ++ final.resolveBuildSystem (
+              { setuptools = [ ]; }
+              // lib.optionalAttrs (name == "python-olm") { cffi = [ ]; }
+            );
         })
       )
       (
