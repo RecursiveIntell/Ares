@@ -2145,6 +2145,29 @@ def _build_child_agent(
     except Exception:
         logger.debug("subagent_start hook invocation failed", exc_info=True)
 
+    # Task 2.2 audit record: the child's attenuated grant (tools, budget, window). This is
+    # evidence only. Building it must never stop a child; the enforcement points (budget
+    # debit, window bound, effect boundary) are independent of this record.
+    try:
+        _parent_budget = getattr(parent_agent, "iteration_budget", None)
+        _parent_remaining = _parent_budget.remaining if _parent_budget is not None else 0
+        # The canonical authority scope is a single string per field, so it cannot express a
+        # toolset. The tool surface is therefore recorded as audit data, while the containment
+        # itself is enforced by delegation's existing toolset intersection. The canonical scope
+        # here carries only the child's window bound, which the record checks against itself.
+        child._grant_record = {
+            "schema": "ares.delegation.grant/v1",
+            "child_id": str(getattr(child, "session_id", "") or f"child-{task_index}"),
+            "toolsets": sorted(toolsets or []),
+            "parent_toolsets": sorted(getattr(parent_agent, "enabled_toolsets", None) or []),
+            "budget": {
+                "child_max": int(max_iterations),
+                "parent_remaining": int(_parent_remaining),
+            },
+            "window_not_after": None,
+        }
+    except Exception:
+        logger.debug("subagent: grant audit record not built", exc_info=True)
     return child
 
 
