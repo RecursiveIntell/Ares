@@ -21,7 +21,12 @@ from tools.delegate_tool import delegate_task
 
 
 def _make_mock_parent(depth=0):
+    from agent.iteration_budget import IterationBudget
+
     parent = MagicMock()
+    # A real parent always carries a real IterationBudget (agent_init). Delegation
+    # debits it, so the double must provide one instead of an auto-generated MagicMock.
+    parent.iteration_budget = IterationBudget(500)
     parent.base_url = "https://openrouter.ai/api/v1"
     parent.api_key = "test-key"
     parent.provider = "openrouter"

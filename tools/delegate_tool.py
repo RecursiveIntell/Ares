@@ -126,6 +126,23 @@ _DEFAULT_MAX_CONCURRENT_CHILDREN = 10
 # so without this flag a config of max_concurrent_children>10 spams the log on
 # every turn / agent spawn even when delegate_task is never called.
 _HIGH_CONCURRENCY_WARNED = False
+def _child_debiting_budget(parent_agent, child_max_iterations):
+    """Child budget debited from the parent's live budget (Task 2.2, debit from parent).
+
+    ``child_max_iterations`` is the same authoritative per-child cap the child is built
+    with (``effective_max_iter``, from delegation.max_iterations), not a guessed parent
+    attribute. Raises rather than falling back, so a missing parent budget cannot
+    silently restore an unbounded child.
+    """
+    from agent.delegated_budget import DebitingIterationBudget
+    from agent.iteration_budget import IterationBudget
+
+    parent_budget = getattr(parent_agent, "iteration_budget", None)
+    if not isinstance(parent_budget, IterationBudget):
+        raise RuntimeError("delegation requires a parent iteration budget; refusing unbounded child")
+    return DebitingIterationBudget(max_total=int(child_max_iterations), parent=parent_budget)
+
+
 MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected unless max_spawn_depth raised.
 # Configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
 # stays as the default fallback and is still the symbol tests import.
@@ -2033,7 +2050,10 @@ def _build_child_agent(
                 ),
                 openrouter_min_coding_score=child_openrouter_min_coding_score,
                 tool_progress_callback=child_progress_cb,
-                iteration_budget=None,  # fresh budget per subagent
+                # Task 2.2 (debit from parent): the child's iterations are charged against
+                # the parent's remaining budget, so parent + children cannot exceed the
+                # parent's cap. The child keeps its own per-child ceiling.
+                iteration_budget=_child_debiting_budget(parent_agent, max_iterations),
                 **child_optional_kwargs,
             )
         except BaseException:
