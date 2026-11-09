@@ -529,7 +529,7 @@ def _desktop_request(root: Path, envelope: Mapping[str, object]) -> dict[str, ob
         assert isinstance(host, str) and isinstance(port, int)
         with socket.create_connection((host, port), timeout=10) as connection:
             connection.sendall(payload)
-            response = connection.recv(MAX_RESPONSE_BYTES + 1)
+            response = _read_framed_reply(connection)
     except OSError as exc:
         raise DispatchError("DESKTOP_DISPATCH_UNAVAILABLE") from exc
     if len(response) > MAX_RESPONSE_BYTES:
@@ -538,6 +538,24 @@ def _desktop_request(root: Path, envelope: Mapping[str, object]) -> dict[str, ob
     if "token" in result:
         raise DispatchError("DESKTOP_RESPONSE_INVALID")
     return result
+
+
+def _read_framed_reply(connection) -> bytes:
+    """Read one newline-terminated reply, reassembling split TCP reads (audit L6a).
+
+    A single recv() may return only a prefix of the reply. Read until the
+    terminating newline, EOF, or the bound is exceeded; never more than
+    MAX_RESPONSE_BYTES + 1 bytes are buffered.
+    """
+    buffer = bytearray()
+    while len(buffer) <= MAX_RESPONSE_BYTES:
+        chunk = connection.recv(MAX_RESPONSE_BYTES + 1 - len(buffer))
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        if b"\n" in chunk:
+            break
+    return bytes(buffer)
 
 
 def _parse_capability_bindings(
