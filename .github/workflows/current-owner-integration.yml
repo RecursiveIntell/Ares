@@ -77,7 +77,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          uv sync --frozen --extra dev --extra anthropic --python 3.13
+          uv sync --frozen --extra dev --extra anthropic --python 3.14
           test -x tests/owner_integration/semantic_memory_revocation_owner
           HERMES_PYTHON="$PWD/.venv/bin/python" HERMES_TEST_WORKERS=1 \
             HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \

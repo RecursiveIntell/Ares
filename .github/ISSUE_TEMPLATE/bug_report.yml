@@ -116,7 +116,7 @@ body:
     attributes:
       label: Python Version
       description: Output of `python --version`
-      placeholder: "3.11.9"
+      placeholder: "3.14.8"
 
   - type: input
     id: hermes-version

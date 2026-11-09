@@ -10,7 +10,7 @@
 #
 # This script:
 # 1. Detects desktop/server vs Android/Termux setup path
-# 2. Creates a Python 3.11 virtual environment
+# 2. Creates a Python 3.14 virtual environment
 # 3. Installs the appropriate dependency set for the platform
 # 4. Creates .env from template (if not exists)
 # 5. Symlinks the 'hermes' CLI command into a user-facing bin dir
@@ -33,7 +33,7 @@ cd "$SCRIPT_DIR"
 # wrong user's home directory when running under sudo -u <user>.  See #21269.
 export UV_NO_CONFIG=1
 
-PYTHON_VERSION="3.11"
+PYTHON_VERSION="3.14"
 
 is_termux() {
     [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"com.termux/files/usr"* ]]
@@ -135,11 +135,11 @@ echo -e "${CYAN}→${NC} Checking Python $PYTHON_VERSION..."
 if is_termux; then
     if command -v python >/dev/null 2>&1; then
         PYTHON_PATH="$(command -v python)"
-        if "$PYTHON_PATH" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+        if "$PYTHON_PATH" -c 'import sys; raise SystemExit(0 if (3, 14) <= sys.version_info[:2] < (3, 15) else 1)' 2>/dev/null; then
             PYTHON_FOUND_VERSION=$($PYTHON_PATH --version 2>/dev/null)
             echo -e "${GREEN}✓${NC} $PYTHON_FOUND_VERSION found"
         else
-            echo -e "${RED}✗${NC} Termux Python must be 3.11+"
+            echo -e "${RED}✗${NC} Termux Python must be >=3.14,<3.15"
             echo "    Run: pkg install python"
             exit 1
         fi

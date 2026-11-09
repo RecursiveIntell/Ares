@@ -228,6 +228,12 @@ def validate_explicit_reasoning(expected: dict, controls: dict | None, *, protoc
         if protocol == "openai.responses":
             deny("EXPLICIT_REASONING_UNQUALIFIED")
         emitted.append(controls["reasoning_effort"])
+    # OpenRouter's native Chat disable form has no symbolic effort. Accept
+    # only an explicit boolean false with no conflicting effort fields; this
+    # does not introduce that representation into the Responses protocol.
+    if (not emitted and not enabled and protocol == "openai.chat_completions"
+            and reasoning.get("enabled") is False):
+        return
     if not emitted or any(type(value) is not str or value != effort for value in emitted):
         deny("EXPLICIT_REASONING_MISMATCH")
 

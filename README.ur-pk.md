@@ -234,7 +234,7 @@ cd hermes-agent
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv .venv --python 3.11
+uv venv .venv --python 3.14
 source .venv/bin/activate
 uv pip install -e ".[all,dev]"
 scripts/run_tests.sh
