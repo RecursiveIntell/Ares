@@ -28,6 +28,7 @@ from hermes_cli.curses_ui import MenuNavigationEvent, MenuNavigationStart
 from hermes_cli.nous_subscription import get_nous_subscription_features
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 from hermes_constants import get_optional_skills_dir
+from hermes_cli.config_defaults import DEFAULT_TERMINAL_IMAGE, DEFAULT_SINGULARITY_IMAGE
 
 logger = logging.getLogger(__name__)
 
@@ -1486,7 +1487,7 @@ def setup_terminal_backend(config: dict):
 
         # Image and resource limits use defaults; tune via `hermes setup terminal`.
         config["terminal"].setdefault(
-            "docker_image", "nikolaik/python-nodejs:python3.11-nodejs20"
+            "docker_image", DEFAULT_TERMINAL_IMAGE
         )
         print()
         print_info("Docker sandboxes can be protected with the egress credential firewall.")
@@ -1527,7 +1528,7 @@ def setup_terminal_backend(config: dict):
         # Image and resource limits use defaults; tune via `hermes setup terminal`.
         config["terminal"].setdefault(
             "singularity_image",
-            "docker://nikolaik/python-nodejs:python3.11-nodejs20",
+            DEFAULT_SINGULARITY_IMAGE,
         )
 
     elif selected_backend == "modal":
@@ -1647,7 +1648,7 @@ def setup_terminal_backend(config: dict):
 
         # Image and resource limits use defaults; tune via `hermes setup terminal`.
         config["terminal"].setdefault(
-            "daytona_image", "nikolaik/python-nodejs:python3.11-nodejs20"
+            "daytona_image", DEFAULT_TERMINAL_IMAGE
         )
 
     elif selected_backend == "vercel_sandbox":
