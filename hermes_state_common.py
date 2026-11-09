@@ -8,7 +8,6 @@ hermes_state re-imports every name here for backward compatibility.
 
 import contextlib
 import logging
-import os
 import sys
 import time
 from typing import Any
