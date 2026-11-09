@@ -70,7 +70,7 @@ jobs:
   # protected publish job after these tests pass.
   build:
     needs: [detect]
-    if: github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.build == 'true'
+    if: (github.repository == 'NousResearch/hermes-agent' || github.repository == 'RecursiveIntell/Ares') && needs.detect.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:

@@ -40,15 +40,18 @@ let
       };
     };
 
-  # Legacy alibabacloud packages ship only sdists with setup.py/setup.cfg
-  # and no pyproject.toml, so setuptools isn't declared as a build dep.
+  # These locked sdists need setuptools in the isolated build environment.
+  # Nix CI's Python 3.14 python-olm build could not import setuptools.
   buildSystemOverrides =
     final: prev:
     builtins.mapAttrs
       (
         name: _:
         prev.${name}.overrideAttrs (old: {
-          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ final.setuptools ];
+          nativeBuildInputs =
+            (old.nativeBuildInputs or [ ])
+            ++ [ final.setuptools ]
+            ++ lib.optionals (name == "python-olm") [ final.cffi ];
         })
       )
       (
@@ -58,6 +61,7 @@ let
           "alibabacloud-gateway-dingtalk"
           "alibabacloud-gateway-spi"
           "alibabacloud-tea"
+          "python-olm"
         ] (_: null)
       );
 
