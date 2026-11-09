@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import hashlib
-import hmac
 import json
 import os
 import stat
