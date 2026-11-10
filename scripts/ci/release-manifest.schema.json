@@ -41,7 +41,7 @@
       "additionalProperties": false,
       "required": ["python_runtime", "manifest_python", "rust"],
       "properties": {
-        "python_runtime": {"const": "3.13"},
+        "python_runtime": {"const": "3.14"},
         "manifest_python": {"const": "3.14"},
         "rust": {"const": "1.99.1"}
       }

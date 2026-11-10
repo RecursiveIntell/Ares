@@ -31,7 +31,7 @@
     }
   },
   "toolchains": {
-    "python_runtime": "3.13",
+    "python_runtime": "3.14",
     "manifest_python": "3.14",
     "rust": "1.99.1"
   }

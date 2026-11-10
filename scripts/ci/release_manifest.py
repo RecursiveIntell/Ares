@@ -28,7 +28,7 @@ SUBMODULES = {
         "url": "https://github.com/RecursiveIntell/semantic-memory-mcp.git",
     }
 }
-TOOLCHAINS = {"python_runtime": "3.13", "manifest_python": "3.14", "rust": "1.99.1"}
+TOOLCHAINS = {"python_runtime": "3.14", "manifest_python": "3.14", "rust": "1.99.1"}
 DEFAULT_MANIFEST = Path(__file__).with_name("release-manifest.json")
 
 

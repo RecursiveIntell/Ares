@@ -216,14 +216,10 @@ curl -fsSL https://astral.sh/uv/install.sh -o "$TEMP_DIR/uv-install.sh"
 UV_NO_MODIFY_PATH=1 sh "$TEMP_DIR/uv-install.sh"
 command -v uv >/dev/null 2>&1 || die "uv provisioning failed."
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
-uv python install 3.13
-PYTHON="$(uv python find 3.13)"
-if [[ "$EXTRAS" == true ]]; then
-  # The release-manifest resolver is agent-authored Python 3.14 code. Keep the
-  # Ares runtime venv on its declared 3.13 line, but run the resolver on 3.14.
-  uv python install 3.14
-  RELEASE_MANIFEST_PYTHON="$(uv python find 3.14)"
-fi
+uv python install 3.14
+PYTHON="$(uv python find 3.14)"
+# The release-manifest resolver runs on the same qualified 3.14 interpreter.
+RELEASE_MANIFEST_PYTHON="$PYTHON"
 export UV_PYTHON="$PYTHON"
 ARES_HOME="$("$PYTHON" -c 'import os,sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$ARES_HOME")"
 ARES_BIN_DIR="$("$PYTHON" -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$ARES_BIN_DIR")"
@@ -265,7 +261,7 @@ if [[ "$EXTRAS" == true ]]; then
   RELEASE_MANIFEST_SHA256="$("$RELEASE_MANIFEST_PYTHON" "$RELEASE_MANIFEST_HELPER" --manifest "$RELEASE_MANIFEST_PATH" validate)" || die "Release manifest validation failed."
   ARES_PYTHON_RUNTIME="$("$RELEASE_MANIFEST_PYTHON" "$RELEASE_MANIFEST_HELPER" --manifest "$RELEASE_MANIFEST_PATH" toolchain python_runtime)"
   ARES_MANIFEST_PYTHON="$("$RELEASE_MANIFEST_PYTHON" "$RELEASE_MANIFEST_HELPER" --manifest "$RELEASE_MANIFEST_PATH" toolchain manifest_python)"
-  [[ "$ARES_PYTHON_RUNTIME" == "3.13" ]] || die "Manifest Python runtime does not match the installed Ares runtime contract."
+  [[ "$ARES_PYTHON_RUNTIME" == "3.14" ]] || die "Manifest Python runtime does not match the installed Ares runtime contract."
   [[ "$ARES_MANIFEST_PYTHON" == "3.14" ]] || die "Manifest resolver requires Python 3.14."
   ARES_RELEASE_SOURCE_SHA="$(git -C "$ARES_SOURCE" rev-parse HEAD)"
   export RELEASE_MANIFEST_PATH RELEASE_MANIFEST_HELPER RELEASE_MANIFEST_SHA256 ARES_RELEASE_SOURCE_SHA RELEASE_MANIFEST_PYTHON ARES_PYTHON_RUNTIME ARES_MANIFEST_PYTHON
@@ -301,7 +297,7 @@ if Path(owner[0]).resolve() != Path(os.environ['ARES_HOME']).resolve():
 PY
 fi
 STEP=python
-(cd "$ARES_SOURCE" && uv sync --locked --extra all --no-dev --python 3.13)
+(cd "$ARES_SOURCE" && uv sync --locked --extra all --no-dev --python 3.14)
 BOOTSTRAP_PYTHON="$ARES_SOURCE/.venv/bin/python"
 
 if [[ "$EXTRAS" == true ]]; then

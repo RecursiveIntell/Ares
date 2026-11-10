@@ -49,6 +49,11 @@ def _is_glm_5_2_model(model: str | None) -> bool:
     return any(token in m for token in ("glm-5.2", "glm-5-2", "glm-5p2"))
 
 
+def _is_glm_5_3_flash_model(model: str | None) -> bool:
+    """Match only the Go-catalog GLM-5.3 Flash reasoning profile target."""
+    return _flat_model_name(model) == "glm-5.3-flash"
+
+
 class OpenCodeGoProfile(ProviderProfile):
     """OpenCode Go - model-specific reasoning controls."""
 
@@ -72,6 +77,32 @@ class OpenCodeGoProfile(ProviderProfile):
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
+
+        if _is_glm_5_3_flash_model(model):
+            # OpenCode Go's catalog declares GLM-5.3 Flash on the graded
+            # low/high/max reasoning_effort scale. Use its route-specific
+            # canonical vocabulary and keep unset/disabled requests at the relay default.
+            if not isinstance(reasoning_config, dict):
+                return extra_body, top_level
+            if reasoning_config.get("enabled") is False:
+                return extra_body, top_level
+            effort = (reasoning_config.get("effort") or "").strip().lower()
+            if not effort or effort == "none":
+                return extra_body, top_level
+            from agent.reasoning_effort import (
+                OPENCODE_GO_GLM53_FLASH_EFFORTS,
+                OPENCODE_GO_GLM53_FLASH_OVERRIDES,
+                clamp_effort,
+            )
+
+            clamped = clamp_effort(
+                effort,
+                OPENCODE_GO_GLM53_FLASH_EFFORTS,
+                OPENCODE_GO_GLM53_FLASH_OVERRIDES,
+            )
+            if clamped in OPENCODE_GO_GLM53_FLASH_EFFORTS:
+                top_level["reasoning_effort"] = clamped
+            return extra_body, top_level
 
         if _is_glm_5_2_model(model):
             # GLM-5.2 on OpenCode Go uses its native OpenAI-compatible
