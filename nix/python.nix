@@ -1,6 +1,6 @@
 # nix/python.nix — uv2nix virtual environment builder
 {
-  python312,
+  python314,
   lib,
   callPackage,
   uv2nix,
@@ -40,15 +40,22 @@ let
       };
     };
 
-  # Legacy alibabacloud packages ship only sdists with setup.py/setup.cfg
-  # and no pyproject.toml, so setuptools isn't declared as a build dep.
+  # These locked sdists need setuptools in the isolated build environment.
+  # Nix CI's Python 3.14 python-olm build could not import setuptools.
+  # Resolve backend closures on the build host, including transitive Python
+  # dependencies such as cffi -> pycparser; direct derivations omit them.
   buildSystemOverrides =
     final: prev:
     builtins.mapAttrs
       (
         name: _:
         prev.${name}.overrideAttrs (old: {
-          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ final.setuptools ];
+          nativeBuildInputs =
+            (old.nativeBuildInputs or [ ])
+            ++ final.resolveBuildSystem (
+              { setuptools = [ ]; }
+              // lib.optionalAttrs (name == "python-olm") { cffi = [ ]; }
+            );
         })
       )
       (
@@ -58,6 +65,7 @@ let
           "alibabacloud-gateway-dingtalk"
           "alibabacloud-gateway-spi"
           "alibabacloud-tea"
+          "python-olm"
         ] (_: null)
       );
 
@@ -65,30 +73,30 @@ let
     final: _prev:
     if isAarch64Darwin then
       {
-        numpy = mkPrebuiltOverride final python312.pkgs.numpy { };
+        numpy = mkPrebuiltOverride final python314.pkgs.numpy { };
 
-        pyarrow = mkPrebuiltOverride final python312.pkgs.pyarrow { };
+        pyarrow = mkPrebuiltOverride final python314.pkgs.pyarrow { };
 
-        av = mkPrebuiltOverride final python312.pkgs.av { };
+        av = mkPrebuiltOverride final python314.pkgs.av { };
 
-        humanfriendly = mkPrebuiltOverride final python312.pkgs.humanfriendly { };
+        humanfriendly = mkPrebuiltOverride final python314.pkgs.humanfriendly { };
 
-        coloredlogs = mkPrebuiltOverride final python312.pkgs.coloredlogs {
+        coloredlogs = mkPrebuiltOverride final python314.pkgs.coloredlogs {
           humanfriendly = [ ];
         };
 
-        onnxruntime = mkPrebuiltOverride final python312.pkgs.onnxruntime {
+        onnxruntime = mkPrebuiltOverride final python314.pkgs.onnxruntime {
           coloredlogs = [ ];
           numpy = [ ];
           packaging = [ ];
         };
 
-        ctranslate2 = mkPrebuiltOverride final python312.pkgs.ctranslate2 {
+        ctranslate2 = mkPrebuiltOverride final python314.pkgs.ctranslate2 {
           numpy = [ ];
           pyyaml = [ ];
         };
 
-        faster-whisper = mkPrebuiltOverride final python312.pkgs.faster-whisper {
+        faster-whisper = mkPrebuiltOverride final python314.pkgs.faster-whisper {
           av = [ ];
           ctranslate2 = [ ];
           huggingface-hub = [ ];
@@ -102,7 +110,7 @@ let
 
   pythonSet =
     (callPackage pyproject-nix.build.packages {
-      python = python312;
+      python = python314;
     }).overrideScope
       (
         lib.composeManyExtensions [

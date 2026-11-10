@@ -56,7 +56,7 @@ else
     INSTALL_DIR=""
     INSTALL_DIR_EXPLICIT=false
 fi
-PYTHON_VERSION="3.11"
+PYTHON_VERSION="3.14"
 NODE_VERSION="26"
 
 # FHS-style root install layout (set by resolve_install_layout when applicable):
@@ -645,7 +645,7 @@ check_python() {
         log_info "Checking Termux Python..."
         if command -v python >/dev/null 2>&1; then
             PYTHON_PATH="$(command -v python)"
-            if "$PYTHON_PATH" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+            if "$PYTHON_PATH" -c 'import sys; raise SystemExit(0 if (3, 14) <= sys.version_info[:2] < (3, 15) else 1)' 2>/dev/null; then
                 PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
                 log_success "Python found: $PYTHON_FOUND_VERSION"
                 return 0

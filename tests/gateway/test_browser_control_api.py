@@ -53,6 +53,20 @@ def _ticket_protocol(ticket):
     return f"hermes-browser-control-ticket.{ticket}"
 
 
+async def _wait_for_controller_ready(ws, nonce):
+    await ws.send_json(
+        {
+            "method": "browser.controller.heartbeat",
+            "params": {"nonce": nonce},
+        }
+    )
+    ready = await ws.receive_json(timeout=2.0)
+    assert ready == {
+        "method": "browser.controller.heartbeat",
+        "params": {"nonce": nonce, "ok": True},
+    }
+
+
 def _adapter(*, key=API_KEY):
     adapter = APIServerAdapter(
         PlatformConfig(enabled=True, extra={"key": key} if key else {})
@@ -373,6 +387,7 @@ async def test_controller_ws_rechecks_feature_flag_before_consuming_ticket(monke
             "/v1/browser-control/ws",
             protocols=[CONTROL_PROTOCOL, _ticket_protocol(ticket)],
         )
+        await _wait_for_controller_ready(ws, "heartbeat-valid-ticket")
         await ws.close()
 
 
@@ -497,6 +512,7 @@ async def test_real_browser_action_routes_through_controller_without_legacy_fall
             "/v1/browser-control/ws",
             protocols=[CONTROL_PROTOCOL, _ticket_protocol(registration["ticket"])],
         )
+        await _wait_for_controller_ready(ws, "heartbeat-real-action")
 
         legacy_calls = []
         pending = asyncio.create_task(
@@ -554,6 +570,7 @@ async def test_local_api_same_identity_reconnect_completes_command_started_on_ol
             "/v1/browser-control/ws",
             protocols=[CONTROL_PROTOCOL, _ticket_protocol(first["ticket"])],
         )
+        await _wait_for_controller_ready(first_ws, "heartbeat-reconnect-old")
 
         pending = asyncio.create_task(
             asyncio.to_thread(
@@ -584,6 +601,7 @@ async def test_local_api_same_identity_reconnect_completes_command_started_on_ol
             "/v1/browser-control/ws",
             protocols=[CONTROL_PROTOCOL, _ticket_protocol(second["ticket"])],
         )
+        await _wait_for_controller_ready(second_ws, "heartbeat-reconnect-new")
         await second_ws.send_json(
             {
                 "method": "browser.controller.result",
@@ -613,6 +631,7 @@ async def test_local_api_explicit_detach_is_hard_and_stale_socket_cannot_detach_
             "/v1/browser-control/ws",
             protocols=[CONTROL_PROTOCOL, _ticket_protocol(first["ticket"])],
         )
+        await _wait_for_controller_ready(first_ws, "heartbeat-detach-stale")
         second_response = await client.post(
             "/v1/browser-control/register",
             json=_registration_body(capabilities=["controller.noop"]),
@@ -623,6 +642,7 @@ async def test_local_api_explicit_detach_is_hard_and_stale_socket_cannot_detach_
             "/v1/browser-control/ws",
             protocols=[CONTROL_PROTOCOL, _ticket_protocol(second["ticket"])],
         )
+        await _wait_for_controller_ready(second_ws, "heartbeat-detach-current")
 
         await first_ws.send_json(
             {"method": "browser.controller.detach", "params": {}}
@@ -685,6 +705,7 @@ async def test_remote_api_uses_the_same_authenticated_noop_round_trip(monkeypatc
             "/v1/browser-control/ws",
             protocols=[CONTROL_PROTOCOL, _ticket_protocol(registration["ticket"])],
         )
+        await _wait_for_controller_ready(ws, "heartbeat-remote-api")
         scope = ControllerScope(
             principal_id=registration["scope"]["principal_id"],
             profile_id=registration["scope"]["profile_id"],

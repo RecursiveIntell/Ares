@@ -1,4 +1,4 @@
-"""Ares-owned boundary around the existing verified release extraction core."""
+"""Ares-owned boundary around verified candidate release materialization."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from .layout import AresRuntimeLayout
 
 @dataclass(frozen=True)
 class MaterializedRelease:
-    """Verified immutable release returned to the activation transaction."""
+    """Verified immutable release returned to the authorized caller."""
 
     sealed_candidate_id: str
     release_root: Path

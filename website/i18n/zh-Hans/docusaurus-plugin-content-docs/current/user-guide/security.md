@@ -326,7 +326,7 @@ _SECURITY_ARGS = [
 ```yaml
 terminal:
   backend: docker
-  docker_image: "nikolaik/python-nodejs:python3.11-nodejs20"
+  docker_image: "nikolaik/python-nodejs:python3.14-nodejs26"
   docker_forward_env: []  # 仅显式允许列表；空值可防止密钥进入容器
   container_cpu: 1        # CPU 核心数
   container_memory: 5120  # MB（默认 5GB）

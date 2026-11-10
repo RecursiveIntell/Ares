@@ -2981,10 +2981,12 @@ def try_activate_fallback(
         try:
             from hermes_cli.config import load_config
             from hermes_constants import resolve_reasoning_config
+            from ares_runtime.physical_dispatch import explicit_reasoning_override
 
-            agent.reasoning_config = resolve_reasoning_config(
+            explicit = explicit_reasoning_override(agent)
+            agent.reasoning_config = (explicit if explicit is not None else resolve_reasoning_config(
                 load_config() or {}, agent.model
-            )
+            ))
             logger.info(
                 "Fallback %s: reasoning_config resolved: %s",
                 agent.model, agent.reasoning_config,
