@@ -79,7 +79,29 @@ jobs:
           set -euo pipefail
           rustup toolchain install 1.94.0 --profile minimal --component rustfmt --component clippy
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y bubblewrap libseccomp-dev strace
+          sudo apt-get install --no-install-recommends -y curl libcap-dev libseccomp-dev meson ninja-build strace xz-utils
+      - name: Build and install pinned Bubblewrap
+        run: |
+          set -euo pipefail
+          version=0.13.1
+          archive="$RUNNER_TEMP/bubblewrap-${version}.tar.xz"
+          expected_sha256=0e85c8702248b8dd64144f594147553650cdd0e4c951690345faace79c217c4d
+          curl --fail --location --silent --show-error \
+            --retry 3 --retry-delay 2 \
+            -o "$archive" \
+            "https://github.com/containers/bubblewrap/releases/download/v${version}/bubblewrap-${version}.tar.xz"
+          printf '%s  %s\n' "$expected_sha256" "$archive" | sha256sum --check --strict
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          meson setup "$RUNNER_TEMP/bwrap-build" \
+            "$RUNNER_TEMP/bubblewrap-${version}" \
+            --prefix=/usr \
+            -Dtests=false -Dman=disabled -Dselinux=disabled \
+            -Dbash_completion=disabled -Dzsh_completion=disabled
+          meson compile -C "$RUNNER_TEMP/bwrap-build"
+          DESTDIR="$RUNNER_TEMP/bwrap-stage" meson install -C "$RUNNER_TEMP/bwrap-build"
+          sudo install -m 0755 "$RUNNER_TEMP/bwrap-stage/usr/bin/bwrap" /usr/bin/bwrap
+          test "$(bwrap --version)" = "bubblewrap ${version}"
+          sha256sum /usr/bin/bwrap
       - name: Admit Bubblewrap on the ephemeral hosted runner
         run: |
           set -euo pipefail
@@ -107,7 +129,7 @@ jobs:
         working-directory: ares
         run: |
           set -euo pipefail
-          uv sync --frozen --extra dev --extra anthropic --python 3.13
+          uv sync --frozen --extra dev --extra anthropic --python 3.14
           HERMES_TEST_CONTEXT_DAEMON_BIN="$GITHUB_WORKSPACE/recursive-agent/target/debug/ra-daemon" \
             HERMES_PYTHON="$PWD/.venv/bin/python" HERMES_TEST_WORKERS=1 HERMES_TEST_FILE_RETRIES=0 \
             scripts/run_tests.sh tests/ares_runtime/test_context_native_paired.py -- -q
@@ -126,7 +148,7 @@ jobs:
         with:
           version: '0.9.28'
       - name: Install locked test dependencies
-        run: uv sync --frozen --extra dev --extra anthropic --python 3.13
+        run: uv sync --frozen --extra dev --extra anthropic --python 3.14
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: RecursiveIntell/Libraries

@@ -1997,7 +1997,7 @@ export interface Translations {
     queueMessage: string
     steer: string
     stop: string
-      stopAgain: string
+    stopAgain: string
     send: string
     speaking: string
     transcribing: string
@@ -2040,8 +2040,8 @@ export interface Translations {
     attachments: (count: number) => string
     editingInComposer: string
     editingQueuedInComposer: string
-      queuedBehindPrompt: string
-      queuedBehindBusy: string
+    queuedBehindPrompt: string
+    queuedBehindBusy: string
     queueEdit: string
     queueSendNext: string
     queueSend: string

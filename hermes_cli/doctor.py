@@ -1374,18 +1374,13 @@ def run_doctor(args):
     
     _section("Python Environment")
     py_version = sys.version_info
-    if py_version >= (3, 11):
+    if (3, 14) <= py_version[:2] < (3, 15):
         check_ok(f"Python {py_version.major}.{py_version.minor}.{py_version.micro}")
-    elif py_version >= (3, 10):
-        check_ok(f"Python {py_version.major}.{py_version.minor}.{py_version.micro}")
-        check_warn("Python 3.11+ recommended for RL Training tools (tinker requires >= 3.11)")
-    elif py_version >= (3, 8):
-        check_warn(f"Python {py_version.major}.{py_version.minor}.{py_version.micro}", "(3.10+ recommended)")
     else:
         _fail_and_issue(
             f"Python {py_version.major}.{py_version.minor}.{py_version.micro}",
-            "(3.10+ required)",
-            "Upgrade Python to 3.10+",
+            "(>=3.14,<3.15 required)",
+            "Install Python 3.14 and rebuild the managed environment",
             issues,
         )
 

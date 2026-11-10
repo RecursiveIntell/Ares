@@ -428,10 +428,10 @@ def test_bws_token_env_remap_non_suffix_stripped(tmp_path, monkeypatch):
 def test_bws_bootstrap_policy_failure_refuses_child(monkeypatch, token_name):
     import hermes_cli.config as config_mod
 
-    def _raise():
+    def _raise(*_args, **_kwargs):
         raise RuntimeError("config unavailable")
 
-    monkeypatch.setattr(config_mod, "read_raw_config", _raise)
+    monkeypatch.setattr(config_mod, "capture_security_policy_config", _raise)
     monkeypatch.setenv(token_name, "fake-bootstrap")
 
     with pytest.raises(RuntimeError, match="Bitwarden token policy unavailable"):

@@ -1,4 +1,4 @@
-"""Windows UTF-8 bootstrap for Hermes entry points.
+"""Runtime admission and Windows UTF-8 bootstrap for Hermes entry points.
 
 Python on Windows has two long-standing text-encoding footguns:
 
@@ -12,8 +12,8 @@ Python on Windows has two long-standing text-encoding footguns:
    delegation children, linter subprocesses, etc.) inherits the same
    cp1252 defaults and hits the same UnicodeEncodeError.
 
-This module fixes both on Windows *only* — POSIX is untouched.  It
-should be imported at the very top of every Hermes entry point
+Runtime minor-line admission applies on every platform; the encoding fixes
+apply on Windows only. This module should be imported at the very top of every Hermes entry point
 (``hermes``, ``hermes-agent``, ``hermes-acp``, ``python -m gateway.run``,
 ``batch_runner.py``, ``cron/scheduler.py``) before any other imports
 that might do file I/O or print to stdout.
@@ -38,8 +38,9 @@ What this module does NOT do:
 
 What this module does on POSIX:
 
-  - Nothing.  POSIX systems are already UTF-8 by default in 99% of cases,
-    and we don't want to touch ``LANG``/``LC_*`` behavior that users may
+  - Check the supported Python minor line, without changing encoding.
+    POSIX systems are already UTF-8 by default, so we do not touch
+    ``LANG``/``LC_*`` behavior that users may
     have configured intentionally.  If someone hits a C/POSIX locale on
     Linux, they can export ``PYTHONUTF8=1`` themselves — we won't override.
 
@@ -51,6 +52,38 @@ from __future__ import annotations
 
 import os
 import sys
+
+# Early, dependency-free projection of project.requires-python. Packaging and
+# locked artifact admission remain authoritative for full build qualification.
+MIN_SUPPORTED_PYTHON = (3, 14)
+MAX_SUPPORTED_PYTHON_EXCLUSIVE = (3, 15)
+
+
+class UnsupportedPythonRuntimeError(RuntimeError):
+    """The entry point is running on an unsupported Python minor line."""
+
+
+def require_supported_python(version_info=None) -> None:
+    """Reject unsupported minor lines before entry-point bootstrap effects.
+
+    A supplied version sequence is data for callers/tests, not an interpreter
+    override. This does not qualify patch releases, wheels or provider backends.
+    """
+    observed = sys.version_info if version_info is None else version_info
+    if (not isinstance(observed, (tuple, list)) or len(observed) < 2
+            or any(type(value) is not int for value in observed[:2])):
+        raise UnsupportedPythonRuntimeError("HERMES_PYTHON_UNSUPPORTED: unqualified version metadata")
+    minor_line = (observed[0], observed[1])
+    if not MIN_SUPPORTED_PYTHON <= minor_line < MAX_SUPPORTED_PYTHON_EXCLUSIVE:
+        minimum = ".".join(map(str, MIN_SUPPORTED_PYTHON))
+        ceiling = ".".join(map(str, MAX_SUPPORTED_PYTHON_EXCLUSIVE))
+        raise UnsupportedPythonRuntimeError(
+            f"HERMES_PYTHON_UNSUPPORTED: requires >={minimum},<{ceiling}; "
+            f"observed {minor_line[0]}.{minor_line[1]}"
+        )
+
+
+require_supported_python()
 
 _IS_WINDOWS = sys.platform == "win32"
 _bootstrap_applied = False

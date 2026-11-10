@@ -227,8 +227,8 @@ if [[ "$EXTRAS" == true ]]; then
   fi
   export RUSTUP_TOOLCHAIN=stable
 fi
-uv python install 3.13
-PYTHON="$(uv python find 3.13)"
+uv python install 3.14
+PYTHON="$(uv python find 3.14)"
 export UV_PYTHON="$PYTHON"
 ARES_HOME="$("$PYTHON" -c 'import os,sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$ARES_HOME")"
 ARES_BIN_DIR="$("$PYTHON" -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$ARES_BIN_DIR")"
@@ -278,7 +278,7 @@ if Path(owner[0]).resolve() != Path(os.environ['ARES_HOME']).resolve():
 PY
 fi
 STEP=python
-(cd "$ARES_SOURCE" && uv sync --locked --extra all --no-dev --python 3.13)
+(cd "$ARES_SOURCE" && uv sync --locked --extra all --no-dev --python 3.14)
 BOOTSTRAP_PYTHON="$ARES_SOURCE/.venv/bin/python"
 
 if [[ "$EXTRAS" == true ]]; then

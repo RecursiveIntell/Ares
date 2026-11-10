@@ -905,6 +905,10 @@ def test_desktop_gpu_policy_reads_the_ares_scoped_config(tmp_path: Path) -> None
 def test_desktop_launch_bridges_configured_gpu_policy_without_overriding_environment(
     tmp_path: Path, monkeypatch
 ) -> None:
+    # Ares Desktop exports HERMES_DESKTOP_DISABLE_GPU into its child processes.
+    # The launcher deliberately never overrides a present value, so an ambient
+    # value would mask the configured-policy bridge this test asserts (D-009).
+    monkeypatch.delenv("HERMES_DESKTOP_DISABLE_GPU", raising=False)
     runtime = _runtime(tmp_path)
     revision = "a" * 40
     source = _release(runtime, revision)

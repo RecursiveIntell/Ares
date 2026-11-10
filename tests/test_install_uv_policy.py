@@ -111,6 +111,35 @@ def test_native_metadata_stays_native_and_all_exceptions_preserved():
     assert "sources" not in tomllib.loads(policy.project_policy(data))
 
 
+@pytest.mark.parametrize("value", [
+    "pynacl>=1.6,<1.7",
+    "tflite-runtime>=2.14,<3; sys_platform == 'linux' and python_full_version < '3.12'",
+    'demo>=1,<2; (os_name == "posix" or platform_machine != "arm64") and python_version >= "3.11"',
+    "demo; sys_platform == 'win32'",
+])
+def test_override_with_environment_marker_is_admitted(value):
+    assert policy.supported_override(value)
+
+
+@pytest.mark.parametrize("value", [
+    "demo @ https://example.test/demo.whl",
+    "demo; sys_platform == 'linux'; extra == 'x'",
+    "demo; extra == 'wake'",
+    "demo; sys_platform == linux",
+    "demo; sys_platform == 'https://example.test'",
+    "demo; 'linux' == 'linux'",
+    "demo; sys_platform == 'linux' and",
+    "demo; (sys_platform == 'linux'",
+    "demo; sys_platform == 'linux')",
+    "demo; sys_platform in 'linux'",
+    "demo; __import__('os')",
+    "; sys_platform == 'linux'",
+    "demo;",
+])
+def test_override_with_unsupported_marker_is_refused(value):
+    assert not policy.supported_override(value)
+
+
 @pytest.mark.parametrize("code", [0, 37, 124, None])
 def test_real_installer_stage_never_falls_back(tmp_path, code):
     project, uv = fixture(tmp_path, code or 0)

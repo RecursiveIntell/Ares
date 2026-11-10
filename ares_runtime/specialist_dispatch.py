@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -29,6 +30,7 @@ from .collaboration import (
     specialist_descriptor_ref,
     validate_specialist_descriptor_set,
 )
+from .specialist_routing import DECISION_SCHEMA, decide_specialist_nonactivation
 
 
 REQUEST_SCHEMA = "AresExplicitSpecialistDispatchRequestV1"
@@ -217,6 +219,65 @@ def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _persist_specialist_decision_receipt(
+    hermes_home: Path, receipt: Mapping[str, object]
+) -> Path:
+    """Atomically persist one private, immutable decision receipt.
+
+    Repeating the same content-addressed decision is idempotent. A path that
+    already contains different bytes is never replaced.
+    """
+    decision_digest = receipt.get("decision_digest")
+    if not isinstance(decision_digest, str) or not SHA256_RE.fullmatch(decision_digest):
+        raise DispatchError("INVALID_DECISION_RECEIPT")
+    if not hermes_home.is_dir():
+        raise DispatchError("HERMES_HOME_UNAVAILABLE")
+
+    receipt_dir = hermes_home / "specialist-decision-receipts"
+    try:
+        receipt_dir.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    try:
+        if not stat.S_ISDIR(receipt_dir.lstat().st_mode):
+            raise DispatchError("DECISION_RECEIPT_WRITE_FAILED")
+        os.chmod(receipt_dir, 0o700)
+    except OSError as exc:
+        raise DispatchError("DECISION_RECEIPT_WRITE_FAILED", type(exc).__name__) from exc
+
+    target = receipt_dir / f"{decision_digest}.json"
+    encoded = (json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=receipt_dir, delete=False) as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.chmod(temporary, 0o600)
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            existing_info = target.lstat()
+            if not stat.S_ISREG(existing_info.st_mode) or target.read_bytes() != encoded:
+                raise DispatchError("DECISION_RECEIPT_CONFLICT")
+            os.chmod(target, 0o600)
+        else:
+            directory_fd = os.open(receipt_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except DispatchError:
+        raise
+    except OSError as exc:
+        raise DispatchError("DECISION_RECEIPT_WRITE_FAILED", type(exc).__name__) from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return target
 
 
 def run_explicit_dispatch(
@@ -500,7 +561,7 @@ def _parse_capability_bindings(
 
 
 def client_main(argv: Sequence[str]) -> int:
-    parser = argparse.ArgumentParser(description="Submit an explicit specialist dispatch to the running Ares Desktop.")
+    parser = argparse.ArgumentParser(description="Submit a specialist dispatch or record a non-authorizing decision.")
     sub = parser.add_subparsers(dest="action", required=True)
     run = sub.add_parser("run")
     run.add_argument("--profile", action="append", required=True)
@@ -513,6 +574,14 @@ def client_main(argv: Sequence[str]) -> int:
     )
     run.add_argument("--brief-file", required=True, type=Path)
     run.add_argument("--workspace", required=True, type=Path)
+    decide = sub.add_parser("decide", help="Record a non-authorizing specialist decision; never dispatches.")
+    decide.add_argument("--profile", action="append", required=True)
+    decide.add_argument(
+        "--capability",
+        action="append",
+        metavar="PROFILE_ID:CAPABILITY",
+        help="One exact capability binding per profile; all bindings must name the same capability.",
+    )
     quiesce = sub.add_parser("quiesce")
     quiesce.add_argument("--profile", action="append", required=True)
     unquiesce = sub.add_parser("unquiesce")
@@ -523,6 +592,67 @@ def client_main(argv: Sequence[str]) -> int:
     cancel.add_argument("--run-id", required=True)
     args = parser.parse_args(list(argv))
     root = Path(os.environ.get("HERMES_HOME", Path.home() / ".ares")).expanduser().resolve()
+    if args.action == "decide":
+        profile_ids = sorted(args.profile)
+        if (
+            len(profile_ids) != len(set(profile_ids))
+            or not (1 <= len(profile_ids) <= MAX_PROFILES)
+            or any(not PROFILE_RE.fullmatch(profile_id) for profile_id in profile_ids)
+        ):
+            parser.error("--profile values must be unique valid profile IDs (1-4 total)")
+        requested_capability: str | None = None
+        if args.capability:
+            try:
+                capability_bindings = _parse_capability_bindings(args.capability, profile_ids)
+            except DispatchError:
+                parser.error("--capability requires exactly one PROFILE_ID:CAPABILITY binding per --profile")
+            capabilities = set(capability_bindings.values())
+            if len(capabilities) != 1:
+                parser.error("all --capability bindings must name the same capability")
+            requested_capability = next(iter(capabilities))
+        try:
+            source_root = Path(__file__).resolve().parents[1]
+            candidates = load_active_candidates(source_root, profile_ids)
+            if set(candidates) != set(profile_ids):
+                raise DispatchError("DESCRIPTOR_SET_INVALID", "requested profile descriptor missing")
+            profile_binding_refs = _profile_bindings(profile_ids)
+            policy_version = "specialist-policy-v1"
+            request_basis = {
+                "schema": "AresSpecialistDecisionRequestV1",
+                "profile_ids": profile_ids,
+                "requested_capability": requested_capability,
+                "candidate_descriptor_refs": {
+                    profile_id: specialist_descriptor_ref(candidates[profile_id])
+                    for profile_id in profile_ids
+                },
+                "profile_binding_refs": {
+                    profile_id: profile_binding_refs.get(profile_id)
+                    for profile_id in profile_ids
+                },
+                "policy_version": policy_version,
+            }
+            request_digest_value = digest(request_basis)
+            receipt = decide_specialist_nonactivation(
+                request_id=f"specialist-decision-{request_digest_value.removeprefix('sha256:')[:24]}",
+                request_digest=request_digest_value,
+                requested_capability=requested_capability,
+                candidates=[candidates[profile_id] for profile_id in profile_ids],
+                profile_binding_refs=profile_binding_refs,
+                policy_version=policy_version,
+            ).to_dict()
+            _persist_specialist_decision_receipt(root, receipt)
+        except DispatchError as exc:
+            print(
+                json.dumps(
+                    {"schema": DECISION_SCHEMA, "outcome": "error", "reason_code": exc.code},
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+
     endpoint = _read_endpoint(root)
     if args.action == "run":
         profile_ids = sorted(args.profile)
