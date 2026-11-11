@@ -10,7 +10,9 @@ readme = "README.md"
 # from wheels and imported them successfully, so the former <3.14 safety cap
 # is stale. Keep a finite ceiling: every future minor still needs the same
 # locked-sync and import-smoke admission before it can become an Ares runtime.
-requires-python = ">=3.11,<3.15"
+# The supported floor is 3.14: context-inheritance and runtime admission
+# contracts are qualified on this minor, not on legacy interpreter branches.
+requires-python = ">=3.14,<3.15"
 authors = [{ name = "Nous Research" }]
 license = "MIT"
 license-files = ["LICENSE"]
@@ -510,7 +512,7 @@ markers = [
 addopts = "-m 'not integration'"
 
 [tool.ty.environment]
-python-version = "3.13"
+python-version = "3.14"
 
 [tool.ty.rules]
 unknown-argument = "warn"

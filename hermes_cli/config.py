@@ -1013,7 +1013,9 @@ def _ensure_hermes_home_managed(home: Path):
 # Config loading/saving
 # =============================================================================
 
-from hermes_cli.config_defaults import DEFAULT_CONFIG, OPTIONAL_ENV_VARS  # noqa: F401
+from hermes_cli.config_defaults import (
+    DEFAULT_CONFIG, OPTIONAL_ENV_VARS, DEFAULT_TERMINAL_IMAGE, DEFAULT_SINGULARITY_IMAGE,
+)  # noqa: F401
 
 # =============================================================================
 # Config Migration System
@@ -4961,15 +4963,15 @@ def show_config():
     print(f"  Timeout:      {terminal.get('timeout', 60)}s")
     
     if terminal.get('backend') == 'docker':
-        print(f"  Docker image: {terminal.get('docker_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
+        print(f"  Docker image: {terminal.get('docker_image', DEFAULT_TERMINAL_IMAGE)}")
     elif terminal.get('backend') == 'singularity':
-        print(f"  Image:        {terminal.get('singularity_image', 'docker://nikolaik/python-nodejs:python3.11-nodejs20')}")
+        print(f"  Image:        {terminal.get('singularity_image', DEFAULT_SINGULARITY_IMAGE)}")
     elif terminal.get('backend') == 'modal':
-        print(f"  Modal image:  {terminal.get('modal_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
+        print(f"  Modal image:  {terminal.get('modal_image', DEFAULT_TERMINAL_IMAGE)}")
         modal_token = get_env_value('MODAL_TOKEN_ID')
         print(f"  Modal token:  {'configured' if modal_token else '(not set)'}")
     elif terminal.get('backend') == 'daytona':
-        print(f"  Daytona image: {terminal.get('daytona_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
+        print(f"  Daytona image: {terminal.get('daytona_image', DEFAULT_TERMINAL_IMAGE)}")
         daytona_key = get_env_value('DAYTONA_API_KEY')
         print(f"  API key:      {'configured' if daytona_key else '(not set)'}")
     elif terminal.get('backend') == 'vercel_sandbox':

@@ -16,6 +16,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 from hermes_cli.auth import AuthError, resolve_provider
 from hermes_cli.colors import Colors, color
 from hermes_cli.config import get_env_path, get_env_value, get_hermes_home, load_config
+from hermes_cli.config_defaults import DEFAULT_TERMINAL_IMAGE
 from hermes_cli.models import provider_label
 from hermes_cli.nous_account import (
     format_nous_portal_entitlement_message,
@@ -456,10 +457,10 @@ def show_status(args):
         print(f"  SSH Host:     {ssh_host or '(not set)'}")
         print(f"  SSH User:     {ssh_user or '(not set)'}")
     elif terminal_env == "docker":
-        docker_image = os.getenv("TERMINAL_DOCKER_IMAGE", "python:3.11-slim")
+        docker_image = os.getenv("TERMINAL_DOCKER_IMAGE", DEFAULT_TERMINAL_IMAGE)
         print(f"  Docker Image: {docker_image}")
     elif terminal_env == "daytona":
-        daytona_image = os.getenv("TERMINAL_DAYTONA_IMAGE", "nikolaik/python-nodejs:python3.11-nodejs20")
+        daytona_image = os.getenv("TERMINAL_DAYTONA_IMAGE", DEFAULT_TERMINAL_IMAGE)
         print(f"  Daytona Image: {daytona_image}")
     elif terminal_env == "vercel_sandbox":
         runtime = os.getenv("TERMINAL_VERCEL_RUNTIME") or terminal_cfg.get("vercel_runtime") or "node24"

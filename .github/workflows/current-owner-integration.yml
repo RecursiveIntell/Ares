@@ -30,9 +30,17 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: RecursiveIntell/Libraries
-          ref: 12c55d5cd08e0b986a56d344cbe261d01bf2957f
+          ref: 12d865e966dd6ca078ac1078b697da35ac559251
           path: Libraries
           persist-credentials: false
+      - name: Require the pinned owner to be current for the consumed crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ares/scripts/ci/check_owner_pin_drift.py \
+            --libraries Libraries \
+            --crate-dir profile-runtime \
+            --crate-dir semantic-memory
       - name: Generate inputs with the exact current canonical Rust owner
         shell: bash
         run: |
@@ -77,7 +85,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          uv sync --frozen --extra dev --extra anthropic --python 3.13
+          uv sync --frozen --extra dev --extra anthropic --python 3.14
           test -x tests/owner_integration/semantic_memory_revocation_owner
           HERMES_PYTHON="$PWD/.venv/bin/python" HERMES_TEST_WORKERS=1 \
             HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \

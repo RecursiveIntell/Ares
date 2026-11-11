@@ -4,6 +4,9 @@ Pure-data leaf module: DEFAULT_CONFIG and OPTIONAL_ENV_VARS, extracted
 verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 """
 
+DEFAULT_TERMINAL_IMAGE = "nikolaik/python-nodejs:python3.14-nodejs26"
+DEFAULT_SINGULARITY_IMAGE = f"docker://{DEFAULT_TERMINAL_IMAGE}"
+
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
@@ -451,7 +454,7 @@ DEFAULT_CONFIG = {
         # this off if your rc files misbehave when sourced
         # non-interactively (e.g. one that hard-exits on TTY checks).
         "auto_source_bashrc": True,
-        "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+        "docker_image": DEFAULT_TERMINAL_IMAGE,
         "docker_forward_env": [],
         # Explicit environment variables to set inside Docker containers.
         # Unlike docker_forward_env (which reads values from the host process),
@@ -459,9 +462,9 @@ DEFAULT_CONFIG = {
         # runs as a systemd service without access to the user's shell environment.
         # Example: {"SSH_AUTH_SOCK": "/run/user/1000/ssh-agent.sock"}
         "docker_env": {},
-        "singularity_image": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
-        "modal_image": "nikolaik/python-nodejs:python3.11-nodejs20",
-        "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+        "singularity_image": DEFAULT_SINGULARITY_IMAGE,
+        "modal_image": DEFAULT_TERMINAL_IMAGE,
+        "daytona_image": DEFAULT_TERMINAL_IMAGE,
         # Vercel Sandbox runtime (vercel_sandbox backend only).
         # Supported: node24, node22, python3.13.
         "vercel_runtime": "node24",

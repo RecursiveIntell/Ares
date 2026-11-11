@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import NoReturn
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from hermes_cli.middleware import EgressDispatchDenied
@@ -115,9 +116,136 @@ def resolve_dispatch_route(body: bytes, *, route: str) -> dict:
         raise EgressDispatchDenied("MODEL_IDENTITY_UNAVAILABLE") from error
 
 
+def request_controls(body: bytes, *, route: str) -> dict:
+    """Redacted observations from serialized bytes, never configured defaults.
+
+    This is not authority, a provider-internal effort attestation, or proof that
+    hooks/memory were disabled. Context digests permit comparison with isolated
+    controls without copying prompt content into an observer's receipt.
+    """
+    family, _, _ = _wire_family(route)
+    if family not in {"openai.chat_completions", "openai.responses", "anthropic.messages"}:
+        raise ValueError("native controls protocol not qualified")
+    payload = _json_object(body)
+    result: dict[str, object] = {"schema": "ares.native-request-controls/v1"}
+    for name in ("reasoning", "thinking", "output_config"):
+        if name not in payload:
+            continue
+        value = payload[name]
+        if type(value) is not dict:
+            raise ValueError("ambiguous native control object")
+        fields = {}
+        allowed = {
+            "reasoning": ("effort", "enabled"),
+            "thinking": ("type", "budget_tokens"),
+            "output_config": ("effort",),
+        }[name]
+        for field in allowed:
+            if field not in value:
+                continue
+            item = value[field]
+            if field == "enabled":
+                valid = type(item) is bool
+            elif field == "budget_tokens":
+                valid = type(item) is int and item > 0
+            else:
+                valid = type(item) is str and re.fullmatch(r"[a-z0-9_.-]{1,32}", item)
+            if not valid:
+                raise ValueError("unqualified native control value")
+            fields[field] = item
+        result[name] = fields
+    if "reasoning_effort" in payload:
+        effort = payload["reasoning_effort"]
+        if type(effort) is not str or not re.fullmatch(r"[a-z0-9_.-]{1,32}", effort):
+            raise ValueError("unqualified native effort")
+        result["reasoning_effort"] = effort
+    tools = payload.get("tools", [])
+    if type(tools) is not list or any(type(tool) is not dict for tool in tools):
+        raise ValueError("unqualified tools array")
+    result["tools_count"] = len(tools)
+    context = {key: payload[key] for key in ("messages", "system", "instructions", "input") if key in payload}
+    # Explicit serializer, not an RFC8785/JCS or semantic-equivalence claim.
+    import hashlib
+
+    encoded = json.dumps(context, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    result["context_fields"] = sorted(context)
+    result["context_sha256"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return result
+
+
+def validate_explicit_reasoning(expected: dict, controls: dict | None, *, protocol: str | None) -> None:
+    """Require the invocation's intent in actual serialized native controls.
+
+    This is field equality, not provider-internal reasoning attestation. Legacy
+    omitted/config-only calls do not enter this explicit-invocation contract.
+    The adapter remains the sole owner of symbolic-effort to token-budget data.
+    """
+    def deny(code: str) -> NoReturn:
+        raise EgressDispatchDenied(code, "explicit reasoning lacks matching qualified native controls")
+
+    if type(expected) is not dict or type(expected.get("enabled")) is not bool or type(controls) is not dict:
+        deny("EXPLICIT_REASONING_UNQUALIFIED")
+    enabled = expected["enabled"]
+    effort = expected.get("effort") if enabled else "none"
+    if type(effort) is not str:
+        deny("EXPLICIT_REASONING_UNQUALIFIED")
+    thinking = controls.get("thinking", {})
+    reasoning = controls.get("reasoning", {})
+    output = controls.get("output_config", {})
+    if any(type(value) is not dict for value in (thinking, reasoning, output)):
+        deny("EXPLICIT_REASONING_UNQUALIFIED")
+
+    if protocol == "anthropic.messages":
+        if reasoning or "reasoning_effort" in controls:
+            deny("EXPLICIT_REASONING_UNQUALIFIED")
+        if not enabled:
+            if thinking.get("type") != "disabled" or output.get("effort") is not None:
+                deny("EXPLICIT_REASONING_MISMATCH")
+            return
+        if thinking.get("type") == "adaptive":
+            if output.get("effort") != effort:
+                deny("EXPLICIT_REASONING_MISMATCH")
+            return
+        if thinking.get("type") == "enabled":
+            from agent.anthropic_adapter import THINKING_BUDGET
+
+            budget = THINKING_BUDGET.get(effort)
+            if budget is None:
+                deny("EXPLICIT_REASONING_UNSUPPORTED")
+            if type(thinking.get("budget_tokens")) is not int or thinking["budget_tokens"] != budget or output.get("effort") is not None:
+                deny("EXPLICIT_REASONING_MISMATCH")
+            return
+        deny("EXPLICIT_REASONING_MISMATCH")
+
+    if protocol not in {"openai.responses", "openai.chat_completions"} or thinking or output:
+        deny("EXPLICIT_REASONING_UNQUALIFIED")
+    if reasoning.get("enabled") is not None and reasoning["enabled"] is not enabled:
+        deny("EXPLICIT_REASONING_MISMATCH")
+    emitted = []
+    if "effort" in reasoning:
+        emitted.append(reasoning["effort"])
+    if "reasoning_effort" in controls:
+        if protocol == "openai.responses":
+            deny("EXPLICIT_REASONING_UNQUALIFIED")
+        emitted.append(controls["reasoning_effort"])
+    # OpenRouter's native Chat disable form has no symbolic effort. Accept
+    # only an explicit boolean false with no conflicting effort fields; this
+    # does not introduce that representation into the Responses protocol.
+    if (not emitted and not enabled and protocol == "openai.chat_completions"
+            and reasoning.get("enabled") is False):
+        return
+    if not emitted or any(type(value) is not str or value != effort for value in emitted):
+        deny("EXPLICIT_REASONING_MISMATCH")
+
+
 def request_metadata(body: bytes, *, route: str) -> dict:
-    result = {"resolved_route":None, "route_qualification_error":None,
-              "output_token_ceiling":None, "output_bound_error":None}
+    result: dict[str, object] = {"resolved_route":None, "route_qualification_error":None,
+              "output_token_ceiling":None, "output_bound_error":None,
+              "native_controls":None, "controls_qualification_error":None}
+    try:
+        result["native_controls"] = request_controls(body, route=route)
+    except (EgressDispatchDenied, ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+        result["controls_qualification_error"] = "REQUEST_CONTROLS_UNAVAILABLE"
     try:
         result["resolved_route"] = resolve_dispatch_route(body, route=route)
     except EgressDispatchDenied as error:

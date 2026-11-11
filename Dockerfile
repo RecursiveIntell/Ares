@@ -40,7 +40,7 @@ RUN apt-get -o Acquire::Retries=3 update && \
     make -j"$(nproc)" && \
     make install
 
-FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df22866bd7857e5d304b67a564f4feab6ac22044dde719b AS uv_source
+FROM ghcr.io/astral-sh/uv:0.11.6-python3.14-trixie@sha256:f3b1d933a49112e15fb02a24f9bfc8fef9986351afc601fcaba4c01a9b6a0eac AS uv_source
 # Node 26 source stage. Debian trixie's bundled nodejs is pinned to 20.x
 # which reached EOL in April 2026 — we copy node + npm from the upstream
 # node:26 image instead (Hermes pins its toolchain to Node 26 everywhere).
@@ -73,6 +73,11 @@ RUN apt-get -o Acquire::Retries=3 update && \
     ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
+# Copy the complete, same-distribution Python/uv prefix, not uv alone: Debian
+# 13's system Python is below the supported project floor. Install fixed SQLite
+# AFTER this copy so the copied runtime cannot replace its admitted library.
+COPY --from=uv_source /usr/local/ /usr/local/
+
 # Prefer the fixed SQLite over Debian's vulnerable libsqlite3.so.0. Keep the
 # public library name stable so both the system interpreter and the uv-created
 # venv resolve the replacement without changing Python import paths.
@@ -82,6 +87,7 @@ RUN ln -sf libsqlite3.so.3.53.4 /usr/local/lib/libsqlite3.so.0 && \
     printf '/usr/local/lib\n' > /etc/ld.so.conf.d/000-sqlite-fixed.conf && \
     ldconfig && \
     python3 -c "import sqlite3, sys; \
+sys.exit(f'unsupported project Python {sys.version}') if sys.version_info[:2] != (3, 14) else None; \
 v = sqlite3.sqlite_version_info; \
 sys.exit(f'linked SQLite {sqlite3.sqlite_version} still has the WAL-reset bug') if v < (3, 51, 3) else None; \
 db = sqlite3.connect(':memory:'); \
@@ -264,7 +270,7 @@ RUN cd plugins/platforms/photon/sidecar && \
 # The editable link is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
+RUN UV_PYTHON_DOWNLOADS=never uv sync --frozen --python /usr/local/bin/python3.14 --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
 
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't

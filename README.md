@@ -72,8 +72,8 @@ Ares does **not** claim that every installed service is reachable or exercised, 
 ### Prerequisites
 
 - Git
-- [uv](https://docs.astral.sh/uv/) — the installer provisions its own copy under `<ARES_HOME>/bin` and manages Python 3.13.
-- Python **3.11–3.14** is admitted by the current project metadata (`>=3.11,<3.15`). The inherited POSIX installer provisions 3.11 by default; the committed Desktop resolver explicitly probes 3.11–3.14. Resolver support is a source-level admission decision, not proof that every native extension or installation path works on each Python minor and operating system.
+- [uv](https://docs.astral.sh/uv/) — the installer provisions its own copy under `<ARES_HOME>/bin` and manages Python 3.14.
+- Python **3.14** is the supported minor line (`>=3.14,<3.15`). Installers, CI, container/Nix definitions and Desktop interpreter discovery target this line. Source-level admission is not proof that every native extension or installation path works on every operating system; exact artifact and platform checks remain required.
 - A model provider configured through the normal Hermes setup flow
 
 - The Ares runtime controller is currently exercised through the Python module entry point on POSIX systems. `scripts/install.sh` and `scripts/install.ps1` are inherited Hermes installers; they do not create the Ares `ares` launcher or the Ares stable-runtime layout.
@@ -439,8 +439,8 @@ project's `requires-python` constraint is the source of truth for admissible
 future minor versions. A failed repair leaves the existing runtime in place
 when possible and reports that the next update should retry.
 
-The current project admission range is `>=3.11,<3.15` (Python 3.11 through
-3.14). This is a packaging/source contract, not proof that every provider,
+The current project admission range is `>=3.14,<3.15` (Python 3.14).
+This is a packaging/source contract, not proof that every provider,
 native extension, Desktop build, or optional service works on every minor and
 every operating system.
 

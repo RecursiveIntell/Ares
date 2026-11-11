@@ -124,6 +124,11 @@ GLM52_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 GLM53_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "max")
 GLM53_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 
+#: OpenCode Go's model catalog separately declares GLM-5.3 Flash effort as
+#: low/high/max (not Z.AI's medium-enabled vocabulary).
+OPENCODE_GO_GLM53_FLASH_EFFORTS: tuple[str, ...] = ("low", "high", "max")
+OPENCODE_GO_GLM53_FLASH_OVERRIDES: dict[str, str] = {"xhigh": "max"}
+
 #: DeepSeek V4 OpenAI-compat endpoint: low/medium/high/max; ``xhigh``
 #: requests the top tier (matches the shipped profile mapping).
 DEEPSEEK_V4_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "max")
