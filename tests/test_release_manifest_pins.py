@@ -85,7 +85,7 @@ def test_checkout_exact_lands_on_pinned_ancestor_and_refuses_dirty_checkout(tmp_
     )
     pinned = _git(remote, "rev-parse", "HEAD")
     (remote / "payload.txt").write_text("second\n")
-    _git(remote, "commit", "-qam", "second")
+    _git(remote, "-c", "user.name=Fixture", "-c", "user.email=fixture", "commit", "-qam", "second")
 
     actual = release_manifest.checkout_exact(str(remote), "refs/heads/main", pinned, destination)
     assert actual == pinned
