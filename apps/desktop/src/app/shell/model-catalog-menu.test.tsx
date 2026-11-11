@@ -97,7 +97,21 @@ describe('the catalog owns model curation', () => {
     expect(applyPreset).not.toHaveBeenCalled()
   })
 
-  it('a preserving surface selects only the model, never a remembered effort/Fast preset', async () => {
+  it('shows a session-local Fast variant preset as on for an unselected model row', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [{ models: ['alpha', 'alpha-fast'], name: 'Fixture', slug: 'fixture' }]
+    })
+
+    renderMenu({
+      current: { model: '', provider: '', effort: '', fast: false },
+      presetFor: () => ({ fast: true })
+    })
+
+    const row = await screen.findByText('Alpha')
+    expect(row.closest('[role="menuitem"]')?.textContent?.toLowerCase()).toContain('fast')
+  })
+
+  it('a preserving surface applies the target row effort and disables unsupported Fast', async () => {
     const applyPreset = vi.fn()
 
     const select = renderMenu({
@@ -109,36 +123,87 @@ describe('the catalog owns model curation', () => {
 
     fireEvent.click(await screen.findByText(/Gemini 3\.1 Pro/i))
     await vi.waitFor(() => expect(select).toHaveBeenCalledWith('gemini-3.1-pro', 'google'))
-    expect(applyPreset).not.toHaveBeenCalled()
+    await vi.waitFor(() =>
+      expect(applyPreset).toHaveBeenCalledWith(
+        { effort: 'low', fast: false },
+        { model: 'gemini-3.1-pro', provider: 'google', selectionModel: 'gemini-3.1-pro' },
+        undefined
+      )
+    )
   })
 
-  it('still applies no preset when an older selection settles after the newer one', async () => {
+  it('applies explicit target-row effort and Fast together on a capable target', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          capabilities: { 'gemini-3.1-pro': { fast: true, reasoning: true } },
+          models: ['gemini-3.1-pro'],
+          name: 'Google',
+          slug: 'google'
+        }
+      ]
+    })
+    const applyPreset = vi.fn()
+
+    const select = renderMenu({
+      applyPreset,
+      current: { model: 'gemini-2.5-flash', provider: 'google', effort: 'high', fast: false },
+      preserveOptionsOnSelect: true,
+      presetFor: () => ({ effort: 'low', fast: true })
+    })
+
+    fireEvent.click(await screen.findByText(/Gemini 3\.1 Pro/i))
+    await vi.waitFor(() => expect(select).toHaveBeenCalledWith('gemini-3.1-pro', 'google'))
+    await vi.waitFor(() =>
+      expect(applyPreset).toHaveBeenCalledWith(
+        { effort: 'low', fast: true },
+        { model: 'gemini-3.1-pro', provider: 'google', selectionModel: 'gemini-3.1-pro' },
+        undefined
+      )
+    )
+  })
+
+  it('passes selection-intent snapshots so the owner can reject a late preset', async () => {
     const applyPreset = vi.fn()
     const settle: Array<(ok: boolean) => void> = []
+    let nextIntent = 0
+    const beginSelection = vi.fn(() => ++nextIntent)
     const select = vi.fn(() => new Promise<boolean>(resolve => settle.push(resolve)))
 
     renderMenu({
       applyPreset,
+      beginSelection,
       current: { model: '', provider: '', effort: 'high', fast: false },
       preserveOptionsOnSelect: true,
       presetFor: () => ({ effort: 'low', fast: true }),
       select
     })
 
-    // The user picks one model, then the newer one they actually want.
     fireEvent.click(await screen.findByText(/Gemini 2\.5 Flash/i))
     fireEvent.click(await screen.findByText(/Gemini 3\.1 Pro/i))
 
     expect(select).toHaveBeenCalledWith('gemini-2.5-flash', 'google')
     expect(select).toHaveBeenCalledWith('gemini-3.1-pro', 'google')
 
-    // Newer ACK first, older pick settling last — order must not matter.
     await act(async () => {
       settle[1](true)
       settle[0](true)
     })
 
-    expect(applyPreset).not.toHaveBeenCalled()
+    expect(beginSelection).toHaveBeenNthCalledWith(1, 'google', 'gemini-2.5-flash')
+    expect(beginSelection).toHaveBeenNthCalledWith(2, 'google', 'gemini-3.1-pro')
+    expect(applyPreset).toHaveBeenNthCalledWith(
+      1,
+      { effort: 'low', fast: false },
+      { model: 'gemini-3.1-pro', provider: 'google', selectionModel: 'gemini-3.1-pro' },
+      2
+    )
+    expect(applyPreset).toHaveBeenNthCalledWith(
+      2,
+      { effort: 'low', fast: false },
+      { model: 'gemini-2.5-flash', provider: 'google', selectionModel: 'gemini-2.5-flash' },
+      1
+    )
   })
 
   it('recovers a transient empty catalog without closing or restarting the picker', async () => {
@@ -185,5 +250,62 @@ describe('the catalog owns model curation', () => {
     fireEvent.click(screen.getByText('Edit Models…'))
 
     expect($modelVisibilityOpen.get()).toBe(true)
+  })
+})
+
+describe('active Fast-variant toggles', () => {
+  it('remembers an active row Fast-variant toggle for the family after the swap succeeds', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [{ models: ['alpha', 'alpha-fast'], name: 'Fixture', slug: 'fixture' }]
+    })
+
+    const rememberOptions = vi.fn()
+    const select = vi.fn(async () => true)
+
+    renderMenu({
+      current: { model: 'alpha-fast', provider: 'fixture', effort: '', fast: false },
+      rememberOptions,
+      select
+    })
+
+    const row = (await screen.findByText('Alpha')).closest('[role="menuitem"]')!
+    fireEvent.keyDown(row, { key: 'ArrowRight' })
+    const fastItem = (await screen.findByText(/^Fast$/)).closest('[role="menuitem"]')!
+    const toggle = fastItem.querySelector('[role="switch"]')!
+    expect(toggle.getAttribute('aria-checked')).toBe('true')
+
+    await act(async () => {
+      fireEvent.click(toggle)
+    })
+
+    expect(select).toHaveBeenCalledWith('alpha', 'fixture')
+    expect(rememberOptions).toHaveBeenCalledWith({ fast: false }, { model: 'alpha', provider: 'fixture' })
+  })
+
+  it('does not remember the toggle when the variant swap fails', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [{ models: ['alpha', 'alpha-fast'], name: 'Fixture', slug: 'fixture' }]
+    })
+
+    const rememberOptions = vi.fn()
+    const select = vi.fn(async () => false)
+
+    renderMenu({
+      current: { model: 'alpha-fast', provider: 'fixture', effort: '', fast: false },
+      rememberOptions,
+      select
+    })
+
+    const row = (await screen.findByText('Alpha')).closest('[role="menuitem"]')!
+    fireEvent.keyDown(row, { key: 'ArrowRight' })
+
+    const fastItem = (await screen.findByText(/^Fast$/)).closest('[role="menuitem"]')!
+
+    await act(async () => {
+      fireEvent.click(fastItem.querySelector('[role="switch"]')!)
+    })
+
+    expect(select).toHaveBeenCalledWith('alpha', 'fixture')
+    expect(rememberOptions).not.toHaveBeenCalled()
   })
 })

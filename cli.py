@@ -219,6 +219,7 @@ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_cli.config_defaults import DEFAULT_TERMINAL_IMAGE, DEFAULT_SINGULARITY_IMAGE
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
     is_browser_debug_ready,
@@ -451,11 +452,11 @@ def load_cli_config() -> Dict[str, Any]:
             "cwd": ".",  # "." is resolved to os.getcwd() at runtime
             "home_mode": "auto",
             "lifetime_seconds": 300,
-            "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+            "docker_image": DEFAULT_TERMINAL_IMAGE,
             "docker_forward_env": [],
-            "singularity_image": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
-            "modal_image": "nikolaik/python-nodejs:python3.11-nodejs20",
-            "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+            "singularity_image": DEFAULT_SINGULARITY_IMAGE,
+            "modal_image": DEFAULT_TERMINAL_IMAGE,
+            "daytona_image": DEFAULT_TERMINAL_IMAGE,
             "docker_volumes": [],  # host:container volume mounts for Docker backend
             "docker_mount_cwd_to_workspace": False,  # explicit opt-in only; default off for sandbox isolation
             "docker_shared_container_key": "",

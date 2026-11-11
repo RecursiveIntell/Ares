@@ -385,12 +385,10 @@ $script:ResolvedPathReport = @{
 
 $RepoUrlSsh = "git@github.com:NousResearch/hermes-agent.git"
 $RepoUrlHttps = "https://github.com/NousResearch/hermes-agent.git"
-$PythonVersion = "3.11"
-# Minor versions the installer accepts when the requested $PythonVersion isn't
-# available, in preference order.  uv discovers both uv-managed and system
-# interpreters, so this list also matches a pre-existing system Python.  Single
-# source of truth shared by Test-Python's fallback and Resolve-AvailablePythonVersion.
-$PythonFallbackVersions = @("3.12", "3.13", "3.10")
+$PythonVersion = "3.14"
+# Shared interpreter-candidate policy. No lower-minor fallback is admitted by
+# the supported project range; all installer stages must resolve Python 3.14.
+$PythonFallbackVersions = @()
 $NodeVersion = "22"
 # The npm range the root package.json pins in `engines.npm`.  A constant rather
 # than a manifest read like the POSIX side does: Test-Node runs BEFORE the repo
@@ -1126,13 +1124,9 @@ function Resolve-AvailablePythonVersion {
     # requested $PythonVersion and then $PythonFallbackVersions.  Returns $null
     # when none are available.
     #
-    # This is the cross-process-safe counterpart to Test-Python's in-memory
-    # ``$script:PythonVersion = $fallbackVer`` mutation.  Under Hermes-Setup.exe
-    # each ``-Stage NAME`` runs in a *fresh* powershell.exe, so the fallback the
-    # ``python`` stage settled on (e.g. 3.12 when 3.11 is absent) does NOT
-    # survive into the ``venv`` stage's process -- there $PythonVersion is back
-    # at its "3.11" default.  Consumers re-resolve here instead of trusting that
-    # default, which is exactly the propagation gap behind issue #50769.
+    # Under Hermes-Setup.exe each stage runs in a fresh powershell.exe.
+    # Re-resolve the admitted target in every stage instead of relying on a
+    # previous process's variable mutation (the #50769 propagation gap).
     $candidates = @($PythonVersion) + $PythonFallbackVersions
     $seen = @{}
     foreach ($ver in $candidates) {
@@ -1200,8 +1194,10 @@ function Test-Python {
         Write-Warn "uv python install error: $_"
     }
 
-    # Fallback: check if ANY Python 3.10+ is already available on the system
-    Write-Info "Trying to find any existing Python 3.10+..."
+    # Only explicitly admitted alternatives may be considered (currently none).
+    if ($PythonFallbackVersions.Count -gt 0) {
+        Write-Info "Checking explicitly admitted Python alternatives..."
+    }
     foreach ($fallbackVer in $PythonFallbackVersions) {
         try {
             $pythonPath = & $UvCmd python find $fallbackVer 2>$null
@@ -1240,7 +1236,7 @@ function Test-Python {
                 $ErrorActionPreference = "Continue"
                 $sysVer = & python --version 2>&1
                 $ErrorActionPreference = $prevEAP2
-                if ($sysVer -match "Python 3\.(1[0-9]|[1-9][0-9])") {
+                if ($sysVer -match "^Python 3\.14(?:\.\d+)?(?:\s|$)") {
                     Write-Success "Using system Python: $sysVer"
                     return $true
                 }
@@ -1251,9 +1247,9 @@ function Test-Python {
     }
 
     Write-Err "Failed to install Python $PythonVersion"
-    Write-Info "Install Python 3.11 manually, then re-run this script:"
+    Write-Info "Install Python 3.14 manually, then re-run this script:"
     Write-Info "  https://www.python.org/downloads/"
-    Write-Info "  Or: winget install Python.Python.3.11"
+    Write-Info "  Or: winget install Python.Python.3.14"
     return $false
 }
 

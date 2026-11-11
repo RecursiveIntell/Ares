@@ -7947,6 +7947,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 "DELETE FROM session_turn_leases WHERE expires_at < ?",
                 (prune_before,),
             )
+            # Per-key acquisition already reclaims a provably dead holder on
+            # the requested key. Sweep unrelated dead holders as well so
+            # abandoned keys need not wait for another acquire or the existing
+            # expiry-based hygiene pass. Live-holder and TTL rules stay with
+            # their existing owners.
+            stale_rows = conn.execute(
+                "SELECT conversation_id, holder FROM session_turn_leases"
+            ).fetchall()
+            for stale in stale_rows:
+                if _compression_lock_holder_process_is_dead(stale["holder"]):
+                    conn.execute(
+                        "DELETE FROM session_turn_leases "
+                        "WHERE conversation_id = ? AND holder = ?",
+                        (stale["conversation_id"], stale["holder"]),
+                    )
             conn.execute(
                 "INSERT OR IGNORE INTO session_turn_leases "
                 "(conversation_id, holder, acquired_at, expires_at) "

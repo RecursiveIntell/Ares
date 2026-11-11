@@ -253,3 +253,117 @@ class TestOpenCodeGoFullKwargsIntegration:
         )
         assert "extra_body" not in kwargs
         assert kwargs["reasoning_effort"] == "high"
+
+
+def _serialized_chat_body(kwargs):
+    """Send SDK create kwargs through an isolated HTTPX MockTransport."""
+    import json
+
+    import httpx
+    from openai import OpenAI
+
+    captured = []
+
+    def handler(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-local-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": kwargs["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    with httpx.Client(
+        transport=httpx.MockTransport(handler), trust_env=False
+    ) as http_client:
+        with OpenAI(
+            api_key="local-test-only",
+            base_url="https://opencode.ai/zen/go/v1",
+            max_retries=0,
+            http_client=http_client,
+        ) as client:
+            client.chat.completions.create(**kwargs)
+    assert len(captured) == 1
+    return captured[0]
+
+
+class TestOpenCodeGoGLM53FlashReasoning:
+    """GLM-5.3 Flash's OpenCode Go route uses its native scalar wire field."""
+
+    @staticmethod
+    def _kwargs(profile, *, model="opencode-go/glm-5.3-flash", reasoning_config):
+        from agent.transports.chat_completions import ChatCompletionsTransport
+
+        return ChatCompletionsTransport().build_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            tools=None,
+            provider_profile=profile,
+            reasoning_config=reasoning_config,
+            base_url="https://opencode.ai/zen/go/v1",
+        )
+
+    def test_high_is_unambiguous_in_openai_sdk_final_wire(self, opencode_go_profile):
+        body = _serialized_chat_body(
+            self._kwargs(
+                opencode_go_profile,
+                reasoning_config={"enabled": True, "effort": "high"},
+            )
+        )
+        assert body["model"] == "opencode-go/glm-5.3-flash"
+        assert body["reasoning_effort"] == "high"
+        assert "reasoning" not in body
+        assert "extra_body" not in body
+
+    @pytest.mark.parametrize(
+        "reasoning_config",
+        [None, {"enabled": False}, {"enabled": True, "effort": "none"}],
+    )
+    def test_unset_disabled_or_none_does_not_invent_wire_controls(
+        self, opencode_go_profile, reasoning_config
+    ):
+        body = _serialized_chat_body(
+            self._kwargs(opencode_go_profile, reasoning_config=reasoning_config)
+        )
+        assert body["model"] == "opencode-go/glm-5.3-flash"
+        assert "reasoning_effort" not in body
+        assert "reasoning" not in body
+
+    def test_unknown_model_and_other_opencode_profile_stay_untouched(
+        self, opencode_go_profile, opencode_zen_profile
+    ):
+        unknown = self._kwargs(
+            opencode_go_profile,
+            model="opencode-go/glm-5.4-future",
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert "reasoning_effort" not in unknown
+        assert "extra_body" not in unknown
+
+        other_provider = self._kwargs(
+            opencode_zen_profile,
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert "reasoning_effort" not in other_provider
+        assert "extra_body" not in other_provider
+
+    def test_go_wire_vocabulary_does_not_pass_through_zai_only_medium(
+        self, opencode_go_profile
+    ):
+        for requested, expected in (("medium", "low"), ("xhigh", "max")):
+            extra_body, top_level = opencode_go_profile.build_api_kwargs_extras(
+                reasoning_config={"enabled": True, "effort": requested},
+                model="opencode-go/glm-5.3-flash",
+            )
+            assert extra_body == {}
+            assert top_level == {"reasoning_effort": expected}

@@ -99,7 +99,7 @@ def test_find_agent_browser_lazy_install_cycle_terminates(monkeypatch):
 
 
 @pytest.mark.windows_only
-def test_ensure_dependency_uses_powershell_on_windows(tmp_path):
+def test_ensure_dependency_uses_powershell_on_windows(tmp_path, request):
     """``windows_only``: the assertion is that we shell out to a real
     PowerShell. Faking ``_IS_WINDOWS`` on Linux also required faking
     ``shutil.which`` into inventing a powershell.exe that isn't there."""
@@ -107,10 +107,15 @@ def test_ensure_dependency_uses_powershell_on_windows(tmp_path):
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir(parents=True)
     (scripts_dir / "install.ps1").write_text("# fake")
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    home = tmp_path / "fakehome"
+    home.mkdir()
+    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    token = set_hermes_home_override(home)
+    request.addfinalizer(lambda: reset_hermes_home_override(token))
     with patch("hermes_cli.dep_ensure._DEP_CHECKS", {"node": lambda: False}), \
          patch("hermes_cli.dep_ensure._find_install_script", return_value=(scripts_dir / "install.ps1", "powershell")), \
          patch("hermes_cli.dep_ensure.shutil") as mock_shutil, \
-         patch("hermes_constants.get_hermes_home", return_value=tmp_path / "fakehome"), \
          patch("subprocess.run") as mock_run, \
          patch("sys.stdin") as mock_stdin:
         mock_shutil.which.side_effect = lambda name: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" if name == "powershell" else None

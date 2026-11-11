@@ -19,7 +19,7 @@
 # Tool resolution: the hermes wrapper uses --suffix PATH for nix store tools,
 # so apt/uv-installed versions take priority. The container entrypoint provisions
 # extensible tools on first boot: nodejs/npm via apt, uv via curl, and a Python
-# 3.11 venv (bootstrapped entirely by uv) at ~/.venv with pip seeded. Agents get
+# 3.14 venv (bootstrapped entirely by uv) at ~/.venv with pip seeded. Agents get
 # writable tool prefixes for npm i -g, pip install, uv tool install, etc.
 #
 # Usage:
@@ -150,7 +150,7 @@
           su -s /bin/sh "$TARGET_USER" -c 'curl -LsSf https://astral.sh/uv/0.12.24/install.sh | sh' || true
         fi
 
-        # Python 3.12 venv — gives the agent a writable Python with pip.
+        # Python 3.14 venv — gives the agent a writable Python with pip.
         # --seed includes pip/setuptools so bare `pip install` works.
         # Reviewed-range admission (uv-pin contract): the uv binary may run
         # only if its version is inside [0.9.28, 0.13.0); otherwise the venv
@@ -164,8 +164,8 @@
             uv\ 0.9.2[89]|uv\ 0.9.3[0-9]|uv\ 0.1[0-2].*)
               su -s /bin/sh "$TARGET_USER" -c "
                 export PATH=\"\$HOME/.local/bin:\$PATH\"
-                uv python install 3.12
-                uv venv --python 3.12 --seed \"\$HOME/.venv\"
+                uv python install 3.14
+                uv venv --python 3.14 --seed \"\$HOME/.venv\"
               " || true
               ;;
             *)

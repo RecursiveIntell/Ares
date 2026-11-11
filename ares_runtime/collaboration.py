@@ -2827,8 +2827,22 @@ def validate_effect_args(args: Any, schema: Mapping[str, Any]) -> None:
     if required - set(args):
         raise ContractError("MISSING_FIELD", sorted(required - set(args))[0])
     for key, spec in schema.get("properties", {}).items():
-        if key in args and not _exact_type(args[key], spec.get("type")):
+        if key in args and not _spec_accepts(args[key], spec):
             raise ContractError("COERCION_REQUIRED", key)
+
+
+def _spec_accepts(value: Any, spec: Any) -> bool:
+    """Exact-type check for one property spec, including ``anyOf``/``oneOf`` unions.
+
+    A union branch must match its declared type exactly; nothing is coerced. A
+    spec that declares neither ``type`` nor a union stays fail-closed.
+    """
+    if not isinstance(spec, Mapping):
+        return False
+    union = spec.get("anyOf", spec.get("oneOf"))
+    if isinstance(union, list) and union:
+        return any(_spec_accepts(value, branch) for branch in union)
+    return _exact_type(value, spec.get("type"))
 
 
 def target_for(tool_name: str, args: Mapping[str, Any]) -> str:

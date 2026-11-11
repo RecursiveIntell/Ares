@@ -252,6 +252,24 @@ def model_call_owner_scope(agent):
 
 
 def produce_dispatch_materialization(agent, payload, *, purpose, route=None, execution_id=None):
+    """One ephemeral call basis for ordinary and continuity dispatch callers.
+
+    The persisted lineage artifact is unchanged. An explicit invocation's
+    normalized intent travels only in the existing deferred call basis, not
+    in provider bytes or an ambient copied execution Context.
+    """
+    result = _produce_dispatch_materialization(agent, payload, purpose=purpose, route=route, execution_id=execution_id)
+    if agent is not None or purpose == "conversation":
+        from ares_runtime.physical_dispatch import explicit_reasoning_override
+
+        owner = agent if agent is not None else _model_call_owner.get()
+        explicit = explicit_reasoning_override(owner)
+        if explicit is not None:
+            result["explicit_reasoning_request"] = explicit
+    return result
+
+
+def _produce_dispatch_materialization(agent, payload, *, purpose, route=None, execution_id=None):
     """Use actual source, SessionDB, input-phase and lease owners or qualify none.
 
     A missing owner is data, not authorization. The consuming enforce governor

@@ -15450,6 +15450,8 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                       ? 'Checking earlier turn outcomes; retained work is not proof of active computation.'
                     : roomClarifies.length
                       ? 'Waiting for your answer…'
+                    : room.turns?.some(turn => turn.phase === 'queued' || turn.phase === 'budget-queued')
+                      ? `${room.turns.filter(turn => turn.phase === 'queued' || turn.phase === 'budget-queued').map(turn => groupSpeakerLabel(turn.member)).join(', ')} waiting for a turn slot…`
                       : room.turn
                       ? `${groupSpeakerLabel(room.turn)} is thinking…`
                       : 'The room is working…'

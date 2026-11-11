@@ -1906,6 +1906,76 @@ print(json.dumps({'binary': ContextGovernorEngine().binary,
             return True, "clean"
         return False, f"dirty ({len(changed)} path(s))"
 
+    def _transport_backend_check(self, python: Path, source: Path) -> tuple[str, bool, str]:
+        """Ask the selected interpreter whether leased model calls can run there.
+
+        The leased transport refuses every governed send on an unqualified
+        httpx/httpcore/anyio stack; surfacing that here beats discovering it
+        as UNSUPPORTED_TRANSPORT on the first model call.
+        """
+        label = "governed transport backend"
+        program = (
+            "import json\n"
+            "from ares_runtime.transport_lease import transport_backend_mismatches\n"
+            "print(json.dumps(list(transport_backend_mismatches())))\n"
+        )
+        try:
+            probe = subprocess.run(
+                [python, "-c", program],
+                cwd=source,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60,
+                check=False,
+            )
+            if probe.returncode:
+                return label, False, "probe failed: " + (probe.stderr.strip().splitlines() or ["no output"])[-1]
+            mismatches = json.loads(probe.stdout)
+        except subprocess.TimeoutExpired:
+            return label, False, "probe timed out"
+        except (OSError, ValueError) as exc:
+            return label, False, f"probe failed: {type(exc).__name__}"
+        if not isinstance(mismatches, list):
+            return label, False, "probe returned an unexpected result"
+        return label, not mismatches, "qualified" if not mismatches else "; ".join(map(str, mismatches))
+
+    def _capability_checks(self, python: Path, source: Path) -> list[tuple[str, bool, str]]:
+        """Report capabilities the model can actually call, not just reach.
+
+        ``MCP readiness`` proves servers answer. This probe runs offline in the
+        selected interpreter and catches what reachability cannot: plugin
+        tools that reach the model with no parameters, real-profile browsing
+        that cannot resolve the default browser, and a web backend that
+        resolves to nothing. See ``ares_runtime/capability_probe.py``.
+        """
+        try:
+            probe = subprocess.run(
+                [python, "-m", "ares_runtime.capability_probe"],
+                cwd=source,
+                env=self._agent_environment(),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,
+                check=False,
+            )
+            if probe.returncode:
+                tail = (probe.stderr.strip().splitlines() or ["no output"])[-1]
+                return [("callable capabilities", False, f"probe failed: {tail}")]
+            results = json.loads(probe.stdout)
+        except subprocess.TimeoutExpired:
+            return [("callable capabilities", False, "probe timed out")]
+        except (OSError, ValueError) as exc:
+            return [("callable capabilities", False, f"probe failed: {type(exc).__name__}")]
+        if not isinstance(results, dict):
+            return [("callable capabilities", False, "probe returned an unexpected result")]
+        return [
+            (str(label), bool(item.get("ok")), str(item.get("detail", "")))
+            for label, item in results.items()
+            if isinstance(item, dict)
+        ]
+
     def doctor(self) -> list[tuple[str, bool, str]]:
         checks: list[tuple[str, bool, str]] = []
         try:
@@ -1936,6 +2006,7 @@ print(json.dumps({'binary': ContextGovernorEngine().binary,
                 probe.returncode == 0,
                 (probe.stderr or "ok").strip(),
             ))
+            checks.append(self._transport_backend_check(python, source))
             try:
                 from hermes_cli.sqlite_runtime import probe_sqlite_runtime
 
@@ -2033,6 +2104,8 @@ print(json.dumps({'enabled': enabled, 'probed': sorted(probed), 'missing': missi
                 False,
                 f"probe failed: {type(exc).__name__}",
             ))
+        if python.is_file():
+            checks.extend(self._capability_checks(python, source))
         try:
             from ares_runtime.runtime_audit import audit_managed_runtime_processes
 

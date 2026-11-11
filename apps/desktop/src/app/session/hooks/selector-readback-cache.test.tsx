@@ -3,7 +3,13 @@ import { afterEach, expect, it } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { reconcileSelectorInfo } from '@/lib/selector-observation'
-import { $currentModel, setActiveSessionId } from '@/store/session'
+import {
+  $currentModel,
+  $currentProvider,
+  setActiveSessionId,
+  setCurrentModel,
+  setCurrentProvider
+} from '@/store/session'
 import { $sessionStates, publishSessionState } from '@/store/session-states'
 
 import { applyRuntimeInfo } from './use-session-actions/utils'
@@ -39,6 +45,20 @@ it('generic runtime readback cannot replace an established owner with a stale ep
   }
 
   expect($sessionStates.get().r.selectorObservation?.version).toEqual(admitted.selector_version)
+})
+
+it('foreground runtime metadata updates mirrors without overwriting saved draft model preferences', () => {
+  setCurrentModel('draft-model')
+  setCurrentProvider('draft-provider')
+  const savedModel = window.localStorage.getItem('hermes.desktop.composer.model')
+  const savedProvider = window.localStorage.getItem('hermes.desktop.composer.provider')
+
+  applyRuntimeInfo({ session_id: 'r', model: 'live-model', provider: 'live-provider' })
+
+  expect($currentModel.get()).toBe('live-model')
+  expect($currentProvider.get()).toBe('live-provider')
+  expect(window.localStorage.getItem('hermes.desktop.composer.model')).toBe(savedModel)
+  expect(window.localStorage.getItem('hermes.desktop.composer.provider')).toBe(savedProvider)
 })
 
 it('a staged warm-cache view cannot overwrite the newer runtime selector projection', () => {

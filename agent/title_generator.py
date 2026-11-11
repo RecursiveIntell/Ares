@@ -17,6 +17,7 @@ user typed. That ordering is the industry-standard one — Codex CLI encodes the
 same ``custom > ai > fallback`` precedence in its session importer.
 """
 
+from contextvars import Context
 import json
 import logging
 import re
@@ -747,9 +748,15 @@ def maybe_auto_title(
 
     apply_instant_title(session_db, session_id, user_message, title_callback)
 
+    from ares_runtime.physical_dispatch import bind_capture_observer
+
+    # New-thread isolation must not depend on Python's inheritance flag/build.
+    # The registered observer binding crosses explicitly; ambient authority does
+    # not. This does not clear the context of an already-initialized worker.
     thread = threading.Thread(
-        target=auto_title_session,
-        args=(session_db, session_id, user_message),
+        target=Context().run,
+        args=(bind_capture_observer(auto_title_session, purpose="title_generation"),
+              session_db, session_id, user_message),
         kwargs={
             "failure_callback": failure_callback,
             "main_runtime": main_runtime,

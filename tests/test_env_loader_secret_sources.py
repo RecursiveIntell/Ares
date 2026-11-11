@@ -198,6 +198,101 @@ def test_cold_profile_bitwarden_uses_profile_bootstrap_without_global_env(
     assert os.environ.get("ANTHROPIC_API_KEY") is None
 
 
+@pytest.mark.parametrize("changed_input", ["config.yaml", ".env", ".op.env"])
+@pytest.mark.parametrize("use_policy_snapshot", [False, True])
+def test_cold_hydration_does_not_publish_stale_results(
+    tmp_path, monkeypatch, changed_input, use_policy_snapshot
+):
+    """A result produced against old inputs must not gain the new identity."""
+    from agent.secret_sources import registry as reg_module
+    import agent.secret_sources.bitwarden as bw_module
+
+    (tmp_path / ".env").write_text("BWS_ACCESS_TOKEN=fixture-bootstrap\n")
+    (tmp_path / ".op.env").write_text("OP_SERVICE_ACCOUNT_TOKEN=fixture-old\n")
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n  bitwarden:\n    enabled: true\n"
+        "    project_id: fixture-project\n    access_token_env: BWS_ACCESS_TOKEN\n"
+    )
+    monkeypatch.setattr(bw_module, "find_bws", lambda **_kw: Path("/fake/bws"))
+    seen = []
+
+    def mutate_during_fetch(**_kwargs):
+        path = tmp_path / changed_input
+        path.write_text(path.read_text() + "\n# changed during hydration\n")
+        seen.append(changed_input)
+        return {"SYNTHETIC_OLD_RESULT": "old-secret"}, []
+
+    monkeypatch.setattr(bw_module, "fetch_bitwarden_secrets", mutate_during_fetch)
+    reg_module._reset_registry_for_tests()
+    from hermes_cli.config import capture_security_policy_config
+    kwargs = {"_policy_snapshot": capture_security_policy_config(tmp_path)} if use_policy_snapshot else {}
+    assert env_loader.hydrate_profile_secret_sources(tmp_path, **kwargs) == {}
+    snapshot = env_loader.get_external_secret_snapshot(tmp_path)
+    assert seen == [changed_input]
+    assert snapshot.status in {"stale", "failed"}
+    assert not snapshot.data
+    # The rejected generation must not poison the once-per-home cache; a
+    # subsequent fetch against stable inputs can produce a new generation.
+    monkeypatch.setattr(
+        bw_module, "fetch_bitwarden_secrets",
+        lambda **_kwargs: ({"SYNTHETIC_NEW_RESULT": "new-secret"}, []),
+    )
+    assert env_loader.hydrate_profile_secret_sources(tmp_path) == {
+        "SYNTHETIC_NEW_RESULT": "new-secret"
+    }
+    current = env_loader.get_external_secret_snapshot(tmp_path)
+    assert current.status == "ready"
+    assert current.generation > snapshot.generation
+    assert "SYNTHETIC_OLD_RESULT" not in current.data
+
+
+def test_hydration_uses_bound_config_snapshot_without_raw_config_read(tmp_path, monkeypatch):
+    from hermes_cli.config import capture_security_policy_config
+    from agent.secret_sources import registry as reg_module
+
+    path = tmp_path / "config.yaml"
+    path.write_text("secrets:\n  synthetic_source:\n    enabled: true\n")
+    policy = capture_security_policy_config(tmp_path)
+    observed = []
+
+    def apply(cfg, home, environ=None):
+        from agent.secret_sources.registry import ApplyReport
+        observed.append((cfg, home))
+        return ApplyReport(sources=[], provenance={})
+
+    monkeypatch.setattr(reg_module, "apply_all", apply)
+    monkeypatch.setattr(env_loader, "_load_secrets_config", lambda home: pytest.fail("unexpected reread"))
+    assert env_loader.hydrate_profile_secret_sources(tmp_path, _policy_snapshot=policy) == {}
+    assert observed == [({"synthetic_source": {"enabled": True}}, tmp_path)]
+    assert env_loader.get_external_secret_snapshot(tmp_path).status == "empty"
+
+
+@pytest.mark.parametrize("reason", ["wrong-owner", "changed", "untyped"])
+def test_hydration_refuses_invalid_bound_config_snapshot(tmp_path, monkeypatch, reason):
+    from hermes_cli.config import capture_security_policy_config
+    from agent.secret_sources import registry as reg_module
+
+    first, other = tmp_path / "first", tmp_path / "other"
+    first.mkdir()
+    other.mkdir()
+    (first / "config.yaml").write_text("secrets:\n  x:\n    enabled: true\n")
+    (other / "config.yaml").write_text("{}\n")
+    policy = capture_security_policy_config(other if reason == "wrong-owner" else first)
+    if reason == "changed":
+        (first / "config.yaml").write_text("{}\n")
+    if reason == "untyped":
+        policy = {"secrets": {}}
+    monkeypatch.setattr(reg_module, "apply_all", lambda *a, **kw: pytest.fail("source must not execute"))
+    if reason == "untyped":
+        with pytest.raises(TypeError, match="SecurityPolicySnapshot"):
+            env_loader.hydrate_profile_secret_sources(first, _policy_snapshot=policy)
+    else:
+        expected = "CONFIG_ADMISSION_OWNER_MISMATCH" if reason == "wrong-owner" else "CONFIG_ADMISSION_SOURCE_CHANGED"
+        with pytest.raises(ValueError, match=expected):
+            env_loader.hydrate_profile_secret_sources(first, _policy_snapshot=policy)
+    assert env_loader.get_external_secret_snapshot(first).status != "ready"
+
+
 def test_multiplex_without_profile_scope_still_loads(tmp_path, monkeypatch):
     """Multiplex startup without a routed profile scope still loads .env."""
     from agent import secret_scope

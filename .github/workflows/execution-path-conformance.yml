@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   conformance-313:
-    name: Execution path conformance (repo Python 3.13)
+    name: Execution path conformance (repo Python 3.14)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -34,7 +34,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          uv sync --frozen --extra dev --python 3.13
+          uv sync --frozen --extra dev --python 3.14
       - name: Run execution-path gates
         shell: bash
         run: |

@@ -185,23 +185,26 @@ export function useComposerQueue({
     return true
   }
 
-  const queueCurrentDraft = useCallback((note?: string) => {
-    const text = draftRef.current
+  const queueCurrentDraft = useCallback(
+    (note?: string) => {
+      const text = draftRef.current
 
-    if (!activeQueueSessionKey || (!text.trim() && attachments.length === 0)) {
-      return false
-    }
+      if (!activeQueueSessionKey || (!text.trim() && attachments.length === 0)) {
+        return false
+      }
 
-    if (!enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments, ...(note ? { note } : {}) })) {
-      return false
-    }
+      if (!enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments, ...(note ? { note } : {}) })) {
+        return false
+      }
 
-    clearDraft()
-    scope.attachments.clear()
-    triggerHaptic('selection')
+      clearDraft()
+      scope.attachments.clear()
+      triggerHaptic('selection')
 
-    return true
-  }, [activeQueueSessionKey, attachments, clearDraft, draftRef, scope.attachments])
+      return true
+    },
+    [activeQueueSessionKey, attachments, clearDraft, draftRef, scope.attachments]
+  )
 
   // All queue drain paths share one lock + send-then-remove sequence.
   // `pickEntry` lets each caller choose head, by-id, or skip-edited.

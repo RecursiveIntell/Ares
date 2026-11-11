@@ -16,6 +16,13 @@ growing the core.
 Two properties shape almost every design decision and are the lens for
 reviewing any change:
 
+- **A /goal row outlives every session-id boundary except an explicit
+  `/goal clear` or `/goal complete`.** Every boundary that produces a
+  successor (compression, session reset, idle/daily expiry) must migrate it
+  (`migrate_goal_to_session`); every boundary that ends without a successor
+  must archive it visibly (`SESSION_EXPIRED_NO_SUCCESSOR`), never silently.
+  Client goal chips key on the stored session id; hydration may not clear a
+  chip a backend notice just wrote on one read alone.
 - **Per-conversation prompt caching is sacred.** A long-lived conversation
   reuses a cached prefix every turn. Anything that mutates past context,
   swaps toolsets, or rebuilds the system prompt mid-conversation invalidates

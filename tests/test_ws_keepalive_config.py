@@ -90,3 +90,32 @@ def test_ws_orphan_reap_grace_invalid_values_fall_back(_temp_home, monkeypatch):
     assert server._resolve_ws_orphan_reap_grace() == 20.0
     monkeypatch.setenv("HERMES_TUI_WS_ORPHAN_REAP_GRACE_S", "-5")
     assert server._resolve_ws_orphan_reap_grace() == 0.0
+
+
+def test_config_read_failure_warns_without_logging_exception_payload(_temp_home, monkeypatch, caplog):
+    from hermes_cli import config
+    from tui_gateway import server
+
+    sentinel = "TEST_ONLY_PRIVATE_CONFIG_PAYLOAD"
+
+    def broken():
+        raise ValueError(sentinel)
+
+    monkeypatch.setattr(config, "load_config", broken)
+    with caplog.at_level("WARNING", logger=server.logger.name):
+        assert server._resolve_ws_orphan_reap_grace() == 20.0
+    assert "ws_orphan_reap_grace_s config read failed" in caplog.text
+    assert sentinel not in caplog.text
+    assert "ValueError" in caplog.text
+
+
+def test_invalid_grace_warns_without_logging_raw_value(_temp_home, monkeypatch, caplog):
+    from tui_gateway import server
+
+    sentinel = "TEST_ONLY_PRIVATE_GRACE_PAYLOAD"
+    monkeypatch.setenv("HERMES_TUI_WS_ORPHAN_REAP_GRACE_S", sentinel)
+    with caplog.at_level("WARNING", logger=server.logger.name):
+        assert server._resolve_ws_orphan_reap_grace() == 20.0
+    assert "ws_orphan_reap_grace_s" in caplog.text
+    assert sentinel not in caplog.text
+    assert "str" in caplog.text

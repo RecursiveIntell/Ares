@@ -145,12 +145,12 @@ def ensure_label(repo: str) -> None:
     if LABEL in names:
         return
     proc = subprocess.run(
-        ["gh", "label", "create", LABEL, "--repo", repo,
+        ["gh", "label", "create", LABEL, "--force", "--repo", repo,
          "--description", "A scheduled CI run failed (auto-managed by ares-scheduled-failure-watch)",
          "--color", "D73A4A"],
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
     )
-    if proc.returncode != 0 and "already_exists" not in (proc.stderr or ""):
+    if proc.returncode != 0 and "already exists" not in (proc.stderr or "") and "already_exists" not in (proc.stderr or ""):
         raise RuntimeError(f"label create failed: {(proc.stderr or '')[:200]}")
 
 
