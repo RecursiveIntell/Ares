@@ -43,10 +43,12 @@ jobs:
           manifest_sha="$("$python" "$helper" --manifest "$manifest" validate)"
           libraries_sha="$("$python" "$helper" --manifest "$manifest" repo Libraries commit)"
           rust_toolchain="$("$python" "$helper" --manifest "$manifest" toolchain rust)"
-          echo "manifest_sha=$manifest_sha" >> "$GITHUB_OUTPUT"
-          echo "manifest_python=$python" >> "$GITHUB_OUTPUT"
-          echo "libraries_sha=$libraries_sha" >> "$GITHUB_OUTPUT"
-          echo "rust_toolchain=$rust_toolchain" >> "$GITHUB_OUTPUT"
+          {
+            echo "manifest_sha=$manifest_sha"
+            echo "manifest_python=$python"
+            echo "libraries_sha=$libraries_sha"
+            echo "rust_toolchain=$rust_toolchain"
+          } >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: RecursiveIntell/Libraries
