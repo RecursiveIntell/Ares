@@ -66,7 +66,9 @@ def lifecycle(monkeypatch):
     def build(**_kwargs):
         return FakeChild(f"sa-{next(counter)}")
 
-    def run(_index, _goal, child, _parent):
+    def run(_index, _goal, child, _parent, **_kwargs):
+        # **_kwargs: _run_child_lifecycle forwards window_not_after (the
+        # delegated window feature); the fake must accept it.
         for _ in range(20):
             if child.interrupted:
                 return {

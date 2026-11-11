@@ -27,7 +27,7 @@
       "parent": "Libraries",
       "path": "semantic-memory-mcp",
       "url": "https://github.com/RecursiveIntell/semantic-memory-mcp.git",
-      "commit": "3f1bd81fffd84c5de4e5f46a5b6ea34c6896782c"
+      "commit": "56b06a764b36d2ac11ecc56b07f7bcd9b63557e3"
     }
   },
   "toolchains": {

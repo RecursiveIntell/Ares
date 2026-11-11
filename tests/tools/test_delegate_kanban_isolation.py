@@ -109,6 +109,7 @@ def test_build_child_agent_strips_kanban_toolset_even_when_parent_is_worker(monk
             self.session_id = "child-session"
 
     import run_agent
+    from agent.iteration_budget import IterationBudget
     from tools import delegate_tool
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
@@ -123,6 +124,9 @@ def test_build_child_agent_strips_kanban_toolset_even_when_parent_is_worker(monk
         api_mode = "chat_completions"
         platform = "cli"
         session_id = "parent-session"
+        # Task 2.2 (debit from parent): child construction debits a real
+        # parent budget; absence would be refused as an unbounded child.
+        iteration_budget = IterationBudget(500)
 
     child = delegate_tool._build_child_agent(
         task_index=0,
