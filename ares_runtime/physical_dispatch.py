@@ -312,6 +312,8 @@ def capture_physical_dispatch():
 
 
 _sdk_active = contextvars.ContextVar("ares_inference_sdk_request", default=False)
+_sdk_stream_step = contextvars.ContextVar("ares_native_sdk_stream_step", default=None)
+_OBSERVATION_EXTENSION = "ares_dispatch_observation"
 _unsupported_bridge = contextvars.ContextVar(
     "ares_unqualified_thread_bridge", default=None
 )
@@ -632,6 +634,7 @@ class _Observation:
         self.length = 0
         self.started = getattr(tickets, "started", time.monotonic())
         self.finished = False
+        self.pending_sdk_close = False
 
     def update(self, data):
         self.digest.update(data)
@@ -639,7 +642,7 @@ class _Observation:
         if self.budget is not None:
             self.budget.remaining()
 
-    def finish(self, outcome, error=None):
+    def finish(self, outcome, error=None, *, sdk_exhausted=False):
         if self.finished:
             return
         expired = None
@@ -655,15 +658,20 @@ class _Observation:
             "schema": "ares.transport-response-body/v1",
             "digest_algorithm": "sha256",
             "response_digest": "sha256:" + self.digest.hexdigest()
-            if self.length
+            if self.length and not sdk_exhausted
             else None,
             "response_bytes": self.length,
-            "response_complete": outcome == "ok",
+            "response_complete": outcome == "ok" and not sdk_exhausted,
             "http_status": self.status,
             "duration_ms": (time.monotonic() - self.started) * 1000,
             "evidence": "executor_observed",
             "replay": "unavailable",
         }
+        if sdk_exhausted:
+            response.update(
+                completion_evidence="native_openai_sdk_stream_exhausted",
+                observed_prefix_digest="sha256:" + self.digest.hexdigest(),
+            )
         try:
             settle_llm_dispatch(
                 tickets, outcome=outcome, response=response, error=error
@@ -672,6 +680,77 @@ class _Observation:
             _raise_governance(failure)
         if expired is not None:
             _raise_governance(expired)
+
+    def close_or_defer(self, outcome, error=None):
+        if outcome == "abandoned" and _sdk_stream_step.get() is self:
+            # The pinned SDK closes its HTTP response in a finally block at
+            # [DONE], before its iterator returns StopIteration. Close the
+            # resources now, but let that exact native step decide its outcome.
+            self.pending_sdk_close = True
+        else:
+            self.finish(outcome, error)
+
+
+class _SDKStreamStep:
+    def __init__(self, observation):
+        self.observation = observation
+
+    def __enter__(self):
+        self.token = _sdk_stream_step.set(self.observation)
+
+    def __exit__(self, kind, *_):
+        observation = self.observation
+        try:
+            if observation.pending_sdk_close:
+                observation.pending_sdk_close = False
+                if kind in {StopIteration, StopAsyncIteration}:
+                    observation.finish("ok", sdk_exhausted=True)
+                else:
+                    observation.finish("abandoned")
+        finally:
+            _sdk_stream_step.reset(self.token)
+
+
+class _SDKStreamIterator:
+    def __init__(self, inner, observation):
+        self.inner, self.observation = inner, observation
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with _SDKStreamStep(self.observation):
+            return next(self.inner)
+
+
+class _SDKAsyncStreamIterator:
+    def __init__(self, inner, observation):
+        self.inner, self.observation = inner, observation
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        with _SDKStreamStep(self.observation):
+            return await self.inner.__anext__()
+
+
+def _bind_sdk_stream_completion(result):
+    # Instance-only integration with the pinned SDK. Preserve its public
+    # response/stream identity, native parser, close semantics and exceptions.
+    # No extra reads, draining, finish_reason inference or global SDK patch.
+    import openai
+
+    if not isinstance(result, (openai.Stream, openai.AsyncStream)):
+        return result
+    observation = result.response.extensions.get(_OBSERVATION_EXTENSION)
+    if not isinstance(observation, _Observation):
+        return result
+    if isinstance(result._iterator, (_SDKStreamIterator, _SDKAsyncStreamIterator)):
+        return result
+    wrapper = _SDKAsyncStreamIterator if isinstance(result, openai.AsyncStream) else _SDKStreamIterator
+    result._iterator = wrapper(result._iterator, observation)
+    return result
 
 
 class _SyncBody(httpx.SyncByteStream):
@@ -706,7 +785,7 @@ class _SyncBody(httpx.SyncByteStream):
                     self.owner[0].close()
                     self.owner[1].close()
             finally:
-                self.observation.finish(outcome, error)
+                self.observation.close_or_defer(outcome, error)
 
     def close(self):
         self.close_with("abandoned")
@@ -747,7 +826,7 @@ class _AsyncBody(httpx.AsyncByteStream):
                     await self.owner[0].aclose()
                     self.owner[1].close()
         finally:
-            self.observation.finish(outcome, error)
+            self.observation.close_or_defer(outcome, error)
 
     async def aclose(self):
         await self.close_with("abandoned")
@@ -793,9 +872,9 @@ class _SyncTransport(httpx.BaseTransport):
             if isinstance(error, (EgressDispatchDenied, EgressOutcomeUnrecorded)):
                 _raise_governance(error)
             raise
-        response.stream = _SyncBody(
-            response.stream, _Observation(tickets, response.status_code), owner
-        )
+        observation = _Observation(tickets, response.status_code)
+        response.extensions[_OBSERVATION_EXTENSION] = observation
+        response.stream = _SyncBody(response.stream, observation, owner)
         return response
 
     def close(self):
@@ -841,9 +920,9 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
             if isinstance(error, (EgressDispatchDenied, EgressOutcomeUnrecorded)):
                 _raise_governance(error)
             raise
-        response.stream = _AsyncBody(
-            response.stream, _Observation(tickets, response.status_code), owner
-        )
+        observation = _Observation(tickets, response.status_code)
+        response.extensions[_OBSERVATION_EXTENSION] = observation
+        response.stream = _AsyncBody(response.stream, observation, owner)
         return response
 
     async def aclose(self):
@@ -1019,7 +1098,9 @@ def bind_inference_client(client):
             token = _sdk_active.set(True)
             capture_token = _sdk_capture_tickets.set([] if _capture.get() is not None else None)
             try:
-                return _observe_sdk_response_model(await original(*args, **kwargs))
+                return _observe_sdk_response_model(
+                    _bind_sdk_stream_completion(await original(*args, **kwargs))
+                )
             except _GovernanceEscape as escape:
                 raise escape.original from None
             finally:
@@ -1032,7 +1113,9 @@ def bind_inference_client(client):
             token = _sdk_active.set(True)
             capture_token = _sdk_capture_tickets.set([] if _capture.get() is not None else None)
             try:
-                return _observe_sdk_response_model(original(*args, **kwargs))
+                return _observe_sdk_response_model(
+                    _bind_sdk_stream_completion(original(*args, **kwargs))
+                )
             except _GovernanceEscape as escape:
                 raise escape.original from None
             finally:

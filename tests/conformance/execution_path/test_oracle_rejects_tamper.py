@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import base64
 import json
+import hashlib
 import sqlite3
 import subprocess
 import sys
+import pytest
 from pathlib import Path
 
 from ares_runtime.execution_record import ExecutionRecordV1, ExecutionState
@@ -16,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[3]
 ORACLE = ROOT / "scripts" / "verify_execution_record.py"
 
 
-def _seed(tmp_path):
+def _seed(tmp_path, *, sdk_completion=False):
     body = b'{"model":"local","messages":[{"role":"user","content":"hello"}]}'
     execution_id = "turn:api:1:0"
     materialization_ref = "ares-materialization:" + "a" * 64
@@ -73,14 +75,22 @@ def _seed(tmp_path):
             wire_bytes=len(body),
             governor_qualified=True,
             governor_mode="enforce",
+            dispatch_intent_refs=['ares-dispatch-intent:one'],
         )
-        db.transition_execution_record(
-            execution_id,
-            ExecutionState.SETTLED.value,
-            terminal_outcome="ok",
-            response_digest="sha256:" + "c" * 64,
-            http_status=200,
-        )
+        if sdk_completion:
+            db.settle_sdk_stream_execution(
+                execution_id, dispatch_intent_ref='ares-dispatch-intent:one',
+                observed_prefix_digest='sha256:' + 'c' * 64, observed_prefix_bytes=17,
+                http_status=200,
+            )
+        else:
+            db.transition_execution_record(
+                execution_id,
+                ExecutionState.SETTLED.value,
+                terminal_outcome="ok",
+                response_digest="sha256:" + "c" * 64,
+                http_status=200,
+            )
     finally:
         db.close()
     capture = tmp_path / "capture.jsonl"
@@ -154,6 +164,45 @@ def test_oracle_rejects_a_tampered_capture(tmp_path):
     report = json.loads(result.stdout)
     assert report["ok"] is False
     assert report["failures"][0]["code"] == "WIRE_CAPTURE_MISMATCH"
+
+
+def test_oracle_accepts_sdk_completion_with_honest_prefix_evidence(tmp_path):
+    db_path, capture, _execution_id, _body = _seed(tmp_path, sdk_completion=True)
+    result = _run(db_path, capture)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('tamper', ['missing', 'changed', 'rebound', 'eof'])
+def test_oracle_rejects_invalid_sdk_completion_receipt(tmp_path, tamper):
+    db_path, capture, execution_id, _body = _seed(tmp_path, sdk_completion=True)
+    with sqlite3.connect(db_path) as conn:
+        key = 'execution:' + execution_id
+        record = json.loads(conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()[0])
+        ref = record['receipt_refs'][0]
+        receipt = json.loads(conn.execute('SELECT value FROM state_meta WHERE key=?', (ref,)).fetchone()[0])
+        if tamper == 'missing':
+            conn.execute('DELETE FROM state_meta WHERE key=?', (ref,))
+        elif tamper == 'changed':
+            receipt['observed_prefix_bytes'] += 1
+            conn.execute('UPDATE state_meta SET value=? WHERE key=?', (json.dumps(receipt), ref))
+        else:
+            if tamper == 'rebound':
+                receipt['execution_id'] = 'other:api:1:0'
+            else:
+                receipt['response_complete'] = True
+            encoded = json.dumps(receipt, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+            new_ref = 'execution-sdk-completion:' + hashlib.sha256(encoded.encode()).hexdigest()
+            conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (new_ref, encoded))
+            record['receipt_refs'] = [new_ref]
+            record.pop('record_digest')
+            encoded_record = json.dumps(record, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+            record['record_digest'] = 'sha256:' + hashlib.sha256(encoded_record.encode()).hexdigest()
+            conn.execute('UPDATE state_meta SET value=? WHERE key=?', (json.dumps(record), key))
+    result = _run(db_path, capture)
+    assert result.returncode == 1
+    expected = {'missing': 'SDK_COMPLETION_RECEIPT_MISSING', 'changed': 'SDK_COMPLETION_DIGEST_MISMATCH',
+                'rebound': 'SDK_COMPLETION_BINDING_MISMATCH', 'eof': 'SDK_COMPLETION_SCHEMA_MISMATCH'}
+    assert json.loads(result.stdout)['failures'][0]['code'] == expected[tamper]
 
 
 def test_oracle_runs_isolated_without_producer_imports(tmp_path):

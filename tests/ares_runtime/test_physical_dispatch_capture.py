@@ -133,9 +133,15 @@ def test_streamed_sdk_events_retain_actual_model_without_response_text(provider)
             stream.close()
         row = capture.snapshot()[0]
         assert row["provider_response_model"] == "stream-returned-model"
-        # OpenAI's [DONE] ends SDK parsing before the body iterator reaches EOF;
-        # closing that unread tail must remain abandoned, not manufactured ok.
-        assert row["outcome"] == ("abandoned" if provider == "openai" else "ok")
+        # Per the sole-settlement-owner decision (2026-11-10): the SDK stream
+        # iterator owns the outcome. At [DONE] the pinned SDK ends parsing
+        # with an unread HTTP tail; the iterator settles this as an exhausted
+        # SDK stream (completion_evidence=native_openai_sdk_stream_exhausted),
+        # superseding the pre-iterator expectation of "abandoned" here.
+        assert row["outcome"] == "ok"
+        assert row["response"].get("completion_evidence") == (
+            "native_openai_sdk_stream_exhausted" if provider == "openai" else None
+        )
         assert "private-answer" not in json.dumps(row)
     finally:
         sdk.close()
