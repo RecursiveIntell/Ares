@@ -3,8 +3,8 @@
   "repositories": {
     "Libraries": {
       "url": "https://github.com/RecursiveIntell/Libraries.git",
-      "ref": "refs/heads/closeout/libraries-audit-20261109",
-      "commit": "2938ae3f7eb9bba705ff04c884fe455bfb197483"
+      "ref": "refs/heads/main",
+      "commit": "12d865e966dd6ca078ac1078b697da35ac559251"
     },
     "agent-memory-kits": {
       "url": "https://github.com/RecursiveIntell/agent-memory-kits.git",
