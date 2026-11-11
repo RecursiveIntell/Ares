@@ -195,15 +195,13 @@ def _codex_sdk_request_body(payload):
     checked separately, before any trusted transport derivation.
     """
     try:
-        from openai._base_client import _merge_mappings
-        body = {key: value for key, value in payload.items()
-                if key not in {"extra_body", "timeout", "extra_headers", "headers"}}
-        extra = payload.get("extra_body")
-        if extra is not None:
-            if type(extra) is not dict:
-                raise ContextDispatchError("CONTEXT_DISPATCH_WIRE_OVERRIDE_UNQUALIFIED")
-            body = _merge_mappings(body, extra)
-        return body
+        from ares_runtime.managed_calls import openai_sdk_request_body
+        from ares_runtime.collaboration import ContractError
+
+        try:
+            return openai_sdk_request_body(payload)
+        except ContractError as exc:
+            raise ContextDispatchError(exc.code) from None
     except ContextDispatchError:
         raise
     except Exception:

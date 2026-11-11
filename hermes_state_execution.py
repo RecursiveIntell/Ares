@@ -7,6 +7,8 @@ projection of the head history; pruning them never changes the head.
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 import sqlite3
 from collections.abc import Callable
 from typing import Any, Mapping
@@ -207,6 +209,49 @@ class SessionExecutionRecordMixin:
                 conn, execution_id, new_state, **updates
             )
         )
+
+    def settle_sdk_stream_execution(
+        self, execution_id: str, *, dispatch_intent_ref: str,
+        observed_prefix_digest: str, observed_prefix_bytes: int, http_status: int,
+    ) -> ExecutionRecordV1:
+        """Atomically bind native SDK completion without claiming HTTP-body EOF.
+
+        The immutable receipt is evidence owned by this store, referenced by
+        the authoritative record head; it is not another execution state.
+        """
+        if (not isinstance(observed_prefix_digest, str)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", observed_prefix_digest)
+                or type(observed_prefix_bytes) is not int or observed_prefix_bytes <= 0
+                or type(http_status) is not int or not 100 <= http_status <= 599):
+            raise ExecutionRecordStoreError("INVALID_SDK_STREAM_COMPLETION")
+        receipt = {
+            "schema": "ares.sdk-stream-completion/v1", "execution_id": execution_id,
+            "dispatch_intent_ref": dispatch_intent_ref,
+            "completion_evidence": "native_openai_sdk_stream_exhausted",
+            "response_complete": False, "observed_prefix_digest": observed_prefix_digest,
+            "observed_prefix_bytes": observed_prefix_bytes, "http_status": http_status,
+        }
+        encoded = _canonical(receipt)
+        ref = "execution-sdk-completion:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+        def commit(conn):
+            current = self._read_execution_on_conn(conn, execution_id)
+            if current.is_terminal:
+                return current
+            value = current.to_dict()
+            if dispatch_intent_ref not in value["dispatch_intent_refs"]:
+                raise ExecutionRecordStoreError("SDK_COMPLETION_INTENT_MISMATCH")
+            conn.execute("INSERT OR IGNORE INTO state_meta(key,value) VALUES(?,?)", (ref, encoded))
+            stored = conn.execute("SELECT value FROM state_meta WHERE key=?", (ref,)).fetchone()
+            if stored is None or _value(stored) != encoded:
+                raise ExecutionRecordStoreError("SDK_COMPLETION_RECEIPT_MISMATCH")
+            return self.transition_execution_record_on_conn(
+                conn, execution_id, ExecutionState.SETTLED.value, terminal_outcome="ok",
+                response_digest=None, http_status=http_status,
+                receipt_refs=[*value["receipt_refs"], ref],
+            )
+
+        return self._execute_write(commit)
 
     def append_dispatch_intent_on_conn(
         self,

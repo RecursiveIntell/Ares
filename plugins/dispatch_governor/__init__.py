@@ -70,10 +70,11 @@ def _route_reference(route: Any) -> str | None:
 
 
 class _GovernorTicket:
-    def __init__(self, store, execution_id: str, mode: str) -> None:
+    def __init__(self, store, execution_id: str, mode: str, dispatch_intent_ref: str | None = None) -> None:
         self.store = store
         self.execution_id = execution_id
         self.mode = mode
+        self.dispatch_intent_ref = dispatch_intent_ref
 
     def settle(
         self, *, outcome: str, response: Any = None, error: BaseException | None = None
@@ -117,6 +118,16 @@ class _GovernorTicket:
                 http_status = status
 
         try:
+            if (outcome == "ok" and isinstance(response, Mapping)
+                    and response.get("completion_evidence") == "native_openai_sdk_stream_exhausted"):
+                if response.get("response_complete") is not False or response_digest is not None:
+                    raise ExecutionRecordStoreError("INVALID_SDK_STREAM_COMPLETION")
+                self.store.settle_sdk_stream_execution(
+                    self.execution_id, dispatch_intent_ref=self.dispatch_intent_ref,
+                    observed_prefix_digest=response.get("observed_prefix_digest"),
+                    observed_prefix_bytes=response.get("response_bytes"), http_status=http_status,
+                )
+                return
             if outcome == "denied_by_peer":
                 target = (
                     "denied"
@@ -192,6 +203,12 @@ class DispatchGovernor:
         if not execution_id:
             return None
 
+        if self.mode == "enforce" and payload.get("qualification_error"):
+            raise EgressDispatchDenied(
+                "DISPATCH_MATERIALIZATION_UNQUALIFIED",
+                "physical send has no qualified materialization",
+            )
+
         store = self._get_store()
         intent = payload.get("dispatch_intent_ref")
         if not isinstance(intent, str) or not intent:
@@ -223,7 +240,7 @@ class DispatchGovernor:
                             "DISPATCH_WIRE_UNQUALIFIED",
                             "physical send has no qualified wire digest",
                         )
-                    return _GovernorTicket(store, execution_id, self.mode)
+                    return _GovernorTicket(store, execution_id, self.mode, intent)
                 store.transition_execution_record(
                     execution_id,
                     "send_started",
@@ -242,7 +259,7 @@ class DispatchGovernor:
                 current = store.read_execution_record(execution_id)
                 if current.state == "send_started":
                     store.append_dispatch_intent(execution_id, intent)
-                    return _GovernorTicket(store, execution_id, self.mode)
+                    return _GovernorTicket(store, execution_id, self.mode, intent)
                 if current.is_terminal:
                     return None
             if exc.code == "ALREADY_TERMINAL":
@@ -253,7 +270,7 @@ class DispatchGovernor:
                     f"pre-send marker could not be committed: {exc.code}",
                 ) from exc
             logger.warning("dispatch governor observe failure: %s", exc)
-        return _GovernorTicket(store, execution_id, self.mode)
+        return _GovernorTicket(store, execution_id, self.mode, intent)
 
 
 def register(ctx) -> None:

@@ -31,8 +31,16 @@ def endpoint():
                                                                 'input_tokens': 1, 'output_tokens': 1},
                                'candidates': [{'content': {'role': 'model', 'parts': [{'text': 'ok'}]}, 'finishReason': 'STOP'}],
                                'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': 'ok'}, 'finish_reason': 'stop'}]}).encode()
+            streaming = status == 200 and json.loads(body).get('stream') is True
+            if streaming:
+                chunks = [
+                    {'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': 'ok'}, 'finish_reason': None}]},
+                    {'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]},
+                    {'choices': [], 'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}},
+                ]
+                data = ''.join('data: ' + json.dumps({'id': 'local', 'object': 'chat.completion.chunk', 'model': 'local', **chunk}) + '\n\n' for chunk in chunks).encode() + b'data: [DONE]\n\n'
             self.send_response(status)
-            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Type', 'text/event-stream' if streaming else 'application/json')
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
             self.wfile.write(data)

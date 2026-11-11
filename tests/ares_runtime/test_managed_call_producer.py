@@ -80,8 +80,10 @@ def test_v2_is_closed_and_never_claims_v1_integrations():
 
 
 
-def test_persisted_owner_release_input_phase_to_actual_send(db,tmp_path,endpoint,monkeypatch):
+@pytest.mark.parametrize('stream', [False, True])
+def test_persisted_owner_release_input_phase_to_actual_send(db,tmp_path,endpoint,monkeypatch,stream):
     import hashlib,json,subprocess
+    import httpx
     from pathlib import Path
     from ares_runtime import local_runtime
     from ares_runtime.physical_dispatch import inference_call_scope
@@ -112,16 +114,26 @@ def test_persisted_owner_release_input_phase_to_actual_send(db,tmp_path,endpoint
         observations.append(payload)
         return SimpleNamespace(transport_lease=lease(),settle=lambda **kw:outcomes.append(kw))
     monkeypatch.setattr(middleware,'_get_middleware_callbacks',lambda _: [enforce])
-    payload={'model':'local','messages':[{'role':'user','content':'private prompt'}],'max_tokens':7}
+    payload={'model':'local','messages':[{'role':'user','content':'private prompt'}],'max_tokens':7,
+             'stream':stream,'timeout':httpx.Timeout(5),
+             'extra_headers':{'x-private-transport':'not-body'},
+             'extra_body':{'temperature':0.25}}
     url,bodies,_=endpoint
     with client(url) as sdk,inference_call_scope(agent,payload):
-        sdk.chat.completions.create(**payload)
+        response=sdk.chat.completions.create(**payload)
+        if stream:
+            assert list(response)
     assert len(bodies)==len(observations)==len(outcomes)==1
     context=observations[0]['materialization']['context']
     assert context['source_revision']==expected_source['source_revision']
     assert context['source_digest']==expected_source['source_digest']
     assert context['turn_ref']==phase['phase_id']
     assert context['session_generation']==0 and context['integration_claims']=='not_claimed'
+    body=json.loads(bodies[0])
+    assert body['temperature']==0.25
+    assert not {'timeout','extra_headers','extra_body'}.intersection(body)
+    canonical=json.dumps(body,ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+    assert context['request_digest']=='sha256:'+hashlib.sha256(canonical).hexdigest()
     assert 'private prompt' not in json.dumps(observations)
     assert 'private prompt' not in str(db.read_model_dispatch_materialization(observations[0]['materialization']['materialization_ref']))
     # Readback survives an actual reopen, not an adapter-local cache.
