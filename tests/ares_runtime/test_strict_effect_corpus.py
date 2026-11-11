@@ -40,6 +40,15 @@ CORPUS = {
     "bfl_flux3_keyframes_to_video": {"prompt": "pan", "input_images": ["a.png", "b.png"]},
     "bfl_flux3_text_to_video": {"prompt": "waves", "duration": 4},
     "bfl_flux3_video_continuation": {"prompt": "continue", "input_video": "clip.mp4"},
+    # Task 2.1 effect tools (schemas are the tools' own declared *SCHEMA
+    # parameters via _tool_declared_effect_schema). Payloads are inert:
+    # list/search shapes never mutate anything.
+    "cronjob": {"action": "list"},
+    "process": {"action": "list"},
+    "memory": {"action": "add", "target": "memory", "content": "corpus probe"},
+    "skill_manage": {"action": "list", "name": "corpus-probe"},
+    "setup_mcp": {"server": "corpus-probe"},
+    "delegate_task": {"tasks": [{"goal": "corpus probe"}]},
 }
 
 
