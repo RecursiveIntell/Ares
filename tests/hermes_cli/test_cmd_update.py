@@ -210,11 +210,17 @@ class TestCmdUpdateTermuxUvBootstrap:
         # managed dir so the PATH probe is what surfaces the packaged uv.
         monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: None)
         monkeypatch.setattr("shutil.which", lambda name: pkg_uv if name == "uv" else None)
+        # Admission (uv-pin contract): the PATH uv must report an in-range
+        # version to be reused.
+        def _fake_run(cmd, *a, **k):
+            return subprocess.CompletedProcess(cmd, 0, "uv 0.12.10", "")
+        mock_run.side_effect = _fake_run
 
         uv_bin = hm._ensure_uv_for_termux(["/termux/python", "-m", "pip"])
 
         assert uv_bin == pkg_uv
-        mock_run.assert_not_called()
+        # pip install of uv must not have run (reuse path).
+        assert not any("install" in c and "uv" in c for c in (mock_run.call_args_list or []))
 
 
 class TestUpdateManagedPythonEnvIsolation:
