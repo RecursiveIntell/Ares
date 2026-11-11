@@ -93,13 +93,25 @@ export function applyGoalState(
   const now = Date.now()
 
   if (status === 'done') {
-    setSessionGoal(mapKey, { status: 'done', title: title || 'Standing goal', updatedAt: now, writtenBy: 'structured', runtimeId: opts?.runtimeId })
+    setSessionGoal(mapKey, {
+      status: 'done',
+      title: title || 'Standing goal',
+      updatedAt: now,
+      writtenBy: 'structured',
+      runtimeId: opts?.runtimeId
+    })
 
     return
   }
 
   if (status === 'paused') {
-    setSessionGoal(mapKey, { status: 'paused', title: title || 'Standing goal', updatedAt: now, writtenBy: 'structured', runtimeId: opts?.runtimeId })
+    setSessionGoal(mapKey, {
+      status: 'paused',
+      title: title || 'Standing goal',
+      updatedAt: now,
+      writtenBy: 'structured',
+      runtimeId: opts?.runtimeId
+    })
 
     return
   }
@@ -356,6 +368,7 @@ async function performVerificationHydration(
     } else if (next) {
       // Goal confirmed live — restore/keep and reset the counter.
       hydrationVerifyCounts.delete(mapKey)
+
       if (next.status === 'done') {
         clearSessionGoal(mapKey)
 
@@ -401,10 +414,7 @@ export function rehouseGoalChip(fromKey: string, toKey: string) {
   $goalsBySession.set({ ...rest, [toKey]: chip })
 }
 
-export async function refreshSessionGoal(
-  sid: string,
-  opts?: { mapKey?: string }
-): Promise<void> {
+export async function refreshSessionGoal(sid: string, opts?: { mapKey?: string }): Promise<void> {
   const gateway = $gateway.get()
 
   if (!sid || !gateway || isSessionGone(sid)) {
