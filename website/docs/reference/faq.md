@@ -192,7 +192,7 @@ terminal:
 
 **Solution:**
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+curl -LsSf https://astral.sh/uv/0.12.24/install.sh | sh
 source ~/.bashrc
 ```
 
