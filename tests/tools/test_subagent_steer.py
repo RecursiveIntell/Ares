@@ -11,11 +11,24 @@ the subagent.steer gateway RPC that fronts the helper.
 import threading
 from unittest.mock import MagicMock
 
+import pytest
+
 from tools.delegate_tool import (
     _register_subagent,
     _unregister_subagent,
     steer_subagent,
 )
+
+
+@pytest.fixture(autouse=True)
+def _bounded_child_wall_clock(monkeypatch):
+    """Task 2.2 is fail-closed: bound every probe child on the wall clock.
+
+    Mirrors tests/agent/test_delegated_window_enforcement.py, which patches
+    _get_child_timeout as the sanctioned bounding seam; without a bound the
+    child refusal (delegated_expiry) rejects the probe before it starts.
+    """
+    monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 600.0)
 
 
 class _StubAgent:

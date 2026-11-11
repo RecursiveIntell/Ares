@@ -43,6 +43,11 @@ def _make_mock_parent(depth=0):
     parent.session_estimated_cost_usd = 0.0
     parent.session_cost_source = "none"
     parent.session_cost_status = "unknown"
+    # Task 2.2 (debit from parent) requires a real parent iteration budget;
+    # delegation refuses an unbounded child rather than guessing one.
+    from agent.iteration_budget import IterationBudget
+
+    parent.iteration_budget = IterationBudget(max_total=1000)
     return parent
 
 
@@ -66,7 +71,11 @@ def _make_mock_child(cost=0.1234567, cost_status="estimated"):
 class TestCostInResultEntry(unittest.TestCase):
     def _run(self, child):
         parent = _make_mock_parent()
-        with patch("run_agent.AIAgent", return_value=child):
+        # Task 2.2 is fail-closed: a child with no timeout and no grant window
+        # is unbounded and refused. Give the probe a bounded wall clock.
+        with patch("tools.delegate_tool._get_child_timeout", return_value=600.0), patch(
+            "run_agent.AIAgent", return_value=child
+        ):
             result = json.loads(
                 delegate_task(goal="Test per-delegation cost", parent_agent=parent)
             )

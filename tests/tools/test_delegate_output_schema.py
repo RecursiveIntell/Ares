@@ -16,6 +16,8 @@ import json
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.delegate_tool import (
     DELEGATE_TASK_SCHEMA,
     _run_single_child,
@@ -41,6 +43,17 @@ ADDRESS_SCHEMA = {
 # ---------------------------------------------------------------------------
 # Helper-module unit tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _bounded_child_wall_clock(monkeypatch):
+    """Task 2.2 is fail-closed: bound every probe child on the wall clock.
+
+    Mirrors tests/agent/test_delegated_window_enforcement.py, which patches
+    _get_child_timeout as the sanctioned bounding seam; without a bound the
+    child refusal (delegated_expiry) rejects the probe before it starts.
+    """
+    monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 600.0)
 
 
 class TestValidateOutput:
@@ -270,7 +283,12 @@ class TestRunSingleChildSchemaValidation:
 
 
 def _make_mock_parent():
+    from agent.iteration_budget import IterationBudget
+
     parent = MagicMock()
+    # Task 2.2 (debit from parent): delegation requires a real parent budget;
+    # a bare MagicMock would make the child unbounded, which is refused.
+    parent.iteration_budget = IterationBudget(500)
     parent._delegate_depth = 0
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
