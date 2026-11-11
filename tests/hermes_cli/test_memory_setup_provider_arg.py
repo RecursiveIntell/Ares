@@ -55,6 +55,10 @@ class TestInstallDependenciesRunner:
             calls.append(cmd)
             if run_behavior:
                 return run_behavior(cmd)
+            if cmd and cmd[-1] == "--version":
+                # Managed-uv range-admission probe (Task 1.1): report an
+                # in-range uv so the uv tier is taken.
+                return SimpleNamespace(returncode=0, stdout="uv 0.12.24\n", stderr="")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         # The hermetic conftest sets HERMES_DISABLE_LAZY_INSTALLS=1 so no test
@@ -74,7 +78,10 @@ class TestInstallDependenciesRunner:
             tmp_path, lambda b: "/usr/bin/uv" if b == "uv" else None
         )
         assert calls
-        assert calls[0][:3] == ["/usr/bin/uv", "pip", "install"]
+        # calls[0] is the range-admission probe (Task 1.1); calls[1] the
+        # uv-tier install.
+        assert calls[0] == ["/usr/bin/uv", "--version"]
+        assert calls[1][:3] == ["/usr/bin/uv", "pip", "install"]
 
     def test_falls_back_to_pip_when_uv_missing(self, tmp_path):
         """No uv but pip importable -> python -m pip install."""
