@@ -1432,7 +1432,7 @@ class CandidateStore:
             snapshot["certification_set_manifest"],
             snapshot["sealed_candidate_manifest"],
         )
-        for ref, schema, field in (
+        for ref, schema, ref_field in (
             (core_ref, "CandidateCoreV2", "candidate_id"),
             (cert_ref, "CertificationSetV2", "certification_set_id"),
             (seal_ref, "SealedCandidateV2", "sealed_candidate_id"),
@@ -1450,8 +1450,8 @@ class CandidateStore:
                 value = _strict_json_object(raw)
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 raise CandidateStoreError("CUSTODY_CORRUPT", "manifest JSON") from exc
-            self._require_identity(value, schema, field)
-            if value[field] != ref["id"]:
+            self._require_identity(value, schema, ref_field)
+            if value[ref_field] != ref["id"]:
                 raise CandidateStoreError("CUSTODY_CORRUPT", "manifest identity")
         core_raw = _read_regular_at(candidate_fd, core_ref["relative_path"])
         cert_raw = _read_regular_at(candidate_fd, cert_ref["relative_path"])
@@ -1479,7 +1479,7 @@ class CandidateStore:
         ):
             raise CandidateStoreError("CUSTODY_CORRUPT", "identity binding")
         self._validate_non_authorizing_certification_fd(candidate_fd, cert, snapshot)
-        for reference, schema, field in (
+        for reference, schema, ref_field in (
             (
                 snapshot["post_seal_evidence_set"],
                 "PostSealEvidenceSetV1",
@@ -1501,9 +1501,9 @@ class CandidateStore:
             if sha256_bytes(raw) != reference["sha256"]:
                 raise CandidateStoreError("CUSTODY_CORRUPT", "post-seal object digest")
             value = self._read_json_at(candidate_fd, reference["relative_path"])
-            self._require_identity(value, schema, field)
+            self._require_identity(value, schema, ref_field)
             if (
-                value[field] != reference["id"]
+                value[ref_field] != reference["id"]
                 or value.get("candidate_id") != core["candidate_id"]
                 or value.get("certification_set_id") != cert["certification_set_id"]
                 or value.get("sealed_candidate_id") != sealed["sealed_candidate_id"]
@@ -2044,9 +2044,9 @@ class CandidateStore:
                 "max": None,
             }
             summary_values: dict[str, dict[str, Any]] = {}
-            for field, fraction in summaries.items():
+            for summary_field, fraction in summaries.items():
                 summary = exact_object(
-                    record[field], set(summary_metric_names), f"{field} schema"
+                    record[summary_field], set(summary_metric_names), f"{summary_field} schema"
                 )
                 expected = {
                     metric_id: (
@@ -2063,8 +2063,8 @@ class CandidateStore:
                     or summary[metric_id] != expected[metric_id]
                     for metric_id in summary_metric_names
                 ):
-                    fail(f"{field} evidence")
-                summary_values[field] = expected
+                    fail(f"{summary_field} evidence")
+                summary_values[summary_field] = expected
             for metric_id, hard_limit in (
                 ("compaction_latency_ms", 5000),
                 ("restart_load_latency_ms", 500),
@@ -2378,7 +2378,6 @@ class CandidateStore:
                 os.close(source_fd)
                 raise CandidateStoreError("PUBLICATION_CONFLICT", sealed_id)
             incoming_name = uuid.uuid4().hex
-            incoming = self.candidates_root / ".incoming" / incoming_name
             incoming_parent_fd = _open_directory_at(candidates_fd, ".incoming")
             try:
                 os.mkdir(incoming_name, mode=0o700, dir_fd=incoming_parent_fd)

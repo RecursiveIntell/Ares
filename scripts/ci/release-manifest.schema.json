@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:recursiveintell:schemas:ares-release-manifest-v1",
+  "title": "Ares immutable release manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repositories", "submodules", "toolchains"],
+  "properties": {
+    "schema": {"const": "ares-release-manifest/v1"},
+    "repositories": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["Libraries", "agent-memory-kits", "agent-graph-mcp", "recursive-agent"],
+      "properties": {
+        "Libraries": {"$ref": "#/$defs/repository"},
+        "agent-memory-kits": {"$ref": "#/$defs/repository"},
+        "agent-graph-mcp": {"$ref": "#/$defs/repository"},
+        "recursive-agent": {"$ref": "#/$defs/repository"}
+      }
+    },
+    "submodules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["semantic-memory-mcp"],
+      "properties": {
+        "semantic-memory-mcp": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["parent", "path", "url", "commit"],
+          "properties": {
+            "parent": {"const": "Libraries"},
+            "path": {"const": "semantic-memory-mcp"},
+            "url": {"const": "https://github.com/RecursiveIntell/semantic-memory-mcp.git"},
+            "commit": {"$ref": "#/$defs/sha"}
+          }
+        }
+      }
+    },
+    "toolchains": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["python_runtime", "manifest_python", "rust"],
+      "properties": {
+        "python_runtime": {"const": "3.14"},
+        "manifest_python": {"const": "3.14"},
+        "rust": {"const": "1.99.1"}
+      }
+    }
+  },
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "ref", "commit"],
+      "properties": {
+        "url": {"type": "string", "pattern": "^https://github\\.com/RecursiveIntell/[A-Za-z0-9_.-]+\\.git$"},
+        "ref": {"type": "string", "pattern": "^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,240}$"},
+        "commit": {"$ref": "#/$defs/sha"}
+      }
+    }
+  }
+}

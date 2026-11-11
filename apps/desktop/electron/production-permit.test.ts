@@ -59,6 +59,13 @@ function envelope(root: string): ProductionApprovalEnvelope {
 }
 
 describe('production permit Electron signer', () => {
+  it('uses locale-independent UTF-8 byte ordering matching the Rust verifier', () => {
+    // The pinned Rust owner currently sorts String keys by UTF-8 bytes. This
+    // pair distinguishes that order from UTF-16/RFC 8785 surrogate ordering.
+    expect(canonicalizeProductionPermit({ '': 1, '𐀀': 2 })).toBe('{"":1,"𐀀":2}')
+    expect(canonicalizeProductionPermit({ '😀': 1, Z: 2 })).toBe('{"Z":2,"😀":1}')
+  })
+
   it('fails closed without encrypted safeStorage and does not create plaintext key material', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ares-permit-'))
     const controller = createProductionPermitController(root, new FakeSafeStorage(false))

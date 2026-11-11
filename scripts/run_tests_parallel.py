@@ -906,6 +906,13 @@ def main() -> int:
         return False
 
     argv = sys.argv[1:]
+    # Audit L7: honor help before any discovery or pytest dispatch. Only the
+    # runner's own region (before an explicit "--") is inspected, so pytest
+    # passthrough flags after "--" are never intercepted here.
+    _runner_region = argv[: argv.index("--")] if "--" in argv else argv
+    if any(tok in ("-h", "--help") for tok in _runner_region):
+        parser.print_help()
+        return 0
     if "--" in argv:
         sep = argv.index("--")
         before, explicit_passthrough = argv[:sep], argv[sep + 1 :]

@@ -104,7 +104,9 @@ function canonicalize(value: unknown): string {
   }
 
   if (typeof value === 'object') {
-    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+      Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'))
+    )
 
     return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalize(item)}`).join(',')}}`
   }

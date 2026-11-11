@@ -17,6 +17,17 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(autouse=True)
+def _bounded_child_wall_clock(monkeypatch):
+    """Task 2.2 is fail-closed: bound every probe child on the wall clock.
+
+    Mirrors tests/agent/test_delegated_window_enforcement.py, which patches
+    _get_child_timeout as the sanctioned bounding seam; without a bound the
+    child refusal (delegated_expiry) rejects the probe before it starts.
+    """
+    monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 600.0)
+
+
 def _python_with_repo_path(code: str) -> str:
     """Build a shell command running *code* with the repo under test on PYTHONPATH."""
     return (
@@ -98,6 +109,7 @@ def test_build_child_agent_strips_kanban_toolset_even_when_parent_is_worker(monk
             self.session_id = "child-session"
 
     import run_agent
+    from agent.iteration_budget import IterationBudget
     from tools import delegate_tool
 
     monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
@@ -112,6 +124,9 @@ def test_build_child_agent_strips_kanban_toolset_even_when_parent_is_worker(monk
         api_mode = "chat_completions"
         platform = "cli"
         session_id = "parent-session"
+        # Task 2.2 (debit from parent): child construction debits a real
+        # parent budget; absence would be refused as an unbounded child.
+        iteration_budget = IterationBudget(500)
 
     child = delegate_tool._build_child_agent(
         task_index=0,
