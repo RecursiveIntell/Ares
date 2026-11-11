@@ -1000,7 +1000,11 @@ def build_turn_context(
         # (the measured incident shape behind Task 2.2); surfacing it lets an
         # operator spot estimator drift before it forces a needless compaction.
         _real_prompt = getattr(_compressor, "last_real_prompt_tokens", -1)
-        if _preflight_tokens is not None and _real_prompt is not None and _real_prompt > 0:
+        if (
+            _preflight_tokens is not None
+            and isinstance(_real_prompt, int)
+            and _real_prompt > 0
+        ):
             _drift_gap = (_preflight_tokens - _real_prompt) / _real_prompt
             if _drift_gap >= 0.15:
                 logger.info(
