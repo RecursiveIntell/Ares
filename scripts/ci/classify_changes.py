@@ -31,6 +31,8 @@ Lanes:
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
 * ``context_continuity`` — exact paired native owner and Governor qualification.
 * ``current_owner_integration`` — canonical owner to Ares consumer qualification.
+* ``exec_conformance`` — execution-path conformance gates (product, test, and
+  gate-script files they read; formerly a standalone PR workflow)."
 
 Docker is not a lane — it builds on push-to-main and release only,
 never per-PR.
@@ -244,6 +246,21 @@ _CURRENT_OWNER_INTEGRATION_PATHS = (
     'tests/ares_runtime/test_policy_basis_v2.py',
     'tests/ares_runtime/fixtures/profile_runtime_v2_owner.json',
 )
+# Execution-path conformance applicability. Mirrors the former standalone
+# pull_request paths of execution-path-conformance.yml (now a ci.yaml lane):
+# any file the conformance gates read — product, test, or gate script.
+_EXEC_CONFORMANCE_PATHS = (
+    '.github/workflows/execution-path-conformance.yml',
+    'ares_runtime/**',
+    'hermes_state*.py',
+    'gateway/context_input_recovery.py',
+    'agent/conversation_loop.py',
+    'plugins/dispatch_governor/**',
+    'scripts/verify_execution_record.py',
+    'tests/conformance/execution_path/**',
+    'tests/ares_runtime/test_execution_record*.py',
+    'tests/hermes_state/test_execution_record_store.py',
+)
 _QUALIFICATION_INFRA_PATHS = ("scripts/ci/", "tests/ci/")
 _QUALIFICATION_INFRA_FILES = {"scripts/run_tests.sh", "scripts/run_tests_parallel.py"}
 
@@ -347,6 +364,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         "current_owner_integration": any(
             _qualification_path(f, _CURRENT_OWNER_INTEGRATION_PATHS) for f in files
         ),
+        "exec_conformance": any(_qualification_path(f, _EXEC_CONFORMANCE_PATHS) for f in files),
         "nix": python_prod or frontend or any(_is_nix(f) for f in files)
     }
     if not files or any(f.startswith(".github/") for f in files):
@@ -366,11 +384,13 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["ci_review"] = True
         ret["context_continuity"] = True
         ret["current_owner_integration"] = True
+        ret["exec_conformance"] = True
 
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
     if any(f.startswith(_QUALIFICATION_INFRA_PATHS) or f in _QUALIFICATION_INFRA_FILES for f in files):
         ret["context_continuity"] = True
         ret["current_owner_integration"] = True
+        ret["exec_conformance"] = True
     return ret
 
 

@@ -45,3 +45,28 @@ failure classes (`test`, `infra/network`, `admission`, `cancelled`,
 `unknown`), and a failure-signature table. Scheduled failures open or update
 one tracked issue per workflow (`ci-scheduled-failure` label) and close it on
 the next green run — no silent red.
+
+## Test-level quarantine (flaky individual tests)
+
+Lane quarantine (above) is too coarse for one flaky test. The test-level
+process is:
+
+1. **Mark, don't delete.** Add `@pytest.mark.quarantine` with a comment
+   naming the tracked issue (e.g. `# flaky: #76812, expires 2026-11-26`).
+   The marker is registered in `pyproject.toml`; unregistered markers fail
+   collection, so a typo'd marker goes red instead of silently running.
+2. **Deselect from blocking lanes.** Append `and not quarantine` to the
+   marker expression at each lane's pytest invocation (the tests.yml slice
+   step's trailing `--` args and direct `scripts/run_tests.sh` calls; the
+   default `addopts` `-m 'not integration'` is overridden per-invocation,
+   so spell the full expression: `-m 'not integration and not quarantine'`).
+3. **Track with owner + expiry.** One issue per quarantined test (or test
+   group), label `quarantine`, named owner, 14-day expiry like lane
+   quarantine. Expiry without a fix means delete-or-fix review, never silent
+   extension.
+4. **Keep the signal.** The quarantined test still runs on main-schedule or
+   on demand (same invocation without the deselect) so the flake keeps
+   producing data instead of going dark.
+
+Quarantine without an issue link or past expiry fails review, same as lane
+quarantine without owner/expiry.

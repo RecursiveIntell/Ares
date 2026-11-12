@@ -508,6 +508,7 @@ markers = [
     "linux_only: exercises Linux-specific behaviour; skipped on other hosts",
     "macos_only: exercises macOS-specific behaviour; skipped on other hosts",
     "windows_only: exercises native-Windows behaviour; skipped on other hosts",
+    "quarantine: flaky test parked by the CI quarantine process (docs/ci/lane-policy.md); deselected from blocking lanes, never deleted",
 ]
 # integration tests take way too long to run in the normal CI environments
 addopts = "-m 'not integration'"

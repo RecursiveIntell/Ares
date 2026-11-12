@@ -43,10 +43,11 @@ DEFAULT = {
     "ci_review": True,
     "context_continuity": True,
     "current_owner_integration": True,
+    "exec_conformance": True,
 }
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None, context_continuity=False, current_owner_integration=False) -> dict[str, bool]:
+def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None, context_continuity=False, current_owner_integration=False, exec_conformance=False) -> dict[str, bool]:
     # python_prod tracks python except for tests-only diffs; default it to
     # python so the majority of cases don't need to spell it out.
     #
@@ -73,6 +74,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
         "ci_review": ci_review,
         "context_continuity": context_continuity,
         "current_owner_integration": current_owner_integration,
+        "exec_conformance": exec_conformance,
     }
 
 
@@ -180,7 +182,21 @@ CASES = {
     # real failures, so it keeps the conservative full lane set.
     "test runner script → python_prod stays on": (
         ["scripts/run_tests_parallel.py"],
-        _lanes(python=True, scan=True, context_continuity=True, current_owner_integration=True),
+        _lanes(python=True, scan=True, context_continuity=True, current_owner_integration=True, exec_conformance=True),
+    ),
+    # Execution-path conformance lane: any file the gates read runs them.
+    # The gate script itself is product-adjacent (scripts/ are not tests-only).
+    "gate script → exec_conformance": (
+        ["scripts/verify_execution_record.py"],
+        _lanes(python=True, scan=True, exec_conformance=True),
+    ),
+    "execution record test → exec_conformance without python_prod": (
+        ["tests/ares_runtime/test_execution_record.py"],
+        _lanes(python=True, python_prod=False, scan=True, exec_conformance=True),
+    ),
+    "conformance suite file → exec_conformance without python_prod": (
+        ["tests/conformance/execution_path/test_ledger_append.py"],
+        _lanes(python=True, python_prod=False, scan=True, exec_conformance=True),
     ),
     # Supply-chain lanes
     ".pth file → scan": (["evil.pth"], _lanes(python=True, scan=True)),
