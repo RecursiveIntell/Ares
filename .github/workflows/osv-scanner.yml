@@ -40,6 +40,9 @@ permissions:
 jobs:
   scan:
     name: Scan lockfiles
+    # NOTE: timeout-minutes is not permitted on reusable-workflow-call jobs
+    # (only name/uses/with/secrets/needs/if/permissions); the scan duration
+    # is bounded by the upstream google/osv-scanner-action workflow.
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
     with:
       # Scan explicit lockfiles rather than recursing, so we only look at
@@ -58,6 +61,7 @@ jobs:
   emit-status:
     name: Emit review status
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: scan
     if: always()
     # Task 4.2: explicit minimal — this job checks out and runs PR code; it

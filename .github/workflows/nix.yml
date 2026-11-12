@@ -1,5 +1,11 @@
 name: Nix flake check
 
+# ADVISORY (non-blocking): this workflow reports its own check and is NOT a
+# needs-dependency of ``all required checks pass``. It stays independent of
+# ci.yaml for the same reason docker.yml gives: a reusable-workflow call
+# holds the caller run in progress for the full build, and GitHub refuses
+# `gh run rerun` on a run that is still in progress.
+
 # Builds every output of the flake: the package, the devShell, and the 21
 # checks under nix/checks.nix — module evaluation, option parity, .env
 # assembly, service argv, and the rest.
