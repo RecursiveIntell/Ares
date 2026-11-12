@@ -485,7 +485,13 @@ DEFAULT_CONTEXT_LENGTHS = {
     # and inherit the same 1M window. The ``deepseek`` substring entry
     # below remains as a 128K fallback for older / unknown DeepSeek model
     # ids (e.g. via custom endpoints).
+    # The dotted ``deepseek-v4.1`` generation (pro / flash, including Ollama
+    # ``:cloud`` and ``:latest`` suffixes) also ships a 1M window; it is a
+    # separate key because the dotted id does not contain ``deepseek-v4-pro``
+    # or ``deepseek-v4-flash`` as substrings and previously fell through to the
+    # 128K catch-all. Longest-key matching picks it over ``deepseek``.
     # https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+    "deepseek-v4.1": 1_000_000,
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
     "deepseek-chat": 1_000_000,
