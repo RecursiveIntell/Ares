@@ -34,10 +34,14 @@ BEFORE_TAIL_MESSAGES = 20           # protect_last_n: message count, not tokens
 
 
 def _config() -> dict[str, Any]:
+    """Host config, or {} when absent (CI has no ~/.ares)."""
     import yaml
 
     path = Path.home() / ".ares/config.yaml"
-    return yaml.safe_load(path.read_text()) or {}
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        return {}
 
 
 def configured_models(cfg: dict[str, Any]) -> list[tuple[str, str]]:
@@ -142,8 +146,8 @@ def after_row(provider: str, model: str, window: int | None,
     return row
 
 
-def build_report(policy: str = "before") -> dict[str, Any]:
-    cfg = _config()
+def build_report(policy: str = "before", config: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = config if config is not None else _config()
     compression = cfg.get("compression") or {}
     governor = (cfg.get("context") or {}).get("governor") or {}
     threshold_percent = float(compression.get("threshold") or 0.50)

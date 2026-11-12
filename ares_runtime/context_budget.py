@@ -61,7 +61,9 @@ def resolve_output_reserve(configured: int | None, window: int) -> int:
         except (TypeError, ValueError):
             value = 0
         if value > 0:
-            return min(value, max(0, window - MIN_TARGET_TOKENS))
+            # An explicit reservation always stands; only ensure it cannot
+            # consume the entire window (leave at least one input token).
+            return min(value, max(1, window - 1)) if window > 0 else value
     if window <= 0:
         return 0
     return min(

@@ -43,11 +43,21 @@ def test_report_declares_schema_and_inputs():
 
 
 def test_every_configured_model_gets_a_full_row():
-    doc = report.build_report("before")
-    assert doc["models"], "expected at least one configured model"
+    # CI has no ~/.ares/config.yaml, so the report is exercised with a synthetic
+    # config rather than depending on the operator's host.
+    synthetic = {"providers": {"p": {"default_model": "m-1m",
+                                     "models": {"m-1m": {}, "m-small": {}}}}}
+    doc = report.build_report("before", config=synthetic)
+    assert len(doc["models"]) == 2
     for row in doc["models"]:
         assert REQUIRED_ROW_KEYS <= set(row), row
         assert row["provider"] and row["model"]
+
+
+def test_report_without_any_config_is_valid_not_a_crash():
+    doc = report.build_report("before", config={})
+    assert doc["schema"] == "ares-context-budget-report/v1"
+    assert doc["models"] == []
 
 
 def test_one_million_window_reproduces_the_documented_baseline():

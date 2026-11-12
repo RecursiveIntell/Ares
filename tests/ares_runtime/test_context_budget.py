@@ -131,7 +131,7 @@ def test_output_reserve_is_derived_when_the_host_supplies_none():
 
     # An explicit host value wins and is clamped to leave an input budget.
     assert resolve_output_reserve(65_536, 1_000_000) == 65_536
-    assert resolve_output_reserve(10_000_000, 1_000_000) == 1_000_000 - 512
+    assert resolve_output_reserve(10_000_000, 1_000_000) == 1_000_000 - 1
 
 
 def test_reserve_shrinks_the_effective_window():

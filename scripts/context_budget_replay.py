@@ -37,7 +37,7 @@ def load_receipts(corpus: Path, limit: int | None = None) -> list[dict[str, Any]
     rows = []
     for path in files:
         try:
-            receipt = json.loads(path.read_text())["receipt"]
+            receipt = json.loads(path.read_text(encoding="utf-8"))["receipt"]
         except Exception:  # noqa: BLE001 - a corrupt receipt must not abort replay
             continue
         original = receipt.get("original_approx_tokens")
