@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 from agent.system_prompt import build_system_prompt, invalidate_system_prompt
 from hermes_cli import plugins
@@ -154,10 +155,17 @@ def test_fresh_process_resume_restores_identical_full_prompt_without_callback(tm
             TEST_DB=str(db_path),
             TEST_CALLS=str(calls_path),
             TEST_PHASE=phase,
+            # Run the child OUTSIDE any git repo: build_coding_workspace_block
+            # shells out to live `git status`/`git log` per build, and a git call
+            # failing or timing out under xdist contention makes the two builds
+            # differ in the Branch/Recent-commits lines (same flake the sibling
+            # test pins by monkeypatch — impossible across a subprocess boundary).
+            # The repo itself rides in via PYTHONPATH.
+            PYTHONPATH=str(Path(__file__).resolve().parents[2]),
         )
         proc = subprocess.run(
             [sys.executable, "-c", child],
-            cwd=os.getcwd(),
+            cwd=str(tmp_path),
             env=env,
             text=True,
             capture_output=True,

@@ -906,11 +906,29 @@ def main() -> int:
         return False
 
     argv = sys.argv[1:]
+    # Audit L7: honor help before any discovery or pytest dispatch. Only the
+    # runner's own region (before an explicit "--") is inspected, so pytest
+    # passthrough flags after "--" are never intercepted here.
+    _runner_region = argv[: argv.index("--")] if "--" in argv else argv
+    if any(tok in ("-h", "--help") for tok in _runner_region):
+        parser.print_help()
+        return 0
     if "--" in argv:
         sep = argv.index("--")
         before, explicit_passthrough = argv[:sep], argv[sep + 1 :]
     else:
         before, explicit_passthrough = argv, []
+
+    # Help must be served by THIS runner's parser before any routing or
+    # discovery. Bare ``-h``/``--help`` are ``-``-tokens that are not one of
+    # our flags, so without this check the routing loop below forwards them to
+    # the pytest passthrough — which only runs AFTER a full-repo discovery.
+    # On a bare ``--help`` invocation that means the "help" call effectively
+    # launches the entire suite (audit Task 6.4 witness: exit 124 at 37k
+    # tests). Explicit pytest help remains available after ``--``.
+    if not explicit_passthrough and any(tok in ("-h", "--help") for tok in before):
+        parser.print_help(sys.stdout)
+        return 0
 
     our_args: List[str] = []
     bare_passthrough: List[str] = []

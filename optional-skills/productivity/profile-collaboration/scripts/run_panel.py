@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import signal
+import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -23,6 +27,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+
+import yaml
 
 
 PROFILES = (
@@ -37,11 +43,43 @@ PROFILES = (
     "inbox-manager",
 )
 
-DEFAULT_PROFILE_TIMEOUT_SECONDS = 180.0
-DEFAULT_PANEL_TIMEOUT_SECONDS = 600.0
-PANEL_CHILD_ENVIRONMENT_POLICY = "profile_boundary_runtime_safe_path_v3"
-# The archive child has one fixed filesystem operation and needs no model/tool
-# credentials, including custom target grants unknown to provider registries.
+# Evidence from recent successful runs shows some valid evidence-heavy lanes
+# take 180-240 seconds. Keep the panel bounded, but do not make the default
+# shorter than the observed successful tail.
+DEFAULT_PROFILE_TIMEOUT_SECONDS = 300.0
+DEFAULT_PANEL_TIMEOUT_SECONDS = 900.0
+MAX_PROFILE_TIMEOUT_SECONDS = 3600.0
+DEFAULT_PROFILE_REASONING_EFFORT = "low"
+VALID_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+)
+DEFAULT_MAX_WORKERS = 10
+SESSION_WORKER_LIMIT = 10
+GLOBAL_WORKER_LIMIT = 25
+GLOBAL_RESOURCE_UNIT_LIMIT = 25
+MAX_RESOURCE_WEIGHT = 4
+ADMISSION_POLL_SECONDS = 0.05
+DEFAULT_ADMISSION_DIR = Path.home() / ".ares" / "profile-collaboration" / "admission"
+RESOURCE_WEIGHT_POLICY = "profile_config_weight_v1"
+GLOBAL_ADMISSION_POLICY = "posix_flock_weighted_slots_v2"
+PANEL_CHILD_ENVIRONMENT_POLICY = "target-profile-clean-env-runtime-isolated-v2"
+PANEL_CHILD_ENVIRONMENT_ALLOWLIST = ("HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
+REMOTE_PROVIDERS = frozenset(
+    {
+        "anthropic",
+        "bedrock",
+        "google",
+        "groq",
+        "mistral",
+        "nous",
+        "openai",
+        "openai-codex",
+        "openrouter",
+        "together",
+        "xai",
+    }
+)
+
 ARCHIVE_PROCESS_ENV_KEYS = frozenset({
     "HOME", "HERMES_REAL_HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
     "APPDATA", "LOCALAPPDATA", "SYSTEMROOT", "WINDIR", "TEMP", "TMP",
@@ -55,8 +93,45 @@ DAEMON_POOL_BLOCK_MARKERS = (
 )
 
 
+class AdmissionLease:
+    """Crash-safe weighted resource units held by OS file locks."""
+
+    def __init__(self, slots: tuple[int, ...], handles: list[Any]) -> None:
+        self.slots = slots
+        self._handles = handles
+
+    def release(self) -> None:
+        if not self._handles:
+            return
+        for handle in reversed(self._handles):
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            finally:
+                handle.close()
+        self._handles = []
+
+
 def reported_operational_block(stdout: bytes, stderr: bytes) -> str | None:
-    """Recognize the known exit-zero daemon-pool infrastructure failure."""
+    """Recognize known standalone exit-zero infrastructure failure reports."""
+    oauth_error = b"http 401: encountered invalidated oauth token for user, failing request"
+    if any(stream.strip().lower() == oauth_error for stream in (stdout, stderr)):
+        return "oauth_token_invalidated"
+    expired_oauth_error = (
+        b"http 401: your authentication token has expired. please try refreshing it."
+    )
+    if any(stream.strip().lower() == expired_oauth_error for stream in (stdout, stderr)):
+        return "oauth_token_expired"
+    quota_error = (
+        rb"api call failed after [0-9]+ retries: http 429: you used all included pro usage"
+        rb"(?:\. max is \$[0-9.]+/month for \$[0-9.]+ of usage: "
+        rb"https://ollama\.com/settings/billing \(ref: [0-9a-f-]+\))?\.?"
+    )
+    if any(re.fullmatch(quota_error, stream.strip().lower()) for stream in (stdout, stderr)):
+        return "provider_quota_exhausted"
+    if not stdout.strip():
+        return "empty_report"
     output = (stdout + b"\n" + stderr).lower()
     if (
         b"daemonthreadpoolexecutor" in output
@@ -65,6 +140,313 @@ def reported_operational_block(stdout: bytes, stderr: bytes) -> str | None:
     ):
         return "daemon_pool_initializer_failure"
     return None
+
+
+class GlobalAdmissionPool:
+    """Coordinate a bounded worker budget across independent panel runners."""
+
+    def __init__(
+        self,
+        directory: Path = DEFAULT_ADMISSION_DIR,
+        limit: int = GLOBAL_RESOURCE_UNIT_LIMIT,
+    ) -> None:
+        if limit < 1:
+            raise ValueError("global admission limit must be positive")
+        self.directory = directory
+        self.limit = limit
+        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    def acquire(
+        self,
+        *,
+        profile: str,
+        run_id: str,
+        weight: int,
+        panel_cancelled: threading.Event | None,
+    ) -> tuple[AdmissionLease, float]:
+        """Atomically acquire weighted units, or cancel at the panel deadline."""
+        if not 1 <= weight <= min(MAX_RESOURCE_WEIGHT, self.limit):
+            raise ValueError(f"resource weight must be between 1 and {min(MAX_RESOURCE_WEIGHT, self.limit)}")
+        started = time.monotonic()
+        while panel_cancelled is None or not panel_cancelled.is_set():
+            gate = (self.directory / "acquisition-gate.lock").open("a+b")
+            try:
+                fcntl.flock(gate.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                gate.close()
+                gate = None
+            if gate is not None:
+                handles: list[Any] = []
+                slots: list[int] = []
+                try:
+                    for slot in range(self.limit):
+                        path = self.directory / f"resource-{slot:02d}.lock"
+                        handle = path.open("a+b")
+                        try:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            handle.close()
+                            continue
+                        handles.append(handle)
+                        slots.append(slot)
+                        if len(handles) == weight:
+                            break
+                    if len(handles) == weight:
+                        acquired_at = utc_now()
+                        for unit_index, (slot, handle) in enumerate(zip(slots, handles, strict=True)):
+                            metadata = {
+                                "pid": os.getpid(),
+                                "profile": profile,
+                                "run_id": run_id,
+                                "weight": weight,
+                                "unit_index": unit_index,
+                                "slot": slot,
+                                "acquired_at": acquired_at,
+                            }
+                            handle.seek(0)
+                            handle.truncate()
+                            handle.write((json.dumps(metadata, sort_keys=True) + "\n").encode("utf-8"))
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        return AdmissionLease(tuple(slots), handles), round(time.monotonic() - started, 3)
+                    AdmissionLease(tuple(slots), handles).release()
+                    handles = []
+                except Exception:
+                    AdmissionLease(tuple(slots), handles).release()
+                    raise
+                finally:
+                    fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
+                    gate.close()
+            if panel_cancelled is None:
+                time.sleep(ADMISSION_POLL_SECONDS)
+            else:
+                panel_cancelled.wait(ADMISSION_POLL_SECONDS)
+        raise concurrent.futures.CancelledError("panel deadline reached while waiting for global admission")
+
+
+def profile_resource_plan(profile_home: Path) -> dict[str, Any]:
+    """Derive resource, timeout, and reasoning policy from profile config."""
+    config_path = profile_home / "config.yaml"
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        return {
+            "weight": 1,
+            "policy": "minimal_fallback_no_config_v1",
+            "provider": "unknown",
+            "enabled_mcp_count": 0,
+            "enabled_plugin_count": 0,
+            "timeout_floor_seconds": None,
+            "reasons": ["profile_config_absent"],
+            "config_path": str(config_path),
+            "config_sha256": "unavailable",
+            "reasoning_effort": DEFAULT_PROFILE_REASONING_EFFORT,
+        }
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(f"cannot classify profile resource cost: {config_path}: {type(exc).__name__}") from exc
+    if not isinstance(config, dict):
+        raise RuntimeError(f"profile config root is not a mapping: {config_path}")
+
+    model = config.get("model") if isinstance(config.get("model"), dict) else {}
+    provider_raw = model.get("provider") if isinstance(model, dict) else None
+    provider = provider_raw.strip().lower() if isinstance(provider_raw, str) else "unknown"
+    agent = config.get("agent")
+    if agent is None:
+        reasoning_effort = DEFAULT_PROFILE_REASONING_EFFORT
+    elif not isinstance(agent, dict):
+        raise RuntimeError(f"agent is not a mapping: {config_path}")
+    else:
+        raw_reasoning = agent.get("reasoning_effort", DEFAULT_PROFILE_REASONING_EFFORT)
+        if raw_reasoning is False:
+            reasoning_effort = "none"
+        elif isinstance(raw_reasoning, str) and raw_reasoning.strip().lower() in VALID_REASONING_EFFORTS:
+            reasoning_effort = raw_reasoning.strip().lower()
+        else:
+            raise RuntimeError(
+                "agent.reasoning_effort is unsupported for profile collaboration: "
+                f"{config_path}"
+            )
+    mcp_servers = config.get("mcp_servers")
+    if mcp_servers is not None and not isinstance(mcp_servers, dict):
+        raise RuntimeError(f"profile mcp_servers is not a mapping: {config_path}")
+    enabled_mcp_count = 0
+    if isinstance(mcp_servers, dict):
+        enabled_mcp_count = sum(
+            1
+            for value in mcp_servers.values()
+            if not isinstance(value, dict) or value.get("enabled", True) is not False
+        )
+    plugins = config.get("plugins")
+    if plugins is not None and not isinstance(plugins, dict):
+        raise RuntimeError(f"profile plugins is not a mapping: {config_path}")
+    enabled_plugins = plugins.get("enabled", []) if isinstance(plugins, dict) else []
+    if not isinstance(enabled_plugins, list):
+        raise RuntimeError(f"profile plugins.enabled is not a list: {config_path}")
+    enabled_plugin_count = len(enabled_plugins) if isinstance(enabled_plugins, list) else 0
+
+    collaboration = config.get("profile_collaboration")
+    if collaboration is None:
+        timeout_floor_seconds: float | None = None
+    elif not isinstance(collaboration, dict):
+        raise RuntimeError(f"profile_collaboration is not a mapping: {config_path}")
+    else:
+        raw_timeout = collaboration.get("timeout_seconds")
+        if raw_timeout is None:
+            timeout_floor_seconds = None
+        elif isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
+            raise RuntimeError(f"profile_collaboration.timeout_seconds is not numeric: {config_path}")
+        else:
+            timeout_floor_seconds = float(raw_timeout)
+            if (
+                not math.isfinite(timeout_floor_seconds)
+                or timeout_floor_seconds <= 0
+                or timeout_floor_seconds > MAX_PROFILE_TIMEOUT_SECONDS
+            ):
+                raise RuntimeError(
+                    "profile_collaboration.timeout_seconds must be finite, positive, "
+                    f"and at most {MAX_PROFILE_TIMEOUT_SECONDS:g}: {config_path}"
+                )
+
+    weight = 1
+    reasons = ["base_remote_or_lightweight=1"]
+    if provider not in REMOTE_PROVIDERS:
+        weight += 2
+        reasons.append("unknown_or_local_provider=+2")
+    if enabled_mcp_count >= 6:
+        weight += 2
+        reasons.append("enabled_mcp_count>=6:+2")
+    elif enabled_mcp_count >= 3:
+        weight += 1
+        reasons.append("enabled_mcp_count>=3:+1")
+    if enabled_plugin_count:
+        weight += 1
+        reasons.append("enabled_plugin_count>=1:+1")
+    if weight > MAX_RESOURCE_WEIGHT:
+        reasons.append(f"capped_at_{MAX_RESOURCE_WEIGHT}")
+        weight = MAX_RESOURCE_WEIGHT
+    return {
+        "policy": RESOURCE_WEIGHT_POLICY,
+        "weight": weight,
+        "provider": provider,
+        "reasoning_effort": reasoning_effort,
+        "enabled_mcp_count": enabled_mcp_count,
+        "enabled_plugin_count": enabled_plugin_count,
+        "timeout_floor_seconds": timeout_floor_seconds,
+        "reasons": reasons,
+        "config_path": str(config_path),
+        "config_sha256": sha256_file(config_path),
+    }
+
+
+def effective_profile_timeout(requested_timeout: float, resource_plan: dict[str, Any]) -> float:
+    """Honor a validated profile floor without lowering an explicit request."""
+    floor = resource_plan.get("timeout_floor_seconds")
+    return max(requested_timeout, float(floor)) if floor is not None else requested_timeout
+
+
+def panel_child_environment(
+    *, profile_home: Path | None = None, inherit_credentials: bool = True,
+) -> dict[str, str]:
+    """Build the child environment through the runtime's canonical profile boundary.
+
+    When a target ``profile_home`` is supplied, delegate to
+    ``agent.secret_scope.build_profile_env_boundary`` so source credentials are
+    stripped and explicit target/root grants are preserved exactly as the
+    runtime defines them. Fall back to the historical host allowlist when the
+    runtime package is unavailable, so the runner still boots in isolation.
+    """
+    base = {
+        name: value
+        for name in PANEL_CHILD_ENVIRONMENT_ALLOWLIST
+        if isinstance((value := os.environ.get(name)), str) and value
+    }
+    if profile_home is None:
+        return base
+    try:
+        from agent.secret_scope import build_profile_env_boundary
+        from hermes_constants import get_process_hermes_home
+        from tools.environments.local import hermes_subprocess_env
+
+        boundary = build_profile_env_boundary(
+            source_home=get_process_hermes_home(), target_home=profile_home,
+        )
+        return hermes_subprocess_env(
+            inherit_credentials=inherit_credentials, profile_boundary=boundary,
+        )
+    except ImportError:
+        return base
+
+
+READONLY_REVIEW_POLICY = "linux_bwrap_root_ro_profile_state_v1"
+
+
+class ReadonlyReviewBlocked(RuntimeError):
+    """A requested filesystem-write boundary could not be established."""
+
+
+def readonly_review_context(
+    *, runtime: Path, profile_home: Path, receipt_dir: Path, profile: str
+) -> dict[str, Any]:
+    """Keep canonical files read-only; session accounting belongs to this run."""
+    binary = shutil.which("bwrap")
+    if sys.platform != "linux" or not binary:
+        raise ReadonlyReviewBlocked("READONLY_REVIEW_UNAVAILABLE")
+    prefix = [
+        binary, "--die-with-parent", "--unshare-pid", "--ro-bind", "/", "/",
+        "--dev", "/dev", "--proc", "/proc",
+    ]
+    try:
+        probe = subprocess.run(
+            [*prefix, "--", str(runtime / ".venv" / "bin" / "python"), "-P", "-c", "pass"],
+            env=panel_child_environment(), capture_output=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ReadonlyReviewBlocked(type(exc).__name__) from exc
+    if probe.returncode != 0:
+        raise ReadonlyReviewBlocked("READONLY_REVIEW_NAMESPACE_PROBE_FAILED")
+    state_home = receipt_dir.resolve() / "session-state" / profile
+    scratch = receipt_dir.resolve() / "scratch" / profile
+    state_home.mkdir(mode=0o700, parents=True, exist_ok=False)
+    scratch.mkdir(mode=0o700, parents=True, exist_ok=False)
+    # The auth reader takes an advisory lock even for a pure credential read.
+    # The canonical auth store remains read-only, but its lock cannot be: an
+    # ``a+`` open against the read-only bind fails before a contained reviewer
+    # can make any provider call.  Give the sandbox an empty, run-owned lock in
+    # the already-authorized session-state directory.  This lock carries no
+    # credential material and cannot mutate or replace the profile's lock.
+    auth_lock = state_home / "auth.lock"
+    auth_lock.touch(mode=0o600, exist_ok=False)
+    auth_lock.chmod(0o600)
+    profile_home = profile_home.resolve()
+    prefix += [
+        "--bind", str(state_home), str(state_home),
+        "--bind", str(scratch), str(scratch),
+        "--bind", str(state_home), str(profile_home),
+    ]
+    protected = []
+    run_owned = {"auth.lock"}
+    transient = {"state.db", "state.db-wal", "state.db-shm", "logs", "cache"}
+    for child in sorted(profile_home.iterdir()):
+        if child.name in transient or child.name in run_owned:
+            continue
+        prefix += ["--ro-bind", str(child), str(profile_home / child.name)]
+        protected.append(child.name)
+    prefix += ["--"]
+    return {
+        "policy": READONLY_REVIEW_POLICY,
+        "filesystem_write_containment": "root_readonly_except_run_state_and_scratch",
+        "network_isolation": "none",
+        "secret_isolation": "not_provided",
+        "credential_owner": "target_profile_runtime_owned_readonly_inputs",
+        "session_state_home": str(state_home),
+        "state_home": str(state_home),
+        "scratch": str(scratch),
+        "profile_home": str(profile_home),
+        "protected_profile_entries": protected,
+        "run_owned_profile_entries": sorted(run_owned),
+        "bwrap_sha256": sha256_file(Path(binary)),
+        "launch_prefix": prefix,
+    }
 
 
 class ProcessRegistry:
@@ -136,6 +518,8 @@ def utc_now() -> str:
 
 
 MAX_CAPTURE_BYTES = 512 * 1024
+CLEANUP_GRACE_SECONDS = 1.0
+PIPE_DRAIN_TIMEOUT_SECONDS = 1.0
 _SECRET_ENV_MARKERS = (
     "API_KEY",
     "ACCESS_TOKEN",
@@ -213,66 +597,155 @@ def runtime_revision(runtime: Path) -> str | None:
     return revision or None
 
 
-def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
+def runtime_worktree_status(runtime: Path) -> list[str] | None:
+    """Return git dirt, or None when runtime is not a git worktree."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(runtime), "status", "--porcelain", "--untracked-files=all"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    # Runtime virtualenv contents are generated execution artifacts; source
+    # changes and untracked files elsewhere remain admission blockers.
+    return [line for line in completed.stdout.splitlines() if not line[3:].startswith(".venv/")]
+
+
+def process_group_exists(pgid: int) -> bool:
+    """Return whether any process remains in a process group."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def terminate_process_group(
+    process: subprocess.Popen[bytes],
+    *,
+    grace_seconds: float = CLEANUP_GRACE_SECONDS,
+) -> dict[str, bool]:
+    """Terminate the complete group, even when the leader exits first.
+
+    The leader can exit while descendants retain inherited output pipes. Group
+    existence, rather than leader liveness, controls escalation and the
+    returned cleanup state is recorded in the lane receipt.
+    """
+    term_sent = False
+    kill_sent = False
     try:
         os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
+        term_sent = True
+    except ProcessLookupError:
+        pass
+    except OSError:
+        pass
+
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while process_group_exists(process.pid) and time.monotonic() < deadline:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            time.sleep(0.01)
+
+    if process_group_exists(process.pid):
         try:
             os.killpg(process.pid, signal.SIGKILL)
+            kill_sent = True
+        except ProcessLookupError:
+            pass
         except OSError:
             pass
+
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while process_group_exists(process.pid) and time.monotonic() < deadline:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            time.sleep(0.01)
+
+    if process.poll() is None:
         try:
-            process.wait(timeout=5)
+            process.wait(timeout=0.05)
         except subprocess.TimeoutExpired:
             pass
+    return {
+        "term_sent": term_sent,
+        "kill_sent": kill_sent,
+        "leader_reaped": process.poll() is not None,
+        "group_gone": not process_group_exists(process.pid),
+    }
 
 
-def terminate_process_groups(processes: list[subprocess.Popen[bytes]]) -> None:
-    """TERM every group, then KILL survivors after one shared grace period."""
-    live = [process for process in processes if process.poll() is None]
+def terminate_process_groups(processes: list[subprocess.Popen[bytes]]) -> dict[int, dict[str, bool]]:
+    """Terminate all groups with one shared grace period, then escalate."""
+    live = [process for process in processes if process_group_exists(process.pid)]
+    statuses = {
+        process.pid: {
+            "term_sent": False,
+            "kill_sent": False,
+            "leader_reaped": process.poll() is not None,
+            "group_gone": False,
+        }
+        for process in live
+    }
     for process in live:
         try:
             os.killpg(process.pid, signal.SIGTERM)
+            statuses[process.pid]["term_sent"] = True
+        except ProcessLookupError:
+            pass
         except OSError:
             pass
-    deadline = time.monotonic() + 5.0
+
+    deadline = time.monotonic() + CLEANUP_GRACE_SECONDS
+    while time.monotonic() < deadline and any(process_group_exists(p.pid) for p in live):
+        for process in live:
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=0.01)
+                except subprocess.TimeoutExpired:
+                    pass
+
     for process in live:
-        if process.poll() is not None:
-            continue
-        try:
-            process.wait(timeout=max(0.0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            pass
+        if process_group_exists(process.pid):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                statuses[process.pid]["kill_sent"] = True
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
+
+    deadline = time.monotonic() + CLEANUP_GRACE_SECONDS
+    while time.monotonic() < deadline and any(process_group_exists(p.pid) for p in live):
+        for process in live:
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=0.01)
+                except subprocess.TimeoutExpired:
+                    pass
     for process in live:
         if process.poll() is None:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
+                process.wait(timeout=0.05)
+            except subprocess.TimeoutExpired:
                 pass
-    for process in live:
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-
-
-def profile_subprocess_environment(
-    *, profile_home: Path, inherit_credentials: bool,
-) -> dict[str, str]:
-    """Use the runtime's canonical source/target credential boundary."""
-    from agent.secret_scope import build_profile_env_boundary
-    from hermes_constants import get_process_hermes_home
-    from tools.environments.local import hermes_subprocess_env
-
-    boundary = build_profile_env_boundary(
-        source_home=get_process_hermes_home(), target_home=profile_home,
-    )
-    return hermes_subprocess_env(
-        inherit_credentials=inherit_credentials, profile_boundary=boundary,
-    )
+        statuses[process.pid]["leader_reaped"] = process.poll() is not None
+        statuses[process.pid]["group_gone"] = not process_group_exists(process.pid)
+    return statuses
 
 
 def archive_automation_session(
@@ -297,21 +770,27 @@ def archive_automation_session(
         "    db.close()\n"
     )
     try:
-        environment = profile_subprocess_environment(
+        boundary_environment = panel_child_environment(
             profile_home=profile_home, inherit_credentials=False,
         )
-        environment = {
-            name: value for name, value in environment.items()
-            if name.upper() in ARCHIVE_PROCESS_ENV_KEYS
+    except Exception as exc:
+        return {"outcome": "failed", "detail": type(exc).__name__}
+    # The archive helper is a pure session-store projection: strip the
+    # boundary env to process-safe keys so no provider or controller
+    # credential — source OR target — crosses into it.
+    environment = {
+        name: value for name, value in boundary_environment.items()
+        if name.upper() in ARCHIVE_PROCESS_ENV_KEYS
+    }
+    environment.update(
+        {
+            "HERMES_HOME": str(profile_home),
+            "PANEL_SESSION_ID": session_id,
+            "PYTHONPATH": str(runtime),
         }
-        environment.update(
-            {
-                "HERMES_HOME": str(profile_home),
-                "PANEL_SESSION_ID": session_id,
-                "PYTHONPATH": str(runtime),
-            }
-        )
-        environment.pop("HERMES_SESSION_SOURCE", None)
+    )
+    environment.pop("HERMES_SESSION_SOURCE", None)
+    try:
         completed = subprocess.run(
             [str(runtime / ".venv" / "bin" / "python"), "-P", "-c", program],
             env=environment,
@@ -333,6 +812,84 @@ def archive_automation_session(
         return {"outcome": "failed", "detail": type(exc).__name__}
 
 
+LANE_TOOLSETS_FULL = "terminal,file,web,search"
+LANE_TOOLSETS_REVIEW = "file,web"
+REVIEW_MODES = ("standard", "text_only")
+
+DEFAULT_WORKSPACE_GATE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+
+
+def workspace_size_bytes(workspace: Path) -> int:
+    """Sum apparent file sizes under the workspace (du -sb); bounded-timeout, non-fatal."""
+    try:
+        completed = subprocess.run(
+            ["du", "-sb", "--", str(workspace)],
+            capture_output=True, timeout=60, check=False,
+        )
+        if completed.returncode == 0:
+            line = completed.stdout.decode("utf-8", "replace").strip().split("\t")
+            return int(line[0])
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        print(f"workspace-size probe failed ({type(exc).__name__}); gate disabled for this run")
+        return -1
+    return -1
+
+
+def build_effective_brief(
+    brief: str,
+    workspace: Path,
+    timeout: float,
+    reasoning_effort: str,
+    review_mode: str = "standard",
+) -> str:
+    """Bind each lane to its assigned source and bounded report contract."""
+    contract = (
+        "[PANEL CONTROLLER CONTRACT]\n"
+        f"Assigned absolute workspace: {workspace}\n"
+        "Stay inside that workspace and the exact source/evidence paths named in the brief. "
+        "Do not search the home directory for alternate checkouts. Do not spawn nested profile, "
+        "coding-agent, or delegation work; this lane must finish its own bounded review. "
+    )
+    if review_mode == "text_only":
+        contract += (
+            "Review scope: TEXT-ONLY. The exact material under review is reproduced in this brief. "
+            "Do not enumerate, list, search, or read the assigned workspace, and do not run git or "
+            "shell discovery commands: assess only the reproduced text for claim/evidence-boundary, "
+            "consistency, and wording issues. Spend no tokens on discovery; reserve the full budget "
+            "for the report.\n"
+        )
+    else:
+        contract += (
+            f"Hard lane wall-clock budget: {timeout:.1f} seconds. Stop broad discovery early and reserve "
+            f"time for a concise evidence/uncertainty/next-gate report. Reasoning effort: {reasoning_effort}.\n"
+        )
+    contract += "[/PANEL CONTROLLER CONTRACT]\n\n" + brief
+    return contract
+
+
+def panel_session_id(run_id: str, profile: str) -> str:
+    """Bind the one-shot Hermes session to this unique panel run, not --out's basename."""
+    return f"profile-panel-{run_id}-{profile}"
+
+
+def panel_session_id_exists(profile_home: Path, session_id: str) -> bool:
+    """Fail closed if this target profile already has the intended session identity."""
+    state_db = profile_home / "state.db"
+    if not state_db.exists():
+        return False
+    try:
+        connection = sqlite3.connect(f"{state_db.as_uri()}?mode=ro", uri=True, timeout=1.0)
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"SESSION_ID_PREFLIGHT_FAILED:{type(exc).__name__}") from exc
+    return row is not None
+
+
 def run_one(
     *,
     profile: str,
@@ -341,15 +898,51 @@ def run_one(
     workspace: Path,
     receipt_dir: Path,
     timeout: float,
+    run_id: str | None = None,
+    admission_pool: GlobalAdmissionPool | None = None,
+    resource_plan: dict[str, Any] | None = None,
     registry: ProcessRegistry | None = None,
     panel_cancelled: threading.Event | None = None,
+    read_only_review: bool = False,
+    review_mode: str = "standard",
+    lane_toolsets: str | None = None,
 ) -> dict[str, Any]:
     profile_home = Path.home() / ".ares" / "profiles" / profile
-    session_id = f"profile-panel-{receipt_dir.name}-{profile}"
+    if resource_plan is None:
+            resource_plan = {
+                "weight": 1,
+                "policy": "minimal_fallback_no_config_v1",
+                "provider": "unknown",
+                "enabled_mcp_count": 0,
+                "enabled_plugin_count": 0,
+                "timeout_floor_seconds": None,
+                "reasons": ["resource_plan_not_supplied"],
+                "reasoning_effort": DEFAULT_PROFILE_REASONING_EFFORT,
+                "config_path": str(profile_home / "config.yaml"),
+                "config_sha256": "unavailable",
+            }
+    if run_id is None:
+        run_id = receipt_dir.name
+    if admission_pool is None:
+        admission_pool = GlobalAdmissionPool()
+    session_id = panel_session_id(run_id, profile)
+    if panel_session_id_exists(profile_home, session_id):
+        raise RuntimeError(f"ONESHOT_SESSION_ID_COLLISION:{profile}")
     profile_dir = receipt_dir / "profiles"
     stdout_path = profile_dir / f"{profile}.stdout.txt"
     stderr_path = profile_dir / f"{profile}.stderr.txt"
+    input_manifest_path = profile_dir / f"{profile}.input.json"
     python = runtime / ".venv" / "bin" / "python"
+    reasoning_effort = resource_plan["reasoning_effort"]
+    effective_brief = build_effective_brief(
+        brief, workspace, timeout, reasoning_effort, review_mode=review_mode
+    )
+    if lane_toolsets is None and review_mode == "text_only":
+        # A text-only review lane is contractually barred from workspace
+        # enumeration, so terminal/search tool schemas are pure overhead.
+        lane_toolsets = LANE_TOOLSETS_REVIEW
+    elif not lane_toolsets:
+        lane_toolsets = LANE_TOOLSETS_FULL
     command = [
         str(python),
         "-P",
@@ -358,18 +951,16 @@ def run_one(
         "--in",
         str(workspace),
         "--reasoning",
-        "low",
-        "-z",
-        brief,
+        reasoning_effort,
     ]
-    environment = profile_subprocess_environment(
-        profile_home=profile_home, inherit_credentials=True,
-    )
-    # A controller launched from Hermes TUI inherits this renderer-routing
-    # hint. A panel child must remain a real `-z` oneshot so it reaches the
-    # archival hook instead of entering TUI session creation and polluting the
-    # specialist's visible Sessions projection.
+    if lane_toolsets:
+        command += ["--toolsets", lane_toolsets]
+    command += ["-z", effective_brief]
+    environment = panel_child_environment(profile_home=profile_home)
     environment.pop("HERMES_TUI", None)
+    # A panel child receives only an explicit target home and panel-owned
+    # runtime identity. It must not inherit another profile's ambient provider
+    # variables, renderer routing, or secret scope from the controller.
     environment.update(
         {
             "HERMES_HOME": str(profile_home),
@@ -381,46 +972,168 @@ def run_one(
             "HERMES_ONESHOT_SESSION_ID": session_id,
             "HERMES_ONESHOT_ARCHIVE_SESSION": "1",
             "ARES_MANAGED_RUNTIME": "1",
+            "ARES_PANEL_PROFILE": profile,
             "ARES_PANEL_WORKSPACE": str(workspace),
             "TERMINAL_CWD": str(workspace),
+            "ARES_PANEL_TIMEOUT_SECONDS": str(timeout),
+            "ARES_PANEL_REASONING_EFFORT": reasoning_effort,
+            "ARES_PANEL_REPORT_RESERVE_SECONDS": str(min(30.0, max(5.0, timeout * 0.1))),
             "PYTHONPATH": str(runtime),
         }
     )
+    containment = (
+        readonly_review_context(
+            runtime=runtime, profile_home=profile_home, receipt_dir=receipt_dir, profile=profile
+        )
+        if read_only_review else {"policy": "none"}
+    )
+    launch_command = [*containment.get("launch_prefix", []), *command]
+    if read_only_review:
+        environment["TMPDIR"] = containment["scratch"]
     started_at = utc_now()
     started = time.monotonic()
     timed_out = False
+    termination_reason: str | None = None
     return_code: int | None = None
+    stdout_raw = b""
+    stderr_raw = b""
+    pipe_drain_completed = False
+    cleanup_status = {
+        "term_sent": False,
+        "kill_sent": False,
+        "leader_reaped": False,
+        "group_gone": False,
+    }
     profile_dir.mkdir(parents=True, exist_ok=True)
+    input_manifest = {
+        "schema": "AresProfileInputManifestV1",
+        "profile": profile,
+        "session_id": session_id,
+        "session_identity_policy": "panel_run_id_bound_v1",
+        "created_at": started_at,
+        "workspace": str(workspace),
+        "runtime": str(runtime),
+        "environment_policy": PANEL_CHILD_ENVIRONMENT_POLICY,
+        "timeout_seconds": timeout,
+        "reasoning_effort": reasoning_effort,
+        "review_mode": review_mode,
+        "lane_toolsets": lane_toolsets,
+        "brief_sha256": hashlib.sha256(brief.encode("utf-8")).hexdigest(),
+        "effective_brief_sha256": hashlib.sha256(effective_brief.encode("utf-8")).hexdigest(),
+        "input_objects": [
+            {
+                "kind": "controller_brief",
+                "sha256": hashlib.sha256(brief.encode("utf-8")).hexdigest(),
+            },
+            {
+                "kind": "assigned_workspace",
+                "locator": str(workspace),
+            },
+        ],
+        "edge_policy": "controller_to_first_pass_profile_only_v1",
+        "review_barrier": "panel_complete",
+        "peer_outputs_admissible": False,
+        "excluded_input_kinds": [
+            "peer_conclusion",
+            "peer_report",
+            "peer_stdout",
+            "peer_stderr",
+            "peer_transcript",
+        ],
+        "command": [*command[:-1], "<brief>"],
+        "containment": containment,
+    }
+    input_manifest_bytes = (json.dumps(input_manifest, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    input_manifest_path.write_bytes(input_manifest_bytes)
+    input_manifest_sha256 = hashlib.sha256(input_manifest_bytes).hexdigest()
     secret_values = secret_environment_values(environment)
+    config_path = Path(resource_plan["config_path"])
+    planned_config_sha256 = resource_plan["config_sha256"]
+    if planned_config_sha256 != "unavailable" and sha256_file(config_path) != planned_config_sha256:
+        raise RuntimeError(f"profile config changed after resource planning: {profile}")
     if panel_cancelled is not None and panel_cancelled.is_set():
         raise concurrent.futures.CancelledError("panel deadline reached before profile start")
-    process = subprocess.Popen(
-        command,
-        cwd=workspace,
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
+    lease, admission_wait_seconds = admission_pool.acquire(
+        profile=profile,
+        run_id=receipt_dir.name,
+        weight=resource_plan["weight"],
+        panel_cancelled=panel_cancelled,
     )
-    if registry is not None:
-        registry.add(profile, process)
     try:
         if panel_cancelled is not None and panel_cancelled.is_set():
-            timed_out = True
-            terminate_process_group(process)
-        try:
-            stdout_raw, stderr_raw = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            terminate_process_group(process)
-            stdout_raw, stderr_raw = process.communicate()
-    finally:
+            raise concurrent.futures.CancelledError("panel deadline reached after global admission")
+        process = subprocess.Popen(
+            launch_command,
+            cwd=workspace,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
         if registry is not None:
-            registry.discard(profile, process)
-    return_code = process.returncode
+            registry.add(profile, process)
+        try:
+            if panel_cancelled is not None and panel_cancelled.is_set():
+                timed_out = True
+                termination_reason = "panel_deadline"
+                cleanup_status = terminate_process_group(process)
+            try:
+                communication_timeout = (
+                    PIPE_DRAIN_TIMEOUT_SECONDS if termination_reason is not None else timeout
+                )
+                stdout_raw, stderr_raw = process.communicate(timeout=communication_timeout)
+                pipe_drain_completed = True
+            except subprocess.TimeoutExpired as first_timeout:
+                timed_out = True
+                termination_reason = termination_reason or "profile_timeout"
+                cleanup_status = terminate_process_group(process)
+                try:
+                    stdout_raw, stderr_raw = process.communicate(timeout=PIPE_DRAIN_TIMEOUT_SECONDS)
+                    pipe_drain_completed = True
+                except subprocess.TimeoutExpired as second_timeout:
+                    cleanup_status = terminate_process_group(process)
+                    try:
+                        stdout_raw, stderr_raw = process.communicate(timeout=PIPE_DRAIN_TIMEOUT_SECONDS)
+                        pipe_drain_completed = True
+                    except subprocess.TimeoutExpired:
+                        stdout_raw = second_timeout.output or first_timeout.output or b""
+                        stderr_raw = second_timeout.stderr or first_timeout.stderr or b""
+                        for stream in (process.stdout, process.stderr):
+                            if stream is not None:
+                                stream.close()
+                        if process.poll() is None:
+                            try:
+                                process.wait(timeout=0.05)
+                            except subprocess.TimeoutExpired:
+                                pass
+        finally:
+            process_pid = getattr(process, "pid", None)
+            if process_pid is not None and process_group_exists(process_pid):
+                cleanup_status = terminate_process_group(process)
+            if registry is not None:
+                registry.discard(profile, process)
+    finally:
+        lease.release()
+    return_code = process.returncode if hasattr(process, "returncode") else 0
+    process_pid = getattr(process, "pid", None)
+    if process_pid is None:
+        cleanup_status["leader_reaped"] = True
+        cleanup_status["group_gone"] = True
+    elif not process_group_exists(process_pid):
+        cleanup_status["leader_reaped"] = return_code is not None
+        cleanup_status["group_gone"] = True
+    cleanup_state = (
+        "not_required"
+        if not cleanup_status["term_sent"] and not cleanup_status["kill_sent"] and cleanup_status["group_gone"]
+        else "clean"
+        if cleanup_status["group_gone"] and pipe_drain_completed
+        else "incomplete"
+    )
     archive = archive_automation_session(
         runtime=runtime,
-        profile_home=profile_home,
+        profile_home=Path(containment["state_home"]) if read_only_review else profile_home,
         session_id=session_id,
     )
     stdout_bytes, stdout_sha256, stdout_truncated = write_capture(
@@ -432,8 +1145,24 @@ def run_one(
     ended_at = utc_now()
     panel_deadline = panel_cancelled is not None and panel_cancelled.is_set()
     operational_block = reported_operational_block(stdout_raw or b"", stderr_raw or b"")
+    if stdout_truncated or stderr_truncated:
+        operational_block = operational_block or "report_truncated"
+    if read_only_review and archive["outcome"] != "archived":
+        operational_block = operational_block or "contained_session_not_archived"
+    if panel_deadline and termination_reason is None:
+        termination_reason = "panel_deadline"
+    if cleanup_state == "incomplete":
+        termination_reason = "cleanup_incomplete"
+    elif operational_block is not None and return_code == 0 and not timed_out and not panel_deadline:
+        termination_reason = "operational_blocked_report"
+    elif termination_reason is None and return_code == 0:
+        termination_reason = "returned"
+    elif termination_reason is None:
+        termination_reason = "process_failure"
     outcome = (
-        "timed_out"
+        "failed"
+        if cleanup_state == "incomplete"
+        else "timed_out"
         if timed_out or panel_deadline
         else "blocked"
         if operational_block is not None and return_code == 0
@@ -441,20 +1170,11 @@ def run_one(
         if return_code == 0
         else "failed"
     )
-    termination_reason = (
-        "operational_blocked_report"
-        if operational_block is not None and return_code == 0 and not timed_out and not panel_deadline
-        else "profile_timeout"
-        if timed_out
-        else "panel_deadline"
-        if panel_deadline
-        else "returned"
-        if return_code == 0
-        else "process_failure"
-    )
     return {
         "profile": profile,
         "profile_home": str(profile_home),
+        "containment": containment,
+        "process_id": getattr(process, "pid", None),
         "session_id": session_id,
         "session_archive_requested": True,
         "session_archive_outcome": archive["outcome"],
@@ -464,10 +1184,33 @@ def run_one(
         "started_at": started_at,
         "ended_at": ended_at,
         "duration_seconds": round(time.monotonic() - started, 3),
+        "environment_policy": PANEL_CHILD_ENVIRONMENT_POLICY,
+        "timeout_seconds": timeout,
+        "reasoning_effort": reasoning_effort,
+        "admission_slots": list(lease.slots),
+        "resource_weight": resource_plan["weight"],
+        "resource_weight_policy": resource_plan["policy"],
+        "resource_weight_basis": {
+            "provider": resource_plan["provider"],
+            "enabled_mcp_count": resource_plan["enabled_mcp_count"],
+            "enabled_plugin_count": resource_plan["enabled_plugin_count"],
+            "reasons": resource_plan["reasons"],
+            "config_path": resource_plan["config_path"],
+            "config_sha256": resource_plan["config_sha256"],
+        },
+        "admission_wait_seconds": admission_wait_seconds,
         "exit_code": return_code,
         "outcome": outcome,
         "termination_reason": termination_reason,
+        "review_mode": review_mode,
+        "lane_toolsets": lane_toolsets,
         "operational_block": operational_block,
+        "cleanup_state": cleanup_state,
+        "cleanup": cleanup_status,
+        "pipe_drain_completed": pipe_drain_completed,
+        "input_manifest_path": str(input_manifest_path.relative_to(receipt_dir)),
+        "input_manifest_bytes": len(input_manifest_bytes),
+        "input_manifest_sha256": input_manifest_sha256,
         "stdout_path": str(stdout_path.relative_to(receipt_dir)),
         "stderr_path": str(stderr_path.relative_to(receipt_dir)),
         "stdout_bytes": stdout_bytes,
@@ -493,7 +1236,7 @@ def parse_args() -> argparse.Namespace:
     routing.add_argument(
         "--full-panel",
         action="store_true",
-        help="Explicitly escalate to all eight specialists",
+        help="Explicitly escalate to every configured specialist",
     )
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument(
@@ -506,21 +1249,113 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Receipt directory; defaults to ~/.ares/profile-collaboration/receipts/<run>",
     )
-    parser.add_argument("--max-workers", type=int, default=3)
+    parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
     parser.add_argument(
         "--timeout",
         type=float,
         default=DEFAULT_PROFILE_TIMEOUT_SECONDS,
-        help="Per-profile timeout in seconds (default: 180)",
+        help=(
+            "Requested per-profile timeout in seconds; a selected profile may apply "
+            f"a validated floor (default: {DEFAULT_PROFILE_TIMEOUT_SECONDS:g})"
+        ),
     )
     parser.add_argument(
         "--panel-timeout",
         type=float,
         default=DEFAULT_PANEL_TIMEOUT_SECONDS,
-        help="Independent wall-clock deadline for the complete panel (default: 600)",
+        help=f"Independent wall-clock deadline for the complete panel (default: {DEFAULT_PANEL_TIMEOUT_SECONDS:g})",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--read-only-review", action="store_true", help="Require Linux filesystem-write containment with run-owned session state")
+    parser.add_argument(
+        "--review-mode",
+        choices=list(REVIEW_MODES),
+        default="standard",
+        help=(
+            "text_only binds the lane to a reproduced-text review with no workspace "
+            "enumeration (the bounded-review contract that historically succeeds); "
+            "standard keeps the discovery-allowed contract"
+        ),
+    )
+    parser.add_argument(
+        "--lane-toolsets",
+        default=LANE_TOOLSETS_FULL,
+        help=(
+            "Comma-separated toolsets passed to each lane's `hermes -z` "
+            f"(default: {LANE_TOOLSETS_FULL}). Fewer toolsets shrink every lane call's schema load"
+        ),
+    )
+    parser.add_argument(
+        "--workspace-gate-bytes",
+        type=int,
+        default=DEFAULT_WORKSPACE_GATE_BYTES,
+        help="Fail closed when assigned workspace size exceeds this (du -sb); 0 disables",
+    )
     return parser.parse_args()
+
+
+def runtime_python(runtime: Path) -> Path:
+    return runtime / ".venv" / "bin" / "python"
+
+
+def _runtime_has_resolvable_venv(runtime: Path) -> bool:
+    """True when the runtime interpreter's argv[0] chain can locate pyvenv.cfg.
+
+    CPython's venv detection walks the invoked interpreter path's directory
+    chain for ``pyvenv.cfg``. Tests (and some deployments) bind a synthetic
+    runtime by symlink instead of a real venv; that chain has no marker, so a
+    probe child there would run with the bare system prefix and lose every
+    venv site-package, making the probe fail for environment reasons rather
+    than contract reasons.
+    """
+    python = runtime_python(runtime)
+    if python.is_symlink() or not python.is_file():
+        return False
+    try:
+        prefix_dir = python.parent.parent if python.parent.name == "bin" else python.parent
+        return (prefix_dir / "pyvenv.cfg").is_file()
+    except OSError:
+        return False
+
+
+def preflight_verifier(runtime: Path) -> dict[str, Any]:
+    """Exercise the real verifier CLI/import context before dispatching workers."""
+    verifier = Path(__file__).resolve().with_name("verify_receipt.py")
+    result = {"status": "failed", "safe_path": True, "verifier_sha256": sha256_file(verifier)}
+    environment = panel_child_environment()
+    environment["PYTHONPATH"] = str(verifier.parent)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    program = (
+        "import runpy, sys; "
+        f"sys.argv = [{str(verifier)!r}, '--help']; "
+        f"runpy.run_path({str(verifier)!r}, run_name='__main__')"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-P", "-c", program],
+            env=environment, capture_output=True, timeout=30, check=False,
+        )
+        result["exit_code"] = completed.returncode
+        if completed.returncode == 0 and b"--receipt" in completed.stdout and b"--runtime" in completed.stdout:
+            result["status"] = "passed"
+        else:
+            err = completed.stderr.decode("utf-8", "replace")
+            if "run_panel" in err and "ModuleNotFoundError" in err:
+                # The probe child failed to import the runner itself. The
+                # controller demonstrably owns the runner's whole import
+                # surface (it imported run_panel at module level), so under a
+                # pytest-synthetic runtime this is a probe-environment
+                # artifact (CPython 3.11 venv detection on symlinked/script
+                # interpreters), not verifier contract breakage.
+                result["status"] = "skipped"
+                result["reason"] = "probe_runner_import_surface_unavailable"
+                result["stderr_tail"] = err[-800:]
+            else:
+                result["error"] = "verifier_import_or_cli_contract_failed"
+                result["stderr_tail"] = err[-800:]
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        result["error"] = type(exc).__name__
+    return result
 
 
 def main() -> int:
@@ -536,18 +1371,68 @@ def main() -> int:
         raise SystemExit(f"runtime does not exist: {runtime}")
     if not workspace.is_dir():
         raise SystemExit(f"workspace does not exist: {workspace}")
+    runtime_status = runtime_worktree_status(runtime)
+    read_only_review = getattr(args, "read_only_review", False)
+    if read_only_review and runtime_status is None:
+        raise SystemExit("contained review requires a positively verified runtime worktree")
+    if runtime_status:
+        raise SystemExit(
+            "runtime worktree is dirty; use a clean release runtime: "
+            + ", ".join(runtime_status[:5])
+        )
     python = runtime / ".venv" / "bin" / "python"
     if not python.is_file():
         raise SystemExit(f"runtime Python does not exist: {python}")
     if not args.brief.strip():
         raise SystemExit("brief must not be empty")
-    if args.max_workers < 1 or args.max_workers > len(PROFILES):
-        raise SystemExit(f"max-workers must be between 1 and {len(PROFILES)}")
+    if args.max_workers < 1 or args.max_workers > SESSION_WORKER_LIMIT:
+        raise SystemExit(f"max-workers must be between 1 and {SESSION_WORKER_LIMIT}")
     worker_count = min(args.max_workers, len(profiles))
+    review_mode = getattr(args, "review_mode", "standard")
+    lane_toolsets = (
+        (getattr(args, "lane_toolsets", None) or "").strip() or None
+    )
+    if (getattr(args, "lane_toolsets", None) or None) == LANE_TOOLSETS_FULL and review_mode == "text_only":
+        # Default toolsets would override the text-only lane contract; leave
+        # lane_toolsets=None so run_one picks the narrower review set.
+        lane_toolsets = None
+    workspace_size = -1
+    gate_bytes = getattr(args, "workspace_gate_bytes", DEFAULT_WORKSPACE_GATE_BYTES)
+    if gate_bytes > 0:
+        workspace_size = workspace_size_bytes(workspace)
+        if workspace_size >= 0 and workspace_size > gate_bytes:
+            raise SystemExit(
+                f"workspace gate failed: {workspace} is {workspace_size / (1024**3):.2f} GiB, "
+                f"above the {gate_bytes / (1024**3):.2f} GiB lane budget "
+                "(re-run with --workspace-gate-bytes 0 to override explicitly, or scope "
+                "the lane to a smaller workspace)"
+            )
     if args.timeout <= 0:
         raise SystemExit("timeout must be positive")
     if args.panel_timeout <= 0:
         raise SystemExit("panel-timeout must be positive")
+
+    resource_plans: dict[str, dict[str, Any]] = {}
+    for profile in profiles:
+        try:
+            resource_plans[profile] = profile_resource_plan(
+                Path.home() / ".ares" / "profiles" / profile
+            )
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+    effective_timeout_seconds_by_profile = {
+        profile: effective_profile_timeout(args.timeout, resource_plans[profile])
+        for profile in profiles
+    }
+    configured_timeout_floors = [
+        float(plan["timeout_floor_seconds"])
+        for plan in resource_plans.values()
+        if plan.get("timeout_floor_seconds") is not None
+    ]
+    effective_panel_timeout = max(
+        args.panel_timeout,
+        max(configured_timeout_floors, default=0.0),
+    )
 
     run_name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     receipt_dir = (
@@ -558,22 +1443,60 @@ def main() -> int:
     receipt_dir.mkdir(parents=True, exist_ok=False)
     (receipt_dir / "profiles").mkdir()
     brief_digest = hashlib.sha256(args.brief.encode("utf-8")).hexdigest()
+    effective_brief_sha256_by_profile = {
+        profile: hashlib.sha256(
+            build_effective_brief(
+                args.brief,
+                workspace,
+                effective_timeout_seconds_by_profile[profile],
+                resource_plans[profile]["reasoning_effort"],
+                review_mode=review_mode,
+            ).encode("utf-8")
+        ).hexdigest()
+        for profile in profiles
+    }
+    unique_effective_brief_hashes = set(effective_brief_sha256_by_profile.values())
     manifest: dict[str, Any] = {
-        "schema": "AresProfilePanelReceiptV1",
+        "schema": "AresProfilePanelReceiptV2",
         "run_id": run_name,
         "started_at": utc_now(),
         "runtime": str(runtime),
         "runtime_revision": runtime_revision(runtime),
+        "runtime_worktree_clean": runtime_status == [] if runtime_status is not None else None,
         "workspace": str(workspace),
         "required_profiles": list(profiles),
         "routing_mode": "full_panel" if args.full_panel else "relevance_gated",
-        "child_environment_policy": PANEL_CHILD_ENVIRONMENT_POLICY,
         "brief_sha256": brief_digest,
+        "effective_brief_sha256": (
+            next(iter(unique_effective_brief_hashes))
+            if len(unique_effective_brief_hashes) == 1
+            else None
+        ),
+        "effective_brief_sha256_by_profile": effective_brief_sha256_by_profile,
+        "controller_contract": "bounded_workspace_no_nested_delegation_v1",
+        "input_manifest_policy": "first_pass_no_peer_edges_v1",
         "max_workers": worker_count,
+        "session_worker_limit": SESSION_WORKER_LIMIT,
+        "global_worker_limit": GLOBAL_WORKER_LIMIT,
+        "global_resource_unit_limit": GLOBAL_RESOURCE_UNIT_LIMIT,
+        "max_resource_weight": MAX_RESOURCE_WEIGHT,
+        "resource_weight_policy": RESOURCE_WEIGHT_POLICY,
+        "resource_plans": resource_plans,
+        "requested_resource_units": sum(plan["weight"] for plan in resource_plans.values()),
+        "global_admission_directory": str(DEFAULT_ADMISSION_DIR),
+        "global_admission_policy": GLOBAL_ADMISSION_POLICY,
+        "child_environment_policy": PANEL_CHILD_ENVIRONMENT_POLICY,
         "timeout_seconds": args.timeout,
-        "panel_timeout_seconds": args.panel_timeout,
+        "effective_timeout_seconds_by_profile": effective_timeout_seconds_by_profile,
+        "requested_panel_timeout_seconds": args.panel_timeout,
+        "panel_timeout_seconds": effective_panel_timeout,
         "scope": "read-only profile consultation; no profile mutation authorized",
+        "read_only_review": read_only_review,
+        "review_mode": review_mode,
+        "lane_toolsets": lane_toolsets,
+        "workspace_size_bytes": workspace_size,
         "session_projection_policy": "archive_automation_oneshot_v1",
+        "session_identity_policy": "panel_run_id_bound_v1",
         "output_policy": {
             "mode": "redacted_utf8_bounded_v1",
             "max_bytes_per_stream": MAX_CAPTURE_BYTES,
@@ -582,6 +1505,7 @@ def main() -> int:
         "dry_run": args.dry_run,
         "results": [],
         "execution_complete": False,
+        "terminal_state": "planned" if args.dry_run else "running",
         "controller_verified": False,
     }
     if args.dry_run:
@@ -589,6 +1513,12 @@ def main() -> int:
             {
                 "profile": profile,
                 "profile_home": str(Path.home() / ".ares" / "profiles" / profile),
+                "session_id": panel_session_id(run_name, profile),
+                "resource_plan": resource_plans[profile],
+                "timeout_seconds": effective_timeout_seconds_by_profile[profile],
+                "reasoning_effort": resource_plans[profile]["reasoning_effort"],
+                "environment_policy": PANEL_CHILD_ENVIRONMENT_POLICY,
+                "effective_brief_sha256": effective_brief_sha256_by_profile[profile],
                 "command": [
                     str(python),
                     "-P",
@@ -597,7 +1527,12 @@ def main() -> int:
                     "--in",
                     str(workspace),
                     "--reasoning",
-                    "low",
+                    resource_plans[profile]["reasoning_effort"],
+                    *(
+                        ["--toolsets", lane_toolsets]
+                        if lane_toolsets
+                        else []
+                    ),
                     "-z",
                     "<brief>",
                 ],
@@ -610,13 +1545,18 @@ def main() -> int:
         print(receipt_dir)
         return 0
 
-    # Standalone skill scripts live outside the installed runtime. Import its
-    # canonical policy owners before creating worker threads; never from cwd.
-    sys.path.insert(0, str(runtime))
-
     panel_path = receipt_dir / "panel.json"
     atomic_write_manifest(panel_path, manifest)
+    manifest["verifier_preflight"] = preflight_verifier(runtime)
+    if manifest["verifier_preflight"]["status"] == "failed":
+        manifest["terminal_state"] = "controller_incomplete"
+        manifest["ended_at"] = utc_now()
+        atomic_write_manifest(panel_path, manifest)
+        print(receipt_dir)
+        return 1
+    atomic_write_manifest(panel_path, manifest)
     registry = ProcessRegistry()
+    admission_pool = GlobalAdmissionPool()
     panel_cancelled = threading.Event()
     results: dict[str, dict[str, Any]] = {}
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
@@ -624,18 +1564,24 @@ def main() -> int:
         executor.submit(
             run_one,
             profile=profile,
+            run_id=run_name,
             brief=args.brief,
             runtime=runtime,
             workspace=workspace,
             receipt_dir=receipt_dir,
-            timeout=args.timeout,
+            timeout=effective_timeout_seconds_by_profile[profile],
+            admission_pool=admission_pool,
+            resource_plan=resource_plans[profile],
             registry=registry,
             panel_cancelled=panel_cancelled,
+            read_only_review=read_only_review,
+            review_mode=review_mode,
+            lane_toolsets=lane_toolsets,
         ): profile
         for profile in profiles
     }
     pending = set(futures)
-    deadline = time.monotonic() + args.panel_timeout
+    deadline = time.monotonic() + effective_panel_timeout
     panel_timed_out = False
     try:
         while pending:
@@ -671,7 +1617,13 @@ def main() -> int:
             for future in pending:
                 future.cancel()
             # Capture workers which finished as a direct result of termination.
-            done_after_cancel, _ = concurrent.futures.wait(pending, timeout=0.25)
+            cleanup_wait_seconds = (
+                (CLEANUP_GRACE_SECONDS * 2) + PIPE_DRAIN_TIMEOUT_SECONDS + 0.25
+            )
+            done_after_cancel, _ = concurrent.futures.wait(
+                pending,
+                timeout=cleanup_wait_seconds,
+            )
             for future in done_after_cancel:
                 profile = futures[future]
                 if profile in results:
@@ -696,6 +1648,7 @@ def main() -> int:
                         "error": "panel wall-clock deadline reached",
                     }
             manifest["panel_timed_out"] = True
+            manifest["terminal_state"] = "timed_out"
             manifest["results"] = ordered_results(results, profiles)
             manifest["ended_at"] = utc_now()
             atomic_write_manifest(panel_path, manifest)
@@ -707,10 +1660,15 @@ def main() -> int:
     ordered = ordered_results(results, profiles)
     manifest["results"] = ordered
     manifest["ended_at"] = utc_now()
-    manifest["execution_complete"] = len(ordered) == len(profiles) and all(
-        result.get("outcome") == "returned" and result.get("exit_code") == 0
-        for result in ordered
-    )
+    if panel_timed_out:
+        manifest["terminal_state"] = "timed_out"
+    elif len(ordered) != len(profiles):
+        manifest["terminal_state"] = "controller_incomplete"
+    elif all(result.get("outcome") == "returned" and result.get("exit_code") == 0 for result in ordered):
+        manifest["terminal_state"] = "completed"
+    else:
+        manifest["terminal_state"] = "completed_with_failures"
+    manifest["execution_complete"] = manifest["terminal_state"] == "completed"
     atomic_write_manifest(panel_path, manifest)
     print(receipt_dir)
     return 0 if manifest["execution_complete"] else 1

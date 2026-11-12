@@ -45,6 +45,17 @@ import pytest
 from hermes_state import SessionDB
 
 
+@pytest.fixture(autouse=True)
+def _bounded_child_wall_clock(monkeypatch):
+    """Task 2.2 is fail-closed: bound every probe child on the wall clock.
+
+    Mirrors tests/agent/test_delegated_window_enforcement.py, which patches
+    _get_child_timeout as the sanctioned bounding seam; without a bound the
+    child refusal (delegated_expiry) rejects the probe before it starts.
+    """
+    monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 600.0)
+
+
 def _build_agent_with_db(
     db: SessionDB,
     session_id: str,

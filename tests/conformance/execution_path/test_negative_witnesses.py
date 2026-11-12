@@ -102,3 +102,35 @@ def test_duplicate_physical_send_keeps_one_execution(tmp_path):
         assert len(db.list_execution_ids()) == 1
     finally:
         db.close()
+
+
+@pytest.mark.parametrize('state', ['admitted', 'materialized'])
+def test_unqualified_materialization_has_no_send_or_state_advance(endpoint, tmp_path, monkeypatch, state):
+    import ares_runtime.managed_calls as managed_calls
+
+    url, bodies, _ = endpoint
+    db = SessionDB(db_path=tmp_path / 'unqualified.db')
+    try:
+        db.create_execution_record(_admitted())
+        if state == 'materialized':
+            db.transition_execution_record(
+                'turn:api:1:0', state,
+                materialization_ref='ares-materialization:' + 'a' * 64,
+                logical_request_digest='sha256:' + 'b' * 64,
+            )
+        monkeypatch.setattr(managed_calls, 'produce_dispatch_materialization', lambda *a, **kw: {
+            'execution_id': 'turn:api:1:0', 'materialization': None,
+            'qualification_error': 'MATERIALIZATION_UNAVAILABLE',
+        })
+        governor = DispatchGovernor(store_factory=lambda: db, mode='enforce')
+        monkeypatch.setattr(middleware, '_get_middleware_callbacks',
+                            lambda kind: [governor] if kind == 'llm_dispatch' else [])
+        payload = {'model': 'local', 'messages': [{'role': 'user', 'content': 'hello'}], 'max_tokens': 7}
+        with client(url) as sdk, pytest.raises(middleware.EgressDispatchDenied) as denied:
+            with inference_call_scope(SimpleNamespace(), payload):
+                sdk.chat.completions.create(**payload)
+        assert denied.value.code == 'DISPATCH_MATERIALIZATION_UNQUALIFIED'
+        assert bodies == []
+        assert db.read_execution_record('turn:api:1:0').state == state
+    finally:
+        db.close()

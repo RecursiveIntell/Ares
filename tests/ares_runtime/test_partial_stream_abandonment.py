@@ -18,7 +18,6 @@ from hermes_cli import middleware
 from hermes_cli.middleware import GovernedStreamProxy
 from tests.ares_runtime.test_transport_deadline import lease
 from tests.ares_runtime.test_transport_stream_ownership import stream_endpoint  # noqa: F401
-from tests.ares_runtime.test_bedrock_lease_stream import aws_stream, sdk as bedrock_sdk  # noqa: F401
 
 
 @pytest.fixture(params=["unleased", "leased"])
@@ -100,7 +99,15 @@ async def test_sdk_async_stream_closed_after_first_chunk_is_abandoned(stream_end
     assert len(bodies) == 1
 
 
+@pytest.fixture
+def aws_stream():
+    # Keep optional Bedrock imports out of the OpenAI abandonment collection.
+    from tests.ares_runtime.test_bedrock_lease_stream import aws_stream as fixture
+    yield from fixture.__wrapped__()
+
+
 def test_bedrock_stream_dropped_after_first_event_is_abandoned(aws_stream, outcomes):
+    from tests.ares_runtime.test_bedrock_lease_stream import sdk as bedrock_sdk
     url, bodies, _, _ = aws_stream
     client = bedrock_sdk(url)
     try:

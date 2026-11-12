@@ -69,13 +69,25 @@ UV_CMD=""
 if is_termux; then
     echo -e "${CYAN}→${NC} Termux detected — using Python's stdlib venv + pip instead of uv"
 else
-    if command -v uv &> /dev/null; then
-        UV_CMD="uv"
-    elif [ -x "$HOME/.local/bin/uv" ]; then
-        UV_CMD="$HOME/.local/bin/uv"
-    elif [ -x "$HOME/.cargo/bin/uv" ]; then
-        UV_CMD="$HOME/.cargo/bin/uv"
-    fi
+    # Reviewed-range admission (uv-pin contract): every candidate is
+    # version-checked against [0.9.28, 0.13.0) before use.
+    _uv_admitted() {
+        local _cand="$1" _ver
+        _ver="$("$_cand" --version 2>/dev/null)" || return 1
+        case "$_ver" in
+            uv\ 0.9.2[89]|uv\ 0.9.3[0-9]|uv\ 0.1[0-2].*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    for _cand in "$(command -v uv 2>/dev/null)" "$HOME/.local/bin/uv" "$HOME/.cargo/bin/uv"; do
+        [ -n "$_cand" ] && [ -x "$_cand" ] || continue
+        if _uv_admitted "$_cand"; then
+            UV_CMD="$_cand"
+            break
+        fi
+        echo -e "${YELLOW}→${NC} skipping uv at $_cand: outside the reviewed range [0.9.28, 0.13.0)"
+    done
+    unset -f _uv_admitted 2>/dev/null || true
 
     if [ -n "$UV_CMD" ]; then
         UV_VERSION=$($UV_CMD --version 2>/dev/null)
@@ -89,7 +101,9 @@ else
         # failures (sh exits 0 on empty stdin under no pipefail).
         _uv_log="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-install.$$.log")"
         _uv_installer="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-installer.$$.sh")"
-        if ! curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>"$_uv_log"; then
+        # Reviewed uv pin (OD-1): versioned installer URL, never "latest".
+        UV_PIN="0.12.24"
+        if ! curl -LsSf "https://astral.sh/uv/${UV_PIN}/install.sh" -o "$_uv_installer" 2>"$_uv_log"; then
             echo -e "${RED}✗${NC} Failed to download uv installer."
             sed 's/^/    /' "$_uv_log" >&2
             echo -e "${CYAN}→${NC} Install manually: https://docs.astral.sh/uv/"

@@ -368,16 +368,16 @@ def install_cli(timeout_s: int = 600) -> Tuple[bool, str]:
 
     uv_bin: Optional[str] = None
     try:
-        from hermes_cli.managed_uv import ensure_uv
+        from hermes_cli.managed_uv import resolve_uv_admitted
 
-        uv_bin = str(ensure_uv() or "") or None
+        uv_bin = resolve_uv_admitted()
     except Exception as e:
-        logger.debug("Managed uv bootstrap unavailable: %s", e)
-    if not uv_bin:
-        uv_bin = shutil.which("uv")
+        logger.debug("Managed uv lookup unavailable: %s", e)
     if not uv_bin:
         return False, (
-            "uv is not available and could not be bootstrapped. Install uv "
+            "uv is not available inside the reviewed version range and could "
+            "not be bootstrapped. Re-run the installer (or `uv self update "
+            "0.12.24`), then retry; or install uv manually "
             "(https://docs.astral.sh/uv/) and run `uv tool install browser-use`."
         )
 

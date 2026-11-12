@@ -22,6 +22,8 @@ execute it on Linux CI).
 
 from pathlib import Path
 
+import re
+
 import pytest
 
 _INSTALL_PS1 = Path(__file__).resolve().parents[1] / "scripts" / "install.ps1"
@@ -48,9 +50,9 @@ def test_astral_uv_installer_invoked_via_resolved_host_variable(source: str):
     i.e. ``& $psHostExe -ExecutionPolicy ... irm https://astral.sh/uv...``
     rather than naming a fixed executable.
     """
-    lines = [ln for ln in source.splitlines() if "astral.sh/uv/install.ps1 | iex" in ln]
+    lines = [ln for ln in source.splitlines() if "astral.sh/uv/" in ln and "install.ps1 | iex" in ln and "/uv/0.12.24/" in ln]
     # Exactly one invocation line carries the astral installer.
-    invocation = [ln for ln in lines if "irm https://astral.sh/uv/install.ps1 | iex" in ln]
+    invocation = [ln for ln in lines if re.search(r"irm https://astral\.sh/uv/\d+\.\d+\.\d+/install\.ps1 \| iex", ln)]
     assert invocation, "astral uv install invocation line not found"
     for ln in invocation:
         stripped = ln.strip()

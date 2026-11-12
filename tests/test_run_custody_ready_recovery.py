@@ -181,7 +181,11 @@ def test_controller_recovery_budget_is_fixed_across_lease_change(task, monkeypat
         agent._active_session_turn_lease_holder = next_holder
         agent._run_checkpoint_custody.begin_turn(next_holder)
     result = reconcile_context_rebase(agent)
-    assert result.reason == "CONTEXT_CONTROLLER_RECOVERY_EXHAUSTED"
+    # Audit L5 (bbf80f4e1c96): a failed durable reconciliation-marker write
+    # is appended to the original outcome instead of being swallowed. After
+    # 3 exhausted attempts this scenario also cannot write the marker, so
+    # the reason carries both facts.
+    assert result.reason == "CONTEXT_CONTROLLER_RECOVERY_EXHAUSTED;RECONCILIATION_MARKER_NOT_DURABLE"
     assert db.read_context_rebase_episode("child").attempts_without_recovery == 1
 
 

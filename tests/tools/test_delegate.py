@@ -32,11 +32,28 @@ from tools.delegate_tool import (
     _resolve_delegation_credentials,
 )
 from hermes_state import SessionDB
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _bounded_child_wall_clock(monkeypatch):
+    """Task 2.2 is fail-closed: bound every probe child on the wall clock.
+
+    Mirrors tests/agent/test_delegated_window_enforcement.py, which patches
+    _get_child_timeout as the sanctioned bounding seam; without a bound the
+    child refusal (delegated_expiry) rejects the probe before it starts.
+    """
+    monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 600.0)
 
 
 def _make_mock_parent(depth=0):
     """Create a mock parent agent with the fields delegate_task expects."""
+    from agent.iteration_budget import IterationBudget
+
     parent = MagicMock()
+    # Task 2.2 (debit from parent): delegation requires a real parent budget;
+    # a bare MagicMock would make the child unbounded, which is refused.
+    parent.iteration_budget = IterationBudget(500)
     parent.base_url = "https://openrouter.ai/api/v1"
     parent.api_key="***"
     parent.provider = "openrouter"
@@ -1775,6 +1792,11 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
                 m._delegate_role = "orchestrator"
                 m._active_children = []
                 m._active_children_lock = threading.Lock()
+                # Task 2.2 (debit from parent): the orchestrator parents nested
+                # leaves, so it needs a real debited budget of its own.
+                from agent.iteration_budget import IterationBudget as _IB
+
+                m.iteration_budget = _IB(500)
                 m._session_db = None
                 m.platform = "cli"
                 m.enabled_toolsets = ["terminal", "file", "delegation"]
