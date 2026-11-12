@@ -16,7 +16,7 @@ jobs:
       qualification_result: ${{ job.status }}
     name: Current profile-runtime owner to Ares
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -42,11 +42,13 @@ jobs:
           helper=scripts/ci/release_manifest.py
           manifest_sha="$("$python" "$helper" --manifest "$manifest" validate)"
           libraries_sha="$("$python" "$helper" --manifest "$manifest" repo Libraries commit)"
+          recursive_agent_sha="$("$python" "$helper" --manifest "$manifest" repo recursive-agent commit)"
           rust_toolchain="$("$python" "$helper" --manifest "$manifest" toolchain rust)"
           {
             echo "manifest_sha=$manifest_sha"
             echo "manifest_python=$python"
             echo "libraries_sha=$libraries_sha"
+            echo "recursive_agent_sha=$recursive_agent_sha"
             echo "rust_toolchain=$rust_toolchain"
           } >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -66,6 +68,12 @@ jobs:
           "$MANIFEST_PYTHON" scripts/ci/release_manifest.py \
             --manifest scripts/ci/release-manifest.json verify-submodule \
             ../Libraries semantic-memory-mcp
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: RecursiveIntell/recursive-agent
+          ref: ${{ steps.bundle.outputs.recursive_agent_sha }}
+          path: recursive-agent
+          persist-credentials: false
       - name: Require the pinned owner to be current for the consumed crates
         shell: bash
         run: |
@@ -73,7 +81,8 @@ jobs:
           python3 ares/scripts/ci/check_owner_pin_drift.py \
             --libraries Libraries \
             --crate-dir profile-runtime \
-            --crate-dir semantic-memory
+            --crate-dir semantic-memory \
+            --crate-dir context-governor
       - name: Generate inputs with the exact current canonical Rust owner
         shell: bash
         env:
@@ -131,6 +140,57 @@ jobs:
               tests/ares_runtime/test_memory_witness_v2.py \
               tests/ares_runtime/test_policy_basis_v2.py -- -q \
               | tee "$RUNNER_TEMP/owner-evidence/consumer-tests.log"
+      - name: Qualify compaction with the manifest-pinned Governor
+        working-directory: ares
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: ${{ steps.bundle.outputs.rust_toolchain }}
+        run: |
+          set -euo pipefail
+          governor_source="$GITHUB_WORKSPACE/Libraries/context-governor"
+          governor="$governor_source/target/debug/context-governor"
+          evidence="$RUNNER_TEMP/owner-evidence"
+          cargo +"$RUST_TOOLCHAIN" test --locked --manifest-path "$governor_source/Cargo.toml" \
+            --test lineage | tee "$evidence/governor-lineage.log"
+          cargo +"$RUST_TOOLCHAIN" build --locked --manifest-path "$governor_source/Cargo.toml" \
+            --bin context-governor
+          test -x "$governor"
+          sha256sum "$governor" >> "$evidence/SHA256SUMS"
+          CONTEXT_GOVERNOR_BINARY="$governor" HERMES_TEST_CONTEXT_GOVERNOR_BIN="$governor" \
+            HERMES_PYTHON="$PWD/.venv/bin/python" HERMES_TEST_WORKERS=2 HERMES_TEST_FILE_RETRIES=0 \
+            scripts/run_tests.sh \
+              tests/agent/test_auxiliary_go_compression_cap.py \
+              tests/agent/test_context_compressor.py \
+              tests/agent/test_context_governor_restore.py \
+              tests/gateway/test_compression_concurrent_sessions.py \
+              tests/ares_runtime/test_continuity_native_governor.py -- -q -m '' \
+              | tee "$evidence/governor-consumer-tests.log"
+      - name: Install native proof prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y curl libcap-dev libseccomp-dev meson ninja-build xz-utils
+          bash ares/scripts/ci/install-ci-bubblewrap.sh
+      - name: Qualify native dispatch with the manifest-pinned daemon
+        working-directory: ares
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: ${{ steps.bundle.outputs.rust_toolchain }}
+        run: |
+          set -euo pipefail
+          owner="$GITHUB_WORKSPACE/recursive-agent"
+          daemon="$owner/target/debug/ra-daemon"
+          evidence="$RUNNER_TEMP/owner-evidence"
+          cargo +"$RUST_TOOLCHAIN" build --locked --manifest-path "$owner/Cargo.toml" \
+            -p recursive-agent-daemon --bin ra-daemon
+          test -x "$daemon"
+          git -C "$owner" rev-parse HEAD > "$evidence/recursive-agent-head.txt"
+          sha256sum "$daemon" /usr/bin/bwrap >> "$evidence/SHA256SUMS"
+          HERMES_TEST_CONTEXT_DAEMON_BIN="$daemon" HERMES_PYTHON="$PWD/.venv/bin/python" \
+            HERMES_TEST_WORKERS=1 HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+              tests/ares_runtime/test_context_native_paired.py -- -q \
+              | tee "$evidence/native-dispatch.log"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
