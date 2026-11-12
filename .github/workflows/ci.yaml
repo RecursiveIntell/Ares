@@ -18,6 +18,14 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Merge queue: the queue tests the merged result on a temporary
+  # merge_group ref. Without this trigger the queue waits forever for the
+  # required aggregate check. The classifier fails open on merge_group
+  # (like push): every lane runs, so the queued combination is fully
+  # validated. PR-only jobs (history, lockfile-diff, supply-chain,
+  # review-labels) skip via their event_name conditions and the evaluator
+  # accepts merge_group explicitly.
+  merge_group:
   # Operational recovery path: GitHub can occasionally terminate a push run
   # before any job is created. A maintainer must be able to re-run the exact
   # post-merge orchestration without manufacturing a source-only no-op commit.
@@ -65,6 +73,7 @@ jobs:
       ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
       context_continuity: ${{ steps.classify.outputs.context_continuity }}
       current_owner_integration: ${{ steps.classify.outputs.current_owner_integration }}
+      exec_conformance: ${{ steps.classify.outputs.exec_conformance }}
       event_name: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -167,28 +176,20 @@ jobs:
       contents: read
     uses: ./.github/workflows/current-owner-integration.yml
 
-  e2e-desktop:
-    name: Desktop E2E
-    # Task 4.2: explicit minimal map - no inherited write scopes.
+  exec-conformance:
+    name: Execution path conformance
+    needs: detect
+    if: needs.detect.outputs.exec_conformance == 'true'
     permissions:
       contents: read
+    uses: ./.github/workflows/execution-path-conformance.yml
 
-    needs: detect
-    # python_prod (not python): the Playwright suite exercises the built app
-    # + `hermes serve` backend, which never import anything under tests/.
-    # Tests-only PRs (~17% of commits) skip this 5-minute job — the longest
-    # single job in the workflow — while still running the full pytest lanes.
-    #
-    # ⛔ TEMPORARILY DISABLED (Aug 2, 2026, Teknium) — the suite is red on
-    # every PR and on main itself since the Aug 1 night engines/npm churn
-    # (#76499 → #76562 → #76575): the mock-backend Electron window never
-    # gets a title, so boot/chat/setup/interim specs all fail identically
-    # regardless of the PR's diff (verified on #76573 and the docs-only
-    # #76582). Tracking issue: #76627 (assigned: Ari). The lane remains
-    # explicitly disabled until that issue is resolved; changing this to true
-    # is a separate workflow admission decision.
-    if: false
-    uses: ./.github/workflows/e2e-desktop.yml
+  # Desktop E2E lane removed (Nov 2026): the suite was parked with
+  # `if: false` since Aug 2, 2026 (tracking issue #76627) and the lane
+  # evaluated a job that could never run. e2e-desktop.yml remains
+  # workflow_dispatch-capable for on-demand native security witnesses;
+  # re-admit it as a lane via a separate workflow admission decision once
+  # #76627 is resolved.
 
   docs-site:
     name: Docs Site
@@ -335,7 +336,7 @@ jobs:
       - rust-tests
       - context-continuity
       - current-owner-integration
-      - e2e-desktop
+      - exec-conformance
       - docs-site
       - history-check
       - contributor-check
@@ -358,7 +359,15 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Restore cached actionlint
+        id: actionlint-cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: actionlint
+          # Pinned to the version below: a bump must change both places.
+          key: actionlint-1.7.11-linux-amd64
       - name: Install pinned actionlint
+        if: steps.actionlint-cache.outputs.cache-hit != 'true'
         env:
           ACTIONLINT_VERSION: 1.7.11
           ACTIONLINT_SHA256: 900919a84f2229bac68ca9cd4103ea297abc35e9689ebb842c6e34a3d1b01b0a
@@ -389,15 +398,26 @@ jobs:
           tar -xzf "$archive" actionlint
           chmod 0755 actionlint
 
+      - name: Save actionlint cache
+        if: steps.actionlint-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: actionlint
+          key: actionlint-1.7.11-linux-amd64
+
       - name: Lint GitHub Actions workflows
-        # The disabled Desktop lane is an explicit CI-01 applicability exception.
-        # Lint the planner and native qualifications enforced by this aggregate.
-        # Other workflows retain their existing independent lint ownership.
+        # Lint the planner and every lane the aggregate enforces, including
+        # lanes added after the original CI-01 plan. Other workflows retain
+        # their existing independent lint ownership.
         run: >-
-          ./actionlint -ignore 'constant expression "false" in condition'
+          ./actionlint
           .github/workflows/ci.yaml
           .github/workflows/context-continuity-qualification.yml
           .github/workflows/current-owner-integration.yml
+          .github/workflows/execution-path-conformance.yml
+          .github/workflows/nix.yml
+          .github/workflows/docker.yml
+          .github/workflows/osv-scanner.yml
 
       - name: Workflow token-permission check (Task 4.2)
         run: python3 scripts/ci/check_workflow_permissions.py
@@ -411,19 +431,16 @@ jobs:
         run: python3 scripts/ci/evaluate_required_checks.py
 
   # ─────────────────────────────────────────────────────────────────────
-  # CI timing report: collect per-job/step durations from the GitHub API,
-  # cache them on main (as a baseline), and on PRs generate an HTML diff
-  # report with a gantt chart + per-step breakdown. The report is uploaded
-  # as an artifact and a markdown summary is written to $GITHUB_STEP_SUMMARY.
-  #
-  # The live comment poller dynamically fetches all review-status-* artifacts
-  # across the orchestrator and sub-workflow runs every cycle, so its link
-  # points straight at that report.
+  # CI timing report: runs on main pushes (baseline) and on demand
+  # (workflow_dispatch). Skipped on PRs and merge-queue runs: every PR
+  # used to pay a GitHub API sweep + artifact upload for a report whose
+  # baseline only changes on main. The live comment poller tolerates the
+  # missing review-status-ci-timings artifact (dynamic fetch).
   # ─────────────────────────────────────────────────────────────────────
   ci-timings:
     name: CI timing report
     needs: [all-checks-pass]
-    if: always()
+    if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Task 4.2: explicit minimal — no inherited write scopes on PR-checkout jobs.

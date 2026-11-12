@@ -15,20 +15,18 @@ def workflow_text() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
 
 
-def test_desktop_e2e_disabled_by_literal_false_only():
-    text = workflow_text()
-    match = re.search(r"(?ms)^  e2e-desktop:.*?(?=^  [A-Za-z0-9_-]+:|\Z)", text)
-    assert match is not None
-    block = match.group(0)
-    assert re.search(r"^    if: false\s*$", block, re.MULTILINE)
-    assert "false &&" not in block
+def test_removed_desktop_lane_is_absent_from_jobs_and_needs():
+    workflow = _workflow()
+    assert "e2e-desktop" not in workflow["jobs"]
+    aggregate = workflow["jobs"]["all-checks-pass"]
+    assert "e2e-desktop" not in aggregate["needs"]
+    assert "exec-conformance" in aggregate["needs"]
 
 
-def test_disabled_desktop_e2e_remains_an_explicit_aggregate_need():
-    text = workflow_text()
-    aggregate = re.search(r"(?ms)^  all-checks-pass:.*?(?=^  [A-Za-z0-9_-]+:|\Z)", text)
-    assert aggregate is not None
-    assert re.search(r"^      - e2e-desktop\s*$", aggregate.group(0), re.MULTILINE)
+def test_desktop_e2e_workflow_remains_dispatchable_on_demand():
+    workflow = _workflow(".github/workflows/e2e-desktop.yml")
+    assert "workflow_dispatch" in workflow["on"]
+    assert "pull_request" not in workflow["on"]
 
 
 def test_aggregate_invokes_expectation_aware_evaluator():
@@ -92,6 +90,7 @@ def test_native_callers_reuse_owners_with_read_only_tokens_and_no_secrets():
     for caller, lane, workflow in [
         ("context-continuity", "context_continuity", "context-continuity-qualification.yml"),
         ("current-owner-integration", "current_owner_integration", "current-owner-integration.yml"),
+        ("exec-conformance", "exec_conformance", "execution-path-conformance.yml"),
     ]:
         job = jobs[caller]
         assert job["needs"] == "detect"
