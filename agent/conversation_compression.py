@@ -2030,6 +2030,22 @@ _SYNTHETIC_USER_FLAGS = (
 )
 
 
+def _has_ambiguous_receipt_user_origin(message: Any) -> bool:
+    """Flag a metadata-free governor carrier without asserting its origin.
+
+    A human may type identical bytes. A role/content-only replay cannot prove
+    whether the row is a real request or a receipt-backed summary, so callers
+    needing a human anchor must retain their safe fallback instead of deciding.
+    """
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    if message.get("_compressed_summary"):
+        return False
+    return _message_text(message).lstrip().startswith(
+        "[CONTEXT COMPACTION — RECEIPT-BACKED REFERENCE ONLY]\n"
+    )
+
+
 def _is_real_user_message(message: Any) -> bool:
     """Distinguish human intent from user-role runtime scaffolding.
 
