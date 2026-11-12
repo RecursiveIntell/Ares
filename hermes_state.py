@@ -98,6 +98,7 @@ from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_runs import SessionRunCustodyMixin
 from hermes_state_continuity import ContextContinuationError, SessionContextContinuityMixin
 from hermes_state_execution import SessionExecutionRecordMixin
+from hermes_state_attention import SessionAttentionMixin
 from hermes_state_inbox import SessionContextInboxMixin
 from hermes_state_schema import (
     SessionSchemaMixin, TODO_LIFECYCLE_SHAPE_SQL,
@@ -4318,7 +4319,7 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
-class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin, SessionRunCustodyMixin, SessionContextContinuityMixin, SessionContextInboxMixin, SessionExecutionRecordMixin):
+class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin, SessionRunCustodyMixin, SessionContextContinuityMixin, SessionContextInboxMixin, SessionExecutionRecordMixin, SessionAttentionMixin):
     """
     SQLite-backed session storage with FTS5 search.
 
