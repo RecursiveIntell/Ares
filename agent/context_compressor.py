@@ -34,7 +34,7 @@ from agent.auxiliary_client import (
 )
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
-from agent.message_sanitization import tool_result_id_variants
+from agent.message_sanitization import tool_call_id_variants, tool_result_id_variants
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     get_model_context_length,
@@ -1983,12 +1983,57 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
         # " chars)" which this shape never contains), and staying strictly
         # below the floor also keeps it out of the >=200-char dedup pass.
         max_summary_chars = _PRUNE_MIN_CHARS - 1
-        truncation_marker = "...[truncated]"
 
         try:
             result = json.loads(content)
         except (json.JSONDecodeError, TypeError):
             result = {}
+        if isinstance(result, dict) and "responses" in result and "user_response" in result:
+            # Conflicting envelope shapes must not silently drop either answer.
+            return content
+        if isinstance(result, dict) and "responses" in result and not isinstance(result["responses"], list):
+            # A malformed batch may carry decisions; do not discard or interpret it.
+            return content
+        if isinstance(result, dict) and isinstance(result.get("responses"), list):
+            pairs = []
+            for item in result["responses"]:
+                if not isinstance(item, dict):
+                    # Unknown rows may contain decisions; never discard them.
+                    return content
+                question, answer = item.get("question"), item.get("user_response")
+                if isinstance(answer, list) and _is_clarify_non_response_sentinel(answer):
+                    # A mixed list cannot be safely treated as answered or unanswered.
+                    return content
+                valid_answer = (
+                    isinstance(answer, str) and bool(answer.strip())
+                ) or (
+                    isinstance(answer, list) and bool(answer)
+                    and all(isinstance(value, str) and value.strip() for value in answer)
+                )
+                unanswered = answer == "" or answer == [] or _is_clarify_non_response_sentinel(answer)
+                if valid_answer or unanswered:
+                    if not isinstance(question, str) or not question.strip():
+                        # An unpaired answer is not safe to discard or assign.
+                        return content
+                    # Keep choice context and row identity along with the answer.
+                    # The assistant's tool arguments can be truncated separately.
+                    pair = dict(item)
+                    pair["user_response"] = "" if unanswered else answer
+                    pairs.append(pair)
+                else:
+                    # Unknown shapes must not silently become a skipped question.
+                    return content
+            if not pairs:
+                return "[clarify] asked user a question"
+            payload = {"responses": pairs}
+            if result.get("timed_out") is True:
+                payload["timed_out"] = True
+            serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8", errors="backslashreplace"
+            ).decode("utf-8")
+            summary = "[clarify] " + serialized
+            # Never silently cut an answer or discard later Q/A pairs to fit.
+            return summary if len(summary) <= max_summary_chars else content
         response = result.get("user_response") if isinstance(result, dict) else None
         is_answer_shaped = (
             isinstance(response, str) and bool(response)
@@ -2014,12 +2059,8 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
                 .decode("utf-8")
             )
             summary = response_prefix + serialized_response
-            if len(summary) > max_summary_chars:
-                summary = (
-                    summary[: max_summary_chars - len(truncation_marker)].rstrip()
-                    + truncation_marker
-                )
-            return summary
+            # Preserve the full answer rather than truncate a decision condition.
+            return summary if len(summary) <= max_summary_chars else content
         return "[clarify] asked user a question"
 
     if tool_name == "text_to_speech":
@@ -3765,21 +3806,43 @@ class ContextCompressor(ContextEngine):
         result = [m.copy() for m in messages]
         pruned = 0
 
-        # Build index: tool_call_id -> (tool_name, arguments_json)
-        call_id_to_tool: Dict[str, tuple] = {}
+        # Index all canonical wire aliases, retaining collisions as ambiguous.
+        call_id_to_tools: dict[str, set[int]] = {}
+        calls: list[tuple] = []
         for msg in result:
             if msg.get("role") == "assistant":
                 for tc in msg.get("tool_calls") or []:
                     if isinstance(tc, dict):
-                        cid = tc.get("id", "")
                         fn = tc.get("function", {})
-                        call_id_to_tool[cid] = (fn.get("name", "unknown"), fn.get("arguments", ""))
+                        name, args_str = fn.get("name", "unknown"), fn.get("arguments", "")
                     else:
-                        cid = getattr(tc, "id", "") or ""
                         fn = getattr(tc, "function", None)
                         name = getattr(fn, "name", "unknown") if fn else "unknown"
                         args_str = getattr(fn, "arguments", "") if fn else ""
-                        call_id_to_tool[cid] = (name, args_str)
+                    index = len(calls)
+                    calls.append((name, args_str))
+                    for alias in tool_call_id_variants(tc):
+                        call_id_to_tools.setdefault(alias, set()).add(index)
+
+        def _tool_for_result(msg):
+            matches = set()
+            for alias in tool_result_id_variants(msg.get("tool_call_id")):
+                matches.update(call_id_to_tools.get(alias, ()))
+            if len(matches) > 1:
+                # Repeated synthetic IDs can denote distinct calls. Do not
+                # pick one, but equivalent non-clarify operations have the
+                # same pruning semantics regardless of which call produced it.
+                candidates = [calls[index] for index in matches]
+                first = candidates[0]
+                if (
+                    isinstance(first[0], str)
+                    and isinstance(first[1], str)
+                    and first[0] not in {"clarify", "unknown"}
+                    and all(candidate == first for candidate in candidates[1:])
+                ):
+                    return first
+                return None
+            return calls[next(iter(matches))] if matches else ("unknown", "")
 
         # Determine the prune boundary
         if protect_tail_tokens is not None and protect_tail_tokens > 0:
@@ -3830,6 +3893,11 @@ class ContextCompressor(ContextEngine):
             if msg.get("role") != "tool":
                 continue
             content = msg.get("content") or ""
+            # A repeated clarification is a separate decision, not a repeated
+            # file read; preserve its call-to-answer association.
+            tool = _tool_for_result(msg)
+            if tool is None or tool[0] == "clarify":
+                continue
             # Multimodal content — dedupe by the text summary if available.
             if isinstance(content, list):
                 continue
@@ -3890,8 +3958,10 @@ class ContextCompressor(ContextEngine):
             # proactive path raises this floor via min_prune_chars).
             if len(content) <= min_prune_chars:
                 return False
-            call_id = msg.get("tool_call_id", "")
-            tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+            tool = _tool_for_result(msg)
+            if tool is None:
+                return False
+            tool_name, tool_args = tool
             if spare_protected_skills and tool_name == "skill_view" and protected_skills:
                 # Just-loaded / actively-referenced skills survive verbatim
                 # (#32106). Pass-4 pressure demotion overrides this.
@@ -3903,6 +3973,8 @@ class ContextCompressor(ContextEngine):
                 if isinstance(_skill, str) and _skill.lower() in protected_skills:
                     return False
             summary = _summarize_tool_result(tool_name, tool_args, content)
+            if summary == content:
+                return False
             result[idx] = {**msg, "content": summary}
             pruned += 1
             return True

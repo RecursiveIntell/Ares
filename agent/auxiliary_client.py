@@ -8873,6 +8873,11 @@ def _contains_profile_reasoning_fields(value: Any) -> bool:
     return False
 
 
+def _requires_opencode_go_compression_cap(provider: str | None, task: str | None) -> bool:
+    """A configured Go compression output limit must survive on the wire."""
+    return str(provider or "").strip().lower() == "opencode-go" and task == "compression"
+
+
 def _build_call_kwargs(
     provider: str,
     model: str,
@@ -8966,6 +8971,7 @@ def _build_call_kwargs(
             or _is_nvidia_nim
             or _is_moa
             or _is_gemini_native
+            or _requires_opencode_go_compression_cap(provider, task)
         ):
             # Use auxiliary_max_tokens_param() so models that require
             # max_completion_tokens (GPT-5 family, Copilot) get the right
@@ -10152,7 +10158,7 @@ def _call_llm_impl(
             "1210" in err_str
             and "bigmodel" in str(getattr(client, "base_url", ""))
         )
-        if max_tokens is not None and (
+        if max_tokens is not None and not _requires_opencode_go_compression_cap(request_provider, task) and (
             "max_tokens" in err_str
             or "unsupported_parameter" in err_str
             or _is_unsupported_parameter_error(first_err, "max_tokens")
@@ -10918,7 +10924,7 @@ async def _async_call_llm_impl(
             "1210" in err_str
             and "bigmodel" in str(getattr(client, "base_url", ""))
         )
-        if max_tokens is not None and (
+        if max_tokens is not None and not _requires_opencode_go_compression_cap(request_provider, task) and (
             "max_tokens" in err_str
             or "unsupported_parameter" in err_str
             or _is_unsupported_parameter_error(first_err, "max_tokens")
