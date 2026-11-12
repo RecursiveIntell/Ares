@@ -151,6 +151,11 @@ jobs:
         run: |
           ruff check .
 
+      - name: Fork-owned pyflakes (blocking)
+        run: |
+          ruff --version
+          ruff check --select PLW1514,F ares_runtime hermes_state_*.py
+
   windows-footguns:
     # Static guardrails on Windows-unsafe Python primitives — os.kill(pid, 0),
     # os.killpg, os.setsid, signal.SIGKILL without getattr fallback,
