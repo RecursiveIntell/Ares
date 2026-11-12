@@ -540,21 +540,28 @@ def _desktop_request(root: Path, envelope: Mapping[str, object]) -> dict[str, ob
 
 
 def _read_framed_reply(connection) -> bytes:
-    """Read one newline-terminated reply, reassembling split TCP reads (audit L6a).
+    """Admit exactly one bounded newline frame, followed by peer EOF.
 
-    A single recv() may return only a prefix of the reply. Read until the
-    terminating newline, EOF, or the bound is exceeded; never more than
-    MAX_RESPONSE_BYTES + 1 bytes are buffered.
+    The desktop response owner uses socket.end(frame). Waiting for that EOF
+    rejects trailing bytes even when TCP delivers them in a later read. Once
+    the newline arrives, read only one more byte to distinguish EOF from an
+    extra frame or trailing whitespace. The socket's timeout remains active.
     """
     buffer = bytearray()
-    while len(buffer) <= MAX_RESPONSE_BYTES:
-        chunk = connection.recv(MAX_RESPONSE_BYTES + 1 - len(buffer))
+    frame_complete = False
+    while True:
+        size = 1 if frame_complete else MAX_RESPONSE_BYTES + 1 - len(buffer)
+        chunk = connection.recv(size)
         if not chunk:
-            break
+            if not frame_complete:
+                raise DispatchError("DESKTOP_RESPONSE_INVALID")
+            return bytes(buffer)
+        if frame_complete:
+            raise DispatchError("DESKTOP_RESPONSE_INVALID")
         buffer.extend(chunk)
-        if b"\n" in chunk:
-            break
-    return bytes(buffer)
+        if len(buffer) > MAX_RESPONSE_BYTES or b"\n" in chunk[:-1]:
+            raise DispatchError("DESKTOP_RESPONSE_INVALID")
+        frame_complete = chunk.endswith(b"\n")
 
 
 def _parse_capability_bindings(
