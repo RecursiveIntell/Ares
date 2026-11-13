@@ -4,7 +4,7 @@
     "Libraries": {
       "url": "https://github.com/RecursiveIntell/Libraries.git",
       "ref": "refs/heads/main",
-      "commit": "d9f3c60f1584285c22ce97e797cfb3f1c9adc7e7"
+      "commit": "ad00c12f403da7ab5a219b41770be20872575a4d"
     },
     "agent-memory-kits": {
       "url": "https://github.com/RecursiveIntell/agent-memory-kits.git",
