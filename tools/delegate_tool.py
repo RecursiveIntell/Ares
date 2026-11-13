@@ -2856,10 +2856,19 @@ def _run_single_child(
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
         )
 
-        # Run child with an optional hard timeout (off by default —
-        # result(timeout=None) blocks until the child finishes). Stuck-child
-        # protection comes from the heartbeat staleness monitor instead.
+        # Run child with an optional hard timeout. ``child_timeout_seconds: 0``
+        # (the shipped default) means "no operator-configured wall-clock cap" —
+        # but a child must never be truly unbounded: the grant-window guard
+        # (agent/delegated_expiry.py) refuses to start one without either an own
+        # timeout or a window, which made every top-level delegation fail
+        # instantly on a fresh install. When no operator cap is set, fall back
+        # to 24 h — deep margin above agent.gateway_timeout (30 min default),
+        # the longest legitimate single turn — so the fallback never cuts off
+        # work the operator did not ask to have cut off. Stuck-child protection
+        # still comes from the heartbeat staleness monitor long before this.
         child_timeout = _get_child_timeout()
+        if child_timeout is None and window_not_after is None:
+            child_timeout = 24.0 * 3600.0
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.

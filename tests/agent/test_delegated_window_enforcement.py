@@ -88,3 +88,42 @@ def test_no_window_leaves_existing_behavior_unchanged(monkeypatch):
     elapsed = time.monotonic() - t0
 
     assert elapsed < 10, f"own timeout did not apply without a window: {elapsed:.1f}s"
+
+
+def test_unbounded_default_falls_back_to_a_bounded_child(monkeypatch):
+    """Regression: ``child_timeout_seconds: 0`` (the shipped default) means
+    "no operator cap", and top-level delegation supplies no grant window — so
+    both bounds were None and agent.delegated_expiry.child_effective_deadline
+    refused with ``ValueError: a child needs an own timeout or a grant window
+    to be bounded``. Every top-level delegation on a fresh install died in
+    ~10 ms. The delegate now derives a 24 h fallback cap when neither bound is
+    present, so the child starts and the heartbeat staleness monitor remains
+    the real stuck-child protection."""
+    monkeypatch.setattr(d, "_get_child_timeout", lambda: None)
+    started = threading.Event()
+    finished = threading.Event()
+    released = threading.Event()
+
+    class _FinishingChild:
+        _interrupt_requested = False
+        model = "m"
+        provider = "p"
+        _delegate_depth = 1
+        session_id = "child"
+        iteration_budget = None
+
+        def run_conversation(self, **kwargs):
+            started.set()
+            # Return quickly: proves the child runs to completion under the
+            # fallback bound rather than being refused or killed early.
+            finished.set()
+            released.set()
+            return {"final_response": "ok", "completed": True, "interrupted": False,
+                    "api_calls": 1, "messages": []}
+
+    child = _FinishingChild()
+    result = d._run_single_child(0, "goal", child, _parent(), window_not_after=None)
+
+    assert started.is_set(), "fallback bound must let the child start"
+    assert finished.is_set(), "child must be able to finish inside the fallback"
+    assert result.get("status") == "completed", result
