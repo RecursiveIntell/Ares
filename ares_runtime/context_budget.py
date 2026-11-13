@@ -66,10 +66,14 @@ def resolve_output_reserve(configured: int | None, window: int) -> int:
             return min(value, max(1, window - 1)) if window > 0 else value
     if window <= 0:
         return 0
-    return min(
+    derived = min(
         RESERVE_MAX_TOKENS,
         max(RESERVE_MIN_TOKENS, int(window * RESERVE_RATIO)),
     )
+    # Never reserve more than a quarter of the window: on a tiny route the 1,024
+    # floor would otherwise exceed the whole window and leave no input budget,
+    # turning a degraded-but-working route into a hard error.
+    return min(derived, max(0, window // 4))
 
 
 class BudgetFloorInfeasible(ValueError):
