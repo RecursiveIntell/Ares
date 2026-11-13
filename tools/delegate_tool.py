@@ -28,6 +28,7 @@ import os
 import threading
 import time
 import weakref
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
@@ -141,6 +142,22 @@ def _child_debiting_budget(parent_agent, child_max_iterations):
     if not isinstance(parent_budget, IterationBudget):
         raise RuntimeError("delegation requires a parent iteration budget; refusing unbounded child")
     return DebitingIterationBudget(max_total=int(child_max_iterations), parent=parent_budget)
+
+
+def _resolve_child_window_not_after(window_not_after) -> Optional["datetime"]:
+    """Single owner for the child's grant window resolution.
+
+    Precedence: explicit caller value > configured dispatcher default > None.
+    An explicit ``None`` from a caller means "not supplied", NOT "force
+    disabled" — otherwise the model-facing dispatch path (which never passes
+    a window) would silently veto the configured default and every child
+    would be unbounded again. Callers who want to force-disable the window
+    for one call should set ``delegation.child_grant_window_seconds: 0``
+    in config, not pass None.
+    """
+    if window_not_after is not None:
+        return window_not_after
+    return _get_child_grant_window()
 
 
 MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected unless max_spawn_depth raised.
@@ -987,6 +1004,49 @@ def _get_child_timeout() -> Optional[float]:
     return DEFAULT_CHILD_TIMEOUT
 
 
+def _get_child_grant_window() -> Optional["datetime"]:
+    """Resolve the dispatcher-issued default grant window for a delegated child.
+
+    The bounding gate (``agent.delegated_expiry.child_effective_deadline``) is
+    fail-closed: a child must carry at least one bound — its own wall-clock
+    timeout OR an explicit grant window. ``child_timeout_seconds`` defaults to
+    0 (disabled) so heavy children are never killed by a generic stopwatch,
+    which left production delegations with NEITHER bound: every child was
+    refused at start (ValueError: a child needs an own timeout or a grant
+    window to be bounded). This resolver supplies the missing bound.
+
+    Resolution order (the EARLIER of timeout and window always wins at the
+    gate, so a coarser window cannot override a tighter timeout):
+
+    1. A caller-supplied ``window_not_after`` — unchanged, always wins.
+    2. ``delegation.child_grant_window_seconds`` (0 = disabled, floor 30s) —
+       a coarse outer horizon issued by the dispatcher, NOT the model: it is
+       not a model-facing schema field, so the model cannot set its own bound.
+    3. Otherwise disabled: no window is issued, and an unbounded child is
+       refused by the gate unless ``child_timeout_seconds`` supplies the
+       bound (fail-closed semantics preserved).
+
+    Only aware datetimes are produced (now + timedelta), per the gate's
+    naive-datetime refusal.
+    """
+    cfg = _load_config()
+    val = cfg.get("child_grant_window_seconds")
+    if val is not None:
+        try:
+            parsed = float(val)
+        except (TypeError, ValueError):
+            logger.warning(
+                "delegation.child_grant_window_seconds=%r is not a valid number; "
+                "using default (no grant window)",
+                val,
+            )
+        else:
+            if parsed > 0:
+                return datetime.now(timezone.utc) + timedelta(seconds=max(30.0, parsed))
+            return None
+    return None
+
+
 def _get_max_spawn_depth() -> int:
     """Read delegation.max_spawn_depth from config, floored at 1 (no ceiling).
 
@@ -1642,10 +1702,14 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
-    # Per-call role controlling whether the child can further delegate.
+    # Per-call role controlling whether a child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Explicit grant window threaded by the dispatcher; recorded in the
+    # child's grant audit record. None = not supplied (the resolver applies
+    # the configured default at record build and again at run entry).
+    window_not_after: Any = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -2164,7 +2228,7 @@ def _build_child_agent(
                 "child_max": int(max_iterations),
                 "parent_remaining": int(_parent_remaining),
             },
-            "window_not_after": None,
+            "window_not_after": _resolve_child_window_not_after(window_not_after),
         }
     except Exception:
         logger.debug("subagent: grant audit record not built", exc_info=True)
@@ -2544,6 +2608,13 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+
+    # Task 2.2 single owner: resolve the effective grant window at entry so
+    # every entry route (explicit delegate_task param, registry kw, the
+    # subagent-lifecycle plugin path) receives the dispatcher-issued default
+    # when no explicit window was supplied. The gate below stays fail-closed:
+    # with both bounds disabled an unbounded child is still refused.
+    window_not_after = _resolve_child_window_not_after(window_not_after)
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -3990,6 +4061,7 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                window_not_after=window_not_after,
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
@@ -4066,6 +4138,7 @@ def delegate_task(
                         owner_session_id=_origin_ui_session_id or None,
                         owner_transport=_origin_owner_transport,
                         owner_session_record=_origin_owner_session_record,
+                        window_not_after=window_not_after,
                     )
                     futures[future] = i
 

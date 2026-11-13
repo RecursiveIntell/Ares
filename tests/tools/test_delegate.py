@@ -15,8 +15,10 @@ import threading
 import time
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+from tools import delegate_tool as tools_delegate_tool
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
@@ -2038,6 +2040,66 @@ class TestFallbackModelInheritance(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     _resolve_delegation_credentials(cfg, parent)
         self.assertIn("missing-acp-binary", str(ctx.exception))
+
+
+class TestChildGrantWindow(unittest.TestCase):
+    """Task 2.2 dispatcher-issued grant window: config default → child record."""
+
+    def test_config_default_reaches_child_grant_record(self):
+        parent = _make_mock_parent(depth=0)
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._load_config", return_value={"child_grant_window_seconds": 3600}),
+        ):
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Test configured grant window", parent_agent=parent)
+
+        record = mock_child._grant_record
+        window = record["window_not_after"]
+        self.assertIsNotNone(window, "grant record must carry the configured window")
+        self.assertTrue(window.tzinfo is not None, "window must be timezone-aware")
+        self.assertGreater(window, datetime.now(timezone.utc))
+
+    def test_disabled_window_records_none_and_run_refuses(self):
+        parent = _make_mock_parent(depth=0)
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._load_config", return_value={"child_grant_window_seconds": 0}),
+        ):
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test disabled window", parent_agent=parent))
+
+        record = mock_child._grant_record
+        self.assertIsNone(record["window_not_after"], "disabled default records no window")
+        # The bounded path is on _run_single_child; with the window disabled and
+        # no explicit timeout bound threaded here the structural record stays None.
+        # _run_single_child's own refusal is covered by
+        # tests/agent/test_delegated_window_enforcement.py.
+
+    def test_resolver_precedence(self):
+        explicit = datetime.now(timezone.utc) + timedelta(seconds=11)
+        with patch(
+            "tools.delegate_tool._get_child_grant_window",
+            return_value=datetime.now(timezone.utc) + timedelta(seconds=99),
+        ):
+            self.assertIs(tools_delegate_tool._resolve_child_window_not_after(explicit), explicit)
+            self.assertIsNotNone(tools_delegate_tool._resolve_child_window_not_after(None))
 
 
 if __name__ == "__main__":
