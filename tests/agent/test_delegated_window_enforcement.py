@@ -88,3 +88,42 @@ def test_no_window_leaves_existing_behavior_unchanged(monkeypatch):
     elapsed = time.monotonic() - t0
 
     assert elapsed < 10, f"own timeout did not apply without a window: {elapsed:.1f}s"
+
+
+def test_production_default_is_not_unbounded(monkeypatch):
+    """Regression for the 2026-11-13 all-children-refused incident.
+
+    The production default pair — child_timeout_seconds: 0 (returns None)
+    and no caller window — must not reach the gate as (None, None), which
+    refuses every child at start with "a child needs an own timeout or a
+    grant window to be bounded". The resolved pair must carry at least one
+    bound (the dispatcher-issued grant window).
+    """
+    monkeypatch.setattr(d, "_get_child_timeout", lambda: None)
+    monkeypatch.setattr(
+        d, "_get_child_grant_window", lambda: datetime.now(timezone.utc) + timedelta(seconds=30)
+    )
+    resolved = d._resolve_child_window_not_after(None)
+    assert resolved is not None, "default pair resolved to an unbounded child"
+
+
+def test_grant_window_disabled_and_no_timeout_still_refuses(monkeypatch):
+    """Fail-closed preserved: both bounds disabled means the child is refused."""
+    monkeypatch.setattr(d, "_get_child_timeout", lambda: None)
+    monkeypatch.setattr(d, "_get_child_grant_window", lambda: None)
+    resolved = d._resolve_child_window_not_after(None)
+    assert resolved is None
+
+    child = _BlockingChild()
+    result = d._run_single_child(0, "goal", child, _parent(), window_not_after=None)
+    assert not child.started.is_set()
+    assert result.get("status") not in {"completed"}, result
+
+
+def test_explicit_window_beats_configured_default(monkeypatch):
+    """A caller-supplied window always wins over the dispatcher default."""
+    explicit = datetime.now(timezone.utc) + timedelta(seconds=11)
+    monkeypatch.setattr(
+        d, "_get_child_grant_window", lambda: datetime.now(timezone.utc) + timedelta(seconds=99)
+    )
+    assert d._resolve_child_window_not_after(explicit) is explicit
