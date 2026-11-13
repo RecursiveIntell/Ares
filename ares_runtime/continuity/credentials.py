@@ -12,7 +12,12 @@ from pathlib import Path
 import re
 import stat
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+# ``cryptography`` is imported lazily at each use site (see below). Importing it
+# at module scope made every importer of ``ares_runtime.continuity`` pull the
+# whole cryptography stack, which breaks the deliberate guarantee that ordinary
+# CLI dispatch (notably the update path) completes without it — asserted by
+# tests/hermes_cli/test_update_secret_import_lock.py and
+# tests/test_lazy_secrets_dispatch.py.
 
 
 KEY_DIRECTORY = "context-controller-keys"
@@ -89,6 +94,10 @@ def _read_key(directory_fd, key_ref):
         # An interrupted or concurrent creator may have written all bytes but
         # not flushed them yet. READY must never outrun credential durability.
         os.fsync(fd)
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey,
+        )
+
         return Ed25519PrivateKey.from_private_bytes(raw), _identity(node)
     finally:
         os.close(fd)
@@ -111,6 +120,10 @@ def create_controller_credential(database_path, key_ref):
             fd = None
         if fd is not None:
             try:
+                from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+                    Ed25519PrivateKey,
+                )
+
                 raw = Ed25519PrivateKey.generate().private_bytes_raw()
                 written = os.write(fd, raw)
                 if written != len(raw):
