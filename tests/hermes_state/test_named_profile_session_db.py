@@ -209,3 +209,73 @@ def test_init_session_skips_launch_db_when_profile_store_unopenable(homes, monke
     finally:
         with server._sessions_lock:
             server._sessions.pop(sid, None)
+
+
+def test_strict_session_profile_upsert_serializes_competing_writers(tmp_path):
+    """Two guarded connections cannot both claim one session for different profiles."""
+    import json
+    from hermes_state import SessionProfileMismatchError
+
+    path = tmp_path / "state.db"
+    first = SessionDB(db_path=path)
+    second = SessionDB(db_path=path)
+    first_inside_write = threading.Event()
+    release_first = threading.Event()
+    second_attempting = threading.Event()
+    second_done = threading.Event()
+    outcomes = []
+    original_store_prompt = first._store_system_prompt
+
+    def hold_after_begin(conn, system_prompt):
+        # _execute_write has acquired BEGIN IMMEDIATE before this owner call.
+        first_inside_write.set()
+        if not release_first.wait(timeout=5):
+            raise TimeoutError("first writer was not released")
+        return original_store_prompt(conn, system_prompt)
+
+    first._store_system_prompt = hold_after_begin
+
+    def claim(db, name, attempting=None, done=None):
+        try:
+            if attempting is not None:
+                attempting.set()
+            db.create_session(
+                "contended-profile-row", source="desktop", profile_name=name,
+                expected_profile_name=name, model_config={"model": name},
+            )
+            outcomes.append((name, "admitted"))
+        except SessionProfileMismatchError:
+            outcomes.append((name, "refused"))
+        except BaseException as exc:
+            outcomes.append((name, type(exc).__name__))
+        finally:
+            if done is not None:
+                done.set()
+
+    writer_a = threading.Thread(target=claim, args=(first, "profile-a"), daemon=True)
+    writer_b = threading.Thread(
+        target=claim, args=(second, "profile-b", second_attempting, second_done),
+        daemon=True,
+    )
+    try:
+        writer_a.start()
+        assert first_inside_write.wait(timeout=5)
+        writer_b.start()
+        assert second_attempting.wait(timeout=5)
+        assert not second_done.wait(timeout=0.1), "second writer bypassed the held write lock"
+    finally:
+        release_first.set()
+        writer_a.join(timeout=10)
+        if writer_b.ident is not None:
+            writer_b.join(timeout=10)
+    assert not writer_a.is_alive() and not writer_b.is_alive()
+    assert sorted(outcomes) == [("profile-a", "admitted"), ("profile-b", "refused")]
+    witness = SessionDB(db_path=path)
+    try:
+        row = witness.get_session("contended-profile-row")
+        assert row is not None and row["profile_name"] == "profile-a"
+        assert json.loads(row["model_config"]) == {"model": "profile-a"}
+    finally:
+        witness.close()
+        first.close()
+        second.close()

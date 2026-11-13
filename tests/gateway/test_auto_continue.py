@@ -51,6 +51,59 @@ class TestAutoDetection:
 
 
 class TestInterruptedReplayFiltering:
+    def test_new_advisory_note_is_not_replayed_as_user_instruction(self):
+        from gateway.run import _build_gateway_agent_history
+        from tui_gateway.server import _auto_continue_note
+
+        note = _auto_continue_note("inspect before repeating an effect")
+        history = [
+            {"role": "user", "content": note},
+            {"role": "user", "content": "what is the current state?"},
+        ]
+        agent_history, _observed = _build_gateway_agent_history(history)
+        assert all(note not in str(item.get("content") or "") for item in agent_history)
+        assert all("inspect before repeating an effect" not in str(item.get("content") or "")
+                   for item in agent_history)
+        assert any(item.get("content") == "what is the current state?" for item in agent_history)
+
+        legacy = "[System note: Your previous turn was interrupted mid-run]\n\na real new question"
+        legacy_history, _ = _build_gateway_agent_history([{"role": "user", "content": legacy}])
+        assert any(item.get("content") == "a real new question" for item in legacy_history)
+
+    def test_timestamped_advisory_note_does_not_replay_prior_request(self):
+        from gateway.run import _build_gateway_agent_history
+        from tui_gateway.server import _auto_continue_note
+
+        prior = "perform the prior side effect"
+        history = [
+            {"role": "user", "content": _auto_continue_note(prior), "timestamp": 1_780_000_000},
+            {"role": "user", "content": "check current state", "timestamp": 1_780_000_001},
+        ]
+        agent_history, _ = _build_gateway_agent_history(history, inject_timestamps=True)
+        assert all(prior not in str(item.get("content") or "") for item in agent_history)
+        assert all("previous turn" not in str(item.get("content") or "").lower()
+                   for item in agent_history)
+        assert len(agent_history) == 1
+        assert "check current state" in str(agent_history[0]["content"])
+
+    def test_timestamped_observed_advisory_note_is_not_model_context(self):
+        from gateway.run import _build_gateway_agent_history
+        from tui_gateway.server import _auto_continue_note
+
+        history = [
+            {"role": "user", "observed": True,
+             "content": _auto_continue_note("prior-effect"), "timestamp": 1_780_000_000},
+            {"role": "user", "observed": True,
+             "content": "Alice said hello", "timestamp": 1_780_000_001},
+        ]
+        agent_history, observed = _build_gateway_agent_history(
+            history, channel_prompt="observed Telegram group context", inject_timestamps=True,
+        )
+        assert agent_history == []
+        assert observed and "Alice said hello" in observed
+        assert "prior-effect" not in observed
+        assert "previous turn" not in observed.lower()
+
     def test_interrupted_side_effect_is_replayed_as_unknown(self):
         from gateway.run import _build_gateway_agent_history
 

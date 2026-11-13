@@ -220,6 +220,7 @@ def test_dashboard_process_isolation_config_defaults_without_default_merge(monke
 
     assert server._load_dashboard_process_isolation_config() == {
         "turn_isolation": False,
+        "require_compute_host": False,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
         "detached_execution_max_s": 300,
@@ -239,6 +240,7 @@ def test_dashboard_process_isolation_config_coerces_raw_values():
 
     assert server._load_dashboard_process_isolation_config(cfg) == {
         "turn_isolation": True,
+        "require_compute_host": False,
         "compute_host_heartbeat_secs": 30,
         "compute_host_respawn_max": 0,
         "detached_execution_max_s": 300,
@@ -248,6 +250,7 @@ def test_dashboard_process_isolation_config_coerces_raw_values():
     malformed = {"dashboard": "enabled"}
     assert server._load_dashboard_process_isolation_config(malformed) == {
         "turn_isolation": False,
+        "require_compute_host": False,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
         "detached_execution_max_s": 300,
@@ -261,6 +264,7 @@ def test_default_config_seeds_dashboard_process_isolation_keys():
 
     dashboard = DEFAULT_CONFIG["dashboard"]
     assert dashboard["turn_isolation"] is False
+    assert dashboard["require_compute_host"] is False
     assert dashboard["compute_host_heartbeat_secs"] == 15
     assert dashboard["compute_host_respawn_max"] == 3
     assert dashboard["detached_execution_max_s"] == 300

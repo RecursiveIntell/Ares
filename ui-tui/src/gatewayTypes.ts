@@ -214,6 +214,8 @@ export interface SessionActiveListResponse {
 
 export interface SessionInflightTurn {
   assistant?: string
+  error_surface?: null | { code?: string; retryable?: boolean }
+  status?: string
   streaming?: boolean
   user?: string
 }
