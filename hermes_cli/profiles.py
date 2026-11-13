@@ -20,6 +20,7 @@ Usage::
 """
 
 import errno
+import hashlib
 import json
 import math
 import logging
@@ -34,7 +35,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
 
@@ -872,6 +873,569 @@ def _count_skills(profile_dir: Path) -> int:
 #
 # Missing file -> empty defaults; never an error. The kanban decomposer
 # tolerates empty descriptions and just falls back to the profile name.
+
+
+# P02 specialist routing evidence is a separate, explicit-scope API. Keep this
+# reader independent from read_profile_meta/listing: those older helpers are
+# deliberately forgiving for interactive profile management, while evidence
+# capture must preserve malformed, empty, and unavailable states distinctly.
+_PROFILE_EVIDENCE_MAX_FILE_BYTES = 64 * 1024 * 1024
+_PROFILE_EVIDENCE_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+_PROFILE_EVIDENCE_MAX_FILES = 256
+_PROFILE_EVIDENCE_MAX_DEPTH = 16
+_PROFILE_EVIDENCE_MAX_ITEMS = 128
+_PROFILE_EVIDENCE_MAX_STRING_BYTES = 65_536
+# File references are opaque identifiers. Keep path separators out so a
+# caller-controlled reference can never turn an error or serialized ref into
+# a path-shaped value.
+_PROFILE_EVIDENCE_REF_RE = re.compile(r"^[A-Za-z0-9._:@#-]{1,256}$")
+_PROFILE_EVIDENCE_FORBIDDEN = frozenset({
+    ".env",
+    "auth.json",
+    "sessions",
+    "config.yaml",
+    "config.yml",
+    "config.json",
+    "account.json",
+    "accounts.json",
+    "credentials.json",
+    "credential.json",
+    "secrets.json",
+    "secret.json",
+    "tokens.json",
+    "token.json",
+    "session.json",
+    "gateway",
+    "models",
+    "models.json",
+    "model.json",
+    "credentials",
+})
+_PROFILE_EVIDENCE_FORBIDDEN_STEMS = frozenset({
+    "account",
+    "accounts",
+    "auth",
+    "config",
+    "credential",
+    "credentials",
+    "gateway",
+    "model",
+    "models",
+    "secret",
+    "secrets",
+    "session",
+    "sessions",
+    "token",
+    "tokens",
+})
+
+
+class ProfileEvidenceReadError(ValueError):
+    """A safe refusal while reading explicitly scoped profile evidence."""
+
+    def __init__(self, code: str, file_ref: str = "") -> None:
+        self.code = code
+        self.file_ref = file_ref
+        suffix = f" ({file_ref})" if file_ref else ""
+        super().__init__(f"{code}{suffix}")
+
+
+def _profile_evidence_sensitive_component(part: str) -> bool:
+    lowered = part.casefold()
+    return (
+        lowered.startswith(".env")
+        or lowered in _PROFILE_EVIDENCE_FORBIDDEN
+        or PurePosixPath(lowered).stem in _PROFILE_EVIDENCE_FORBIDDEN_STEMS
+    )
+
+
+@dataclass(frozen=True)
+class ProfileEvidenceFile:
+    file_ref: str
+    relative_path: str
+    status: str
+    byte_digest: Optional[str]
+    byte_length: Optional[int]
+    parsed: Optional[Mapping[str, Any]]
+    identity: Optional[Tuple[int, int, int, int]]
+
+
+@dataclass(frozen=True)
+class ProfileEvidenceRead:
+    files: Tuple[ProfileEvidenceFile, ...]
+    roster_ids: Tuple[str, ...]
+    roster_identity: Tuple[Tuple[str, int, int], ...]
+
+
+def _profile_evidence_relative_parts(
+    value: Any, *, roster: bool = False
+) -> Tuple[str, ...]:
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        raise ProfileEvidenceReadError("PATH_ESCAPE")
+    try:
+        if len(value.encode("utf-8", "strict")) > 4096:
+            raise ProfileEvidenceReadError("PATH_ESCAPE")
+    except UnicodeEncodeError as exc:
+        raise ProfileEvidenceReadError("PATH_ESCAPE") from exc
+    if any(part in {"", ".", ".."} for part in value.split("/")):
+        raise ProfileEvidenceReadError("PATH_ESCAPE")
+    if any(ord(char) < 32 for char in value):
+        raise ProfileEvidenceReadError("PATH_ESCAPE")
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    if (
+        posix.is_absolute()
+        or windows.is_absolute()
+        or windows.drive
+        or any(part in {"", ".", ".."} for part in posix.parts)
+    ):
+        raise ProfileEvidenceReadError("PATH_ESCAPE")
+    parts = tuple(posix.parts)
+    if not parts or any(_profile_evidence_sensitive_component(part) for part in parts):
+        raise ProfileEvidenceReadError("FORBIDDEN_SOURCE_PATH")
+    if roster and len(parts) > 16:
+        raise ProfileEvidenceReadError("PATH_ESCAPE")
+    return parts
+
+
+def _profile_evidence_tree(value: Any, depth: int = 0) -> None:
+    if depth > _PROFILE_EVIDENCE_MAX_DEPTH:
+        raise ValueError("JSON_TOO_DEEP")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("NONFINITE_NUMBER")
+    if isinstance(value, str):
+        if len(value.encode("utf-8", "strict")) > _PROFILE_EVIDENCE_MAX_STRING_BYTES:
+            raise ValueError("STRING_TOO_LARGE")
+    elif isinstance(value, Mapping):
+        if len(value) > _PROFILE_EVIDENCE_MAX_ITEMS:
+            raise ValueError("LIST_TOO_LARGE")
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("INVALID_OBJECT_KEY")
+            _profile_evidence_tree(key, depth + 1)
+            _profile_evidence_tree(item, depth + 1)
+    elif isinstance(value, (list, tuple)):
+        if len(value) > _PROFILE_EVIDENCE_MAX_ITEMS:
+            raise ValueError("LIST_TOO_LARGE")
+        for item in value:
+            _profile_evidence_tree(item, depth + 1)
+
+
+def _profile_evidence_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in result:
+            raise ValueError("DUPLICATE_JSON_KEY")
+        result[key] = item
+    return result
+
+
+def _profile_evidence_json_constant(_value: str) -> None:
+    raise ValueError("NONFINITE_NUMBER")
+
+
+def _profile_evidence_parse(
+    raw: bytes, file_format: str
+) -> tuple[str, Optional[Mapping[str, Any]]]:
+    try:
+        text = raw.decode("utf-8", "strict")
+        if file_format == "json":
+            value = json.loads(
+                text,
+                object_pairs_hook=_profile_evidence_pairs,
+                parse_constant=_profile_evidence_json_constant,
+            )
+        else:
+            import yaml
+
+            class UniqueSafeLoader(yaml.SafeLoader):
+                def compose_node(self, parent, index):
+                    # Aliases can create a compact shared-object graph whose
+                    # repeated traversal is exponential. This strict evidence
+                    # reader has no need for alias semantics, so reject them.
+                    if self.check_event(yaml.events.AliasEvent):
+                        raise ValueError("YAML_ALIASES_UNSUPPORTED")
+                    return super().compose_node(parent, index)
+
+            def construct_unique_mapping(loader, node, deep=False):
+                mapping: dict[str, Any] = {}
+                for key_node, value_node in node.value:
+                    key = loader.construct_object(key_node, deep=deep)
+                    if not isinstance(key, str) or key in mapping:
+                        raise ValueError("DUPLICATE_OR_INVALID_YAML_KEY")
+                    mapping[key] = loader.construct_object(value_node, deep=deep)
+                return mapping
+
+            UniqueSafeLoader.add_constructor(
+                yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+                construct_unique_mapping,
+            )
+            value = yaml.load(text, Loader=UniqueSafeLoader)
+            if value is None:
+                value = {}
+    except Exception:
+        return "malformed", None
+    if not isinstance(value, Mapping):
+        return "malformed", None
+    try:
+        _profile_evidence_tree(value)
+    except (UnicodeEncodeError, ValueError, RecursionError):
+        return "malformed", None
+    status = "valid_empty" if not value else "valid_populated"
+    return status, dict(value)
+
+
+def _profile_evidence_open_flags() -> tuple[int, int]:
+    required = ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK")
+    if (
+        any(not hasattr(os, flag) for flag in required)
+        or os.open not in getattr(os, "supports_dir_fd", set())
+        or os.stat not in getattr(os, "supports_dir_fd", set())
+        or os.stat not in getattr(os, "supports_follow_symlinks", set())
+        or os.listdir not in getattr(os, "supports_fd", set())
+        or os.scandir not in getattr(os, "supports_fd", set())
+    ):
+        raise ProfileEvidenceReadError("SAFE_READ_UNSUPPORTED")
+    directory = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    )
+    file_flags = (
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    )
+    return directory, file_flags
+
+
+def _profile_evidence_open_absolute_directory(path: Path, directory_flags: int) -> int:
+    if not path.is_absolute() or ".." in path.parts:
+        raise ProfileEvidenceReadError("INVALID_ROOT")
+    if any(_profile_evidence_sensitive_component(part) for part in path.parts):
+        raise ProfileEvidenceReadError("FORBIDDEN_SOURCE_PATH")
+    fd: Optional[int] = None
+    try:
+        fd = os.open(os.sep, directory_flags)
+        for part in path.parts[1:]:
+            if part in {"", ".", ".."}:
+                raise ProfileEvidenceReadError("INVALID_ROOT")
+            try:
+                info = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            except OSError as exc:
+                raise ProfileEvidenceReadError("INVALID_ROOT") from exc
+            if stat.S_ISLNK(info.st_mode):
+                raise ProfileEvidenceReadError("SYMLINK_REFUSED")
+            if not stat.S_ISDIR(info.st_mode):
+                raise ProfileEvidenceReadError("INVALID_ROOT")
+            child = os.open(part, directory_flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            os.close(fd)
+            fd = None
+            raise ProfileEvidenceReadError("INVALID_ROOT")
+        return fd
+    except ProfileEvidenceReadError:
+        if fd is not None:
+            os.close(fd)
+        raise
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
+        if exc.errno in {errno.ELOOP, errno.EMLINK}:
+            raise ProfileEvidenceReadError("SYMLINK_REFUSED") from exc
+        raise ProfileEvidenceReadError("INVALID_ROOT") from exc
+
+
+def _profile_evidence_open_directory(
+    root_fd: int, parts: Tuple[str, ...], flags: int
+) -> int:
+    current = os.dup(root_fd)
+    try:
+        for part in parts:
+            try:
+                info = os.stat(part, dir_fd=current, follow_symlinks=False)
+            except FileNotFoundError as exc:
+                raise ProfileEvidenceReadError("INVALID_ROOT") from exc
+            if stat.S_ISLNK(info.st_mode):
+                raise ProfileEvidenceReadError("SYMLINK_REFUSED")
+            if not stat.S_ISDIR(info.st_mode):
+                raise ProfileEvidenceReadError("INVALID_ROOT")
+            child = os.open(part, flags, dir_fd=current)
+            os.close(current)
+            current = child
+        return current
+    except ProfileEvidenceReadError:
+        os.close(current)
+        raise
+    except OSError as exc:
+        os.close(current)
+        raise ProfileEvidenceReadError("INVALID_ROOT") from exc
+
+
+def _profile_evidence_roster(root_fd: int, roster_parts: Tuple[str, ...], flags: int):
+    roster_fd = _profile_evidence_open_directory(root_fd, roster_parts, flags)
+    try:
+        names: list[str] = []
+        scan_fd: int | None = None
+        # scandir on a duplicated directory descriptor lets us stop as soon as
+        # the explicit roster bound is exceeded instead of allocating an
+        # unbounded list first.
+        try:
+            scan_fd = os.dup(roster_fd)
+            with os.scandir(scan_fd) as entries:
+                for entry in entries:
+                    names.append(entry.name)
+                    if len(names) > _PROFILE_EVIDENCE_MAX_ITEMS:
+                        raise ProfileEvidenceReadError("ROSTER_UNSAFE_ENTRY")
+        finally:
+            # CPython duplicates the supplied fd internally for the iterator;
+            # closing that iterator does not close the fd passed to scandir.
+            # Ignore EBADF for implementations that do consume it themselves.
+            if scan_fd is not None:
+                try:
+                    os.close(scan_fd)
+                except OSError as exc:
+                    if exc.errno != errno.EBADF:
+                        raise
+        names.sort()
+        roster_ids: list[str] = []
+        identities: list[Tuple[str, int, int]] = []
+        for name in names:
+            try:
+                info = os.stat(name, dir_fd=roster_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise ProfileEvidenceReadError("ROSTER_UNSAFE_ENTRY") from exc
+            if stat.S_ISLNK(info.st_mode):
+                raise ProfileEvidenceReadError("ROSTER_UNSAFE_ENTRY")
+            identities.append((name, int(info.st_dev), int(info.st_ino)))
+            if stat.S_ISDIR(info.st_mode) and _PROFILE_ID_RE.fullmatch(name):
+                roster_ids.append(name)
+        return tuple(roster_ids), tuple(identities)
+    except ProfileEvidenceReadError:
+        raise
+    except OSError as exc:
+        raise ProfileEvidenceReadError("ROSTER_UNSAFE_ENTRY") from exc
+    finally:
+        os.close(roster_fd)
+
+
+def _profile_evidence_read_file(
+    root_fd: int,
+    row: Mapping[str, str],
+    directory_flags: int,
+    file_flags: int,
+    aggregate_bytes: int,
+) -> tuple[ProfileEvidenceFile, int]:
+    file_ref = row["file_ref"]
+    parts = _profile_evidence_relative_parts(row["relative_path"])
+    parent_fd = os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            try:
+                info = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return ProfileEvidenceFile(
+                    file_ref, row["relative_path"], "missing", None, None, None, None
+                ), aggregate_bytes
+            except OSError:
+                return ProfileEvidenceFile(
+                    file_ref, row["relative_path"], "unreadable", None, None, None, None
+                ), aggregate_bytes
+            if stat.S_ISLNK(info.st_mode):
+                raise ProfileEvidenceReadError("SYMLINK_REFUSED", file_ref)
+            if not stat.S_ISDIR(info.st_mode):
+                return ProfileEvidenceFile(
+                    file_ref, row["relative_path"], "unreadable", None, None, None, None
+                ), aggregate_bytes
+            try:
+                child = os.open(part, directory_flags, dir_fd=parent_fd)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                    raise ProfileEvidenceReadError("SYMLINK_REFUSED", file_ref) from exc
+                return ProfileEvidenceFile(
+                    file_ref, row["relative_path"], "unreadable", None, None, None, None
+                ), aggregate_bytes
+            os.close(parent_fd)
+            parent_fd = child
+
+        leaf = parts[-1]
+        try:
+            leaf_info = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return ProfileEvidenceFile(
+                file_ref, row["relative_path"], "missing", None, None, None, None
+            ), aggregate_bytes
+        except OSError:
+            return ProfileEvidenceFile(
+                file_ref, row["relative_path"], "unreadable", None, None, None, None
+            ), aggregate_bytes
+        if stat.S_ISLNK(leaf_info.st_mode):
+            raise ProfileEvidenceReadError("SYMLINK_REFUSED", file_ref)
+        if not stat.S_ISREG(leaf_info.st_mode):
+            return ProfileEvidenceFile(
+                file_ref, row["relative_path"], "unreadable", None, None, None, None
+            ), aggregate_bytes
+        try:
+            fd = os.open(leaf, file_flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return ProfileEvidenceFile(
+                file_ref, row["relative_path"], "missing", None, None, None, None
+            ), aggregate_bytes
+        except OSError as exc:
+            try:
+                info = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError:
+                info = None
+            if info is not None and stat.S_ISLNK(info.st_mode):
+                raise ProfileEvidenceReadError("SYMLINK_REFUSED", file_ref) from exc
+            if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                raise ProfileEvidenceReadError("SYMLINK_REFUSED", file_ref) from exc
+            return ProfileEvidenceFile(
+                file_ref, row["relative_path"], "unreadable", None, None, None, None
+            ), aggregate_bytes
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):
+                return ProfileEvidenceFile(
+                    file_ref, row["relative_path"], "unreadable", None, None, None, None
+                ), aggregate_bytes
+            if before.st_nlink != 1:
+                raise ProfileEvidenceReadError("SYMLINK_REFUSED", file_ref)
+            if before.st_size > _PROFILE_EVIDENCE_MAX_FILE_BYTES:
+                raise ProfileEvidenceReadError("SOURCE_TOO_LARGE", file_ref)
+            if aggregate_bytes + before.st_size > _PROFILE_EVIDENCE_MAX_TOTAL_BYTES:
+                raise ProfileEvidenceReadError("SOURCE_TOO_LARGE", file_ref)
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(
+                    fd, min(1_048_576, _PROFILE_EVIDENCE_MAX_FILE_BYTES + 1 - total)
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > _PROFILE_EVIDENCE_MAX_FILE_BYTES:
+                    raise ProfileEvidenceReadError("SOURCE_TOO_LARGE", file_ref)
+            after = os.fstat(fd)
+            identity = (
+                int(before.st_dev),
+                int(before.st_ino),
+                int(before.st_mode),
+                int(before.st_size),
+            )
+            after_identity = (
+                int(after.st_dev),
+                int(after.st_ino),
+                int(after.st_mode),
+                int(after.st_size),
+            )
+            if (
+                identity != after_identity
+                or after.st_nlink != 1
+                or total != before.st_size
+            ):
+                return ProfileEvidenceFile(
+                    file_ref, row["relative_path"], "unreadable", None, None, None, None
+                ), aggregate_bytes
+            raw = b"".join(chunks)
+            byte_digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+            status, parsed = _profile_evidence_parse(raw, row["format"])
+            record = ProfileEvidenceFile(
+                file_ref,
+                row["relative_path"],
+                status,
+                byte_digest,
+                total,
+                parsed,
+                identity,
+            )
+            return record, aggregate_bytes + total
+        except ProfileEvidenceReadError:
+            raise
+        except OSError:
+            return ProfileEvidenceFile(
+                file_ref, row["relative_path"], "unreadable", None, None, None, None
+            ), aggregate_bytes
+        finally:
+            os.close(fd)
+    except ProfileEvidenceReadError:
+        raise
+    finally:
+        os.close(parent_fd)
+
+
+def read_profile_evidence(
+    approved_root: Path,
+    source_manifest: Mapping[str, object],
+) -> ProfileEvidenceRead:
+    """Read only caller-manifested JSON/YAML evidence under an approved root.
+
+    This API never discovers the profile root, follows symlinks, or reads
+    ambient Hermes configuration, credentials, sessions, gateway, or models.
+    """
+    if not isinstance(source_manifest, Mapping) or set(source_manifest) != {
+        "roster_root",
+        "files",
+    }:
+        raise ProfileEvidenceReadError("INVALID_MANIFEST")
+    try:
+        roster_parts = _profile_evidence_relative_parts(
+            source_manifest["roster_root"], roster=True
+        )
+    except ProfileEvidenceReadError:
+        raise
+    except Exception as exc:
+        raise ProfileEvidenceReadError("INVALID_MANIFEST") from exc
+    rows = source_manifest["files"]
+    if not isinstance(rows, list) or len(rows) > _PROFILE_EVIDENCE_MAX_FILES:
+        raise ProfileEvidenceReadError("INVALID_MANIFEST")
+    normalized: list[dict[str, str]] = []
+    refs: set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) != {
+            "file_ref",
+            "relative_path",
+            "format",
+        }:
+            raise ProfileEvidenceReadError("INVALID_MANIFEST")
+        file_ref = row["file_ref"]
+        file_format = row["format"]
+        if (
+            not isinstance(file_ref, str)
+            or not _PROFILE_EVIDENCE_REF_RE.fullmatch(file_ref)
+            or file_ref in refs
+        ):
+            raise ProfileEvidenceReadError("INVALID_MANIFEST")
+        if not isinstance(file_format, str) or file_format not in {"json", "yaml"}:
+            raise ProfileEvidenceReadError("INVALID_MANIFEST", file_ref)
+        parts = _profile_evidence_relative_parts(row["relative_path"])
+        refs.add(file_ref)
+        normalized.append({
+            "file_ref": file_ref,
+            "relative_path": "/".join(parts),
+            "format": file_format,
+        })
+    try:
+        root_path = Path(approved_root)
+        directory_flags, file_flags = _profile_evidence_open_flags()
+        root_fd = _profile_evidence_open_absolute_directory(root_path, directory_flags)
+    except ProfileEvidenceReadError:
+        raise
+    except (TypeError, ValueError, OSError) as exc:
+        raise ProfileEvidenceReadError("INVALID_ROOT") from exc
+    try:
+        roster_ids, roster_identity = _profile_evidence_roster(
+            root_fd, roster_parts, directory_flags
+        )
+        records: list[ProfileEvidenceFile] = []
+        aggregate_bytes = 0
+        for row in normalized:
+            record, aggregate_bytes = _profile_evidence_read_file(
+                root_fd, row, directory_flags, file_flags, aggregate_bytes
+            )
+            records.append(record)
+        return ProfileEvidenceRead(tuple(records), roster_ids, roster_identity)
+    finally:
+        os.close(root_fd)
 
 
 def _profile_yaml_path(profile_dir: Path) -> Path:
