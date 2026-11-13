@@ -1073,7 +1073,7 @@ def _coverage_manifest(value: Any) -> dict[str, Any]:
                 refs=True,
                 sorted_unique=True,
             )
-        except ContractError as exc:
+        except ContractError:
             _coverage_fail("INVALID_APPLICABILITY_MATRIX")
         if not basis_refs or not set(basis_refs) <= source_refs:
             _coverage_fail("INVALID_APPLICABILITY_MATRIX")
@@ -1089,7 +1089,7 @@ def _coverage_manifest(value: Any) -> dict[str, Any]:
         if row["applicability"] == "required":
             try:
                 _coverage_file_ref(row["file_ref"], "applicability.file_ref")
-            except ContractError as exc:
+            except ContractError:
                 _coverage_fail("INVALID_APPLICABILITY_MATRIX")
             if file_row is None or file_row["file_ref"] != row["file_ref"]:
                 _coverage_fail("INVALID_APPLICABILITY_MATRIX")
@@ -1139,7 +1139,7 @@ def _coverage_manifest(value: Any) -> dict[str, Any]:
             _coverage_fail("MISSING_REVIEWED_ASSESSMENT", profile_id)
         try:
             _text_list(exclusions, "assessment.exclusions")
-        except ContractError as exc:
+        except ContractError:
             _coverage_fail("MISSING_REVIEWED_ASSESSMENT", profile_id)
         if not roles and not exclusions:
             _coverage_fail("MISSING_REVIEWED_ASSESSMENT", profile_id)
@@ -1193,7 +1193,7 @@ def _coverage_manifest(value: Any) -> dict[str, Any]:
                     {"covered", "not_covered", "unknown"},
                     "semantic_coverage",
                 )
-            except ContractError as exc:
+            except ContractError:
                 _coverage_fail("MISSING_REVIEWED_ASSESSMENT", profile_id)
             if (role["descriptor_status"] == "valid") != (
                 role["descriptor_ref"] is not None
@@ -1432,7 +1432,7 @@ def compile_coverage(
             _coverage_fail("MISSING_REVIEWED_ASSESSMENT", profile_id)
         try:
             exclusions = _text_list(exclusions, "exclusions")
-        except ContractError as exc:
+        except ContractError:
             _coverage_fail("MISSING_REVIEWED_ASSESSMENT", profile_id)
         if not roles and not exclusions:
             _coverage_fail("MISSING_REVIEWED_ASSESSMENT", profile_id)
