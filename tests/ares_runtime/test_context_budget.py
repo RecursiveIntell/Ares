@@ -133,6 +133,14 @@ def test_output_reserve_is_derived_when_the_host_supplies_none():
     assert resolve_output_reserve(65_536, 1_000_000) == 65_536
     assert resolve_output_reserve(10_000_000, 1_000_000) == 1_000_000 - 1
 
+    # A derived reservation must never consume the window: on a tiny route the
+    # 1,024 floor would otherwise leave no input budget and turn a working route
+    # into a hard ValueError.
+    for tiny in (512, 1_024, 2_048, 4_096):
+        reserve = resolve_output_reserve(None, tiny)
+        assert 0 <= reserve < tiny, (tiny, reserve)
+        assert tiny - reserve > 0
+
 
 def test_reserve_shrinks_the_effective_window():
     from ares_runtime.context_budget import resolve_output_reserve
