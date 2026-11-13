@@ -21,8 +21,6 @@ RECURSIVE_AGENT_SOURCE=""
 STEP=arguments
 CONFIG_PENDING=false
 
-RECURSIVE_AGENT_REPO="https://github.com/RecursiveIntell/recursive-agent.git"
-
 log() { printf '[Ares] %s\n' "$*"; }
 die() { printf '[Ares] %s\n' "$*" >&2; exit 1; }
 restore_configuration() {
@@ -214,21 +212,17 @@ export CARGO_HOME="$(cd "$CARGO_HOME" && pwd -P)"
 export RUSTUP_HOME="$(cd "$RUSTUP_HOME" && pwd -P)"
 unset PYTHONPATH PYTHONHOME VIRTUAL_ENV UV_PROJECT_ENVIRONMENT
 export PATH="$UV_INSTALL_DIR:$ARES_BIN_DIR:$HOME/.local/bin:$CARGO_HOME/bin:$HOME/.cargo/bin:$PATH"
-curl -fsSL https://astral.sh/uv/install.sh -o "$TEMP_DIR/uv-install.sh"
+# Reviewed uv pin (OD-1): install the reviewed version, never "latest"
+# (E-31/E-33; consistency-tested by tests/test_uv_pin_consistency.py).
+UV_PIN="0.12.24"
+curl -fsSL "https://astral.sh/uv/${UV_PIN}/install.sh" -o "$TEMP_DIR/uv-install.sh"
 UV_NO_MODIFY_PATH=1 sh "$TEMP_DIR/uv-install.sh"
 command -v uv >/dev/null 2>&1 || die "uv provisioning failed."
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
-if [[ "$EXTRAS" == true ]]; then
-  if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
-    curl -fsSL https://sh.rustup.rs -o "$TEMP_DIR/rustup.sh"
-    sh "$TEMP_DIR/rustup.sh" -y --profile minimal --default-toolchain stable --no-modify-path
-  else
-    "$CARGO_HOME/bin/rustup" update stable --no-self-update
-  fi
-  export RUSTUP_TOOLCHAIN=stable
-fi
-uv python install 3.13
-PYTHON="$(uv python find 3.13)"
+uv python install 3.14
+PYTHON="$(uv python find 3.14)"
+# The release-manifest resolver runs on the same qualified 3.14 interpreter.
+RELEASE_MANIFEST_PYTHON="$PYTHON"
 export UV_PYTHON="$PYTHON"
 ARES_HOME="$("$PYTHON" -c 'import os,sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$ARES_HOME")"
 ARES_BIN_DIR="$("$PYTHON" -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$ARES_BIN_DIR")"
@@ -263,6 +257,34 @@ checkout() {
 STEP=source
 ARES_SOURCE="$SOURCE_ROOT/Ares"
 checkout Ares "$ARES_SOURCE" "$BRANCH"
+if [[ "$EXTRAS" == true ]]; then
+  RELEASE_MANIFEST_PATH="$ARES_SOURCE/scripts/ci/release-manifest.json"
+  RELEASE_MANIFEST_HELPER="$ARES_SOURCE/scripts/ci/release_manifest.py"
+  [[ -f "$RELEASE_MANIFEST_PATH" && -f "$RELEASE_MANIFEST_HELPER" ]] || die "Release manifest or validator is missing from the selected Ares source."
+  RELEASE_MANIFEST_SHA256="$("$RELEASE_MANIFEST_PYTHON" "$RELEASE_MANIFEST_HELPER" --manifest "$RELEASE_MANIFEST_PATH" validate)" || die "Release manifest validation failed."
+  ARES_PYTHON_RUNTIME="$("$RELEASE_MANIFEST_PYTHON" "$RELEASE_MANIFEST_HELPER" --manifest "$RELEASE_MANIFEST_PATH" toolchain python_runtime)"
+  ARES_MANIFEST_PYTHON="$("$RELEASE_MANIFEST_PYTHON" "$RELEASE_MANIFEST_HELPER" --manifest "$RELEASE_MANIFEST_PATH" toolchain manifest_python)"
+  [[ "$ARES_PYTHON_RUNTIME" == "3.14" ]] || die "Manifest Python runtime does not match the installed Ares runtime contract."
+  [[ "$ARES_MANIFEST_PYTHON" == "3.14" ]] || die "Manifest resolver requires Python 3.14."
+  ARES_RELEASE_SOURCE_SHA="$(git -C "$ARES_SOURCE" rev-parse HEAD)"
+  export RELEASE_MANIFEST_PATH RELEASE_MANIFEST_HELPER RELEASE_MANIFEST_SHA256 ARES_RELEASE_SOURCE_SHA RELEASE_MANIFEST_PYTHON ARES_PYTHON_RUNTIME ARES_MANIFEST_PYTHON
+  log "Qualified release manifest sha256=$RELEASE_MANIFEST_SHA256; Ares source=$ARES_RELEASE_SOURCE_SHA"
+  RUST_VERSION="$("$RELEASE_MANIFEST_PYTHON" "$RELEASE_MANIFEST_HELPER" --manifest "$RELEASE_MANIFEST_PATH" toolchain rust)"
+  if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
+    curl -fsSL https://sh.rustup.rs -o "$TEMP_DIR/rustup.sh"
+    sh "$TEMP_DIR/rustup.sh" -y --profile minimal --default-toolchain none --no-modify-path
+  fi
+  "$CARGO_HOME/bin/rustup" toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+  export RUSTUP_TOOLCHAIN="$RUST_VERSION" ARES_RUST_TOOLCHAIN="$RUST_VERSION"
+fi
+
+checkout_exact() {
+  "$RELEASE_MANIFEST_PYTHON" "$RELEASE_MANIFEST_HELPER" --manifest "$RELEASE_MANIFEST_PATH" checkout "$1" "$2"
+}
+
+verify_manifest_submodule() {
+  "$RELEASE_MANIFEST_PYTHON" "$RELEASE_MANIFEST_HELPER" --manifest "$RELEASE_MANIFEST_PATH" verify-submodule "$1" "$2"
+}
 if [[ -e "$ARES_BIN_DIR/ares" || -L "$ARES_BIN_DIR/ares" ]]; then
   "$PYTHON" - <<'PY'
 import os, re, shlex
@@ -278,7 +300,7 @@ if Path(owner[0]).resolve() != Path(os.environ['ARES_HOME']).resolve():
 PY
 fi
 STEP=python
-(cd "$ARES_SOURCE" && uv sync --locked --extra all --no-dev --python 3.13)
+(cd "$ARES_SOURCE" && uv sync --locked --extra all --no-dev --python 3.14)
 BOOTSTRAP_PYTHON="$ARES_SOURCE/.venv/bin/python"
 
 if [[ "$EXTRAS" == true ]]; then
@@ -286,13 +308,15 @@ if [[ "$EXTRAS" == true ]]; then
   LIBRARIES="$SOURCE_ROOT/Libraries"
   KITS="$SOURCE_ROOT/agent-memory-kits"
   GRAPH="$SOURCE_ROOT/agent-graph-mcp"
-  checkout Libraries "$LIBRARIES"
-  checkout agent-memory-kits "$KITS"
-  checkout agent-graph-mcp "$GRAPH"
+  LIBRARIES_SHA="$(checkout_exact Libraries "$LIBRARIES")"
+  KITS_SHA="$(checkout_exact agent-memory-kits "$KITS")"
+  GRAPH_SHA="$(checkout_exact agent-graph-mcp "$GRAPH")"
+  MCP_SHA="$(verify_manifest_submodule "$LIBRARIES" semantic-memory-mcp)"
+  export ARES_RELEASE_LIBRARIES_SHA="$LIBRARIES_SHA" ARES_RELEASE_KITS_SHA="$KITS_SHA" ARES_RELEASE_GRAPH_SHA="$GRAPH_SHA" ARES_RELEASE_MCP_SHA="$MCP_SHA"
   STEP=rust-tools
-  # Install the current published MCP package with its packaged lockfile.
-  # The Libraries submodule is not a buildable member of its parent workspace.
-  cargo install --locked semantic-memory-mcp --root "$ENHANCEMENTS"
+  # Build the pinned MCP submodule against its exact sibling Libraries source;
+  # never resolve a published crate that may use another semantic-memory version.
+  cargo install --locked --path "$LIBRARIES/semantic-memory-mcp" --root "$ENHANCEMENTS"
   for package in context-governor claim-ledger-mcp cea-graph pilot-bridge; do
     log "Building $package"
     cargo install --locked --path "$LIBRARIES/$package" --root "$ENHANCEMENTS"
@@ -367,8 +391,19 @@ source = Path(os.environ['ARES_INSTALL_SOURCE'])
 revision = runtime._git_output(source, 'rev-parse', 'HEAD')
 inputs = {'recipe_version':os.environ['ARES_INSTALL_RECIPE_VERSION'], 'ares_revision':revision, 'desktop':desktop, 'enhancements':extra, 'sdk_dependencies':sdk}
 if extra:
-    inputs['source_revisions'] = {name:runtime._git_output(home/'installer-sources'/name,'rev-parse','HEAD') for name in ['Libraries','agent-memory-kits','agent-graph-mcp']}
-    inputs['rust_tools'] = runtime._run(['cargo', 'install', '--list', '--root', home/'enhancements'], capture=True).stdout.strip()
+    inputs['release_manifest_sha256'] = os.environ['RELEASE_MANIFEST_SHA256']
+    inputs['source_revisions'] = {
+        'Libraries':os.environ['ARES_RELEASE_LIBRARIES_SHA'],
+        'agent-memory-kits':os.environ['ARES_RELEASE_KITS_SHA'],
+        'agent-graph-mcp':os.environ['ARES_RELEASE_GRAPH_SHA'],
+    }
+    if os.environ['ARES_RECURSIVE_AGENT_MODE'] == 'manifest-pinned':
+        inputs['source_revisions']['recursive-agent'] = os.environ['ARES_RECURSIVE_AGENT_SOURCE_SHA']
+    inputs['submodule_revisions'] = {'semantic-memory-mcp':os.environ['ARES_RELEASE_MCP_SHA']}
+    inputs['toolchain_requirements'] = {'python_runtime':os.environ['ARES_PYTHON_RUNTIME'], 'manifest_python':os.environ['ARES_MANIFEST_PYTHON'], 'rust':os.environ['ARES_RUST_TOOLCHAIN']}
+    inputs['toolchain_versions'] = {'python':sys.version.split()[0], 'rustc':subprocess.run(['rustc','--version'],check=True,capture_output=True,text=True).stdout.strip(), 'cargo':subprocess.run(['cargo','--version'],check=True,capture_output=True,text=True).stdout.strip()}
+    inputs['recursive_agent'] = {'source_mode':os.environ['ARES_RECURSIVE_AGENT_MODE'], 'source_sha':os.environ['ARES_RECURSIVE_AGENT_SOURCE_SHA'], 'qualified':os.environ['ARES_RECURSIVE_AGENT_MODE'] == 'manifest-pinned'}
+    inputs['rust_tools'] = {name:hashlib.sha256((home/'enhancements'/'bin'/name).read_bytes()).hexdigest() for name in tools}
 manifest = {'inputs':inputs, 'native_wheels':[{'name':p.name, 'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for p in wheels] if extra else []}
 
 class FullInstallRuntime(AresLocalRuntime):
@@ -641,45 +676,33 @@ if [[ "$EXTRAS" == true ]]; then
 fi
 
 STEP=recursive-agent
+ARES_RECURSIVE_AGENT_MODE="disabled"
+ARES_RECURSIVE_AGENT_SOURCE_SHA=""
 if [[ "$RECURSIVE_AGENT" == true ]]; then
   plugin_dir="$ARES_HOME/plugins/recursive-agent-native"
-  if [[ -e "$plugin_dir" ]]; then
-    log "Recursive Agent plugin payload already present; keeping it (remove $plugin_dir to reinstall)."
+  if [[ -n "$RECURSIVE_AGENT_SOURCE" ]]; then
+    src="$("$PYTHON" -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$RECURSIVE_AGENT_SOURCE")"
+    [[ -x "$src/scripts/install-hermes-plugin.sh" ]] || die "Recursive Agent plugin installer not found or not executable: $src/scripts/install-hermes-plugin.sh"
+    ARES_RECURSIVE_AGENT_MODE="explicit-development-source"
   else
-    src=""
-    if [[ -n "$RECURSIVE_AGENT_SOURCE" ]]; then
-      src="$("$PYTHON" -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$RECURSIVE_AGENT_SOURCE")"
-      [[ -x "$src/scripts/install-hermes-plugin.sh" ]] || die "Recursive Agent plugin installer not found or not executable: $src/scripts/install-hermes-plugin.sh"
-    else
-      src="$ARES_HOME/recursive-agent-src"
-      if [[ -d "$src/.git" ]]; then
-        if [[ -n "$(git -C "$src" status --porcelain)" ]]; then
-          log "recursive-agent checkout at $src has local changes; skipping the plugin payload install."
-          src=""
-        else
-          git -C "$src" pull --ff-only >/dev/null 2>&1 || log "Could not fast-forward $src; using the current revision."
-        fi
-      elif [[ -e "$src" ]]; then
-        log "$src exists but is not a Git checkout; skipping the plugin payload install."
-        src=""
-      else
-        log "Cloning RecursiveIntell/recursive-agent for the plugin payload..."
-        mkdir -p "$(dirname "$src")"
-        if ! git clone --depth 1 "$RECURSIVE_AGENT_REPO" "$src" >/dev/null 2>&1; then
-          log "recursive-agent clone failed; skipping the plugin payload install."
-          src=""
-        fi
-      fi
+    src="$SOURCE_ROOT/recursive-agent"
+    checkout_exact recursive-agent "$src"
+    ARES_RECURSIVE_AGENT_MODE="manifest-pinned"
+  fi
+  ARES_RECURSIVE_AGENT_SOURCE_SHA="$(git -C "$src" rev-parse HEAD 2>/dev/null || printf 'UNQUALIFIED')"
+  export ARES_RECURSIVE_AGENT_MODE ARES_RECURSIVE_AGENT_SOURCE_SHA
+  if [[ -e "$plugin_dir" || -L "$plugin_dir" ]]; then
+    HERMES_HOME="$ARES_HOME" bash "$src/scripts/install-hermes-plugin.sh" --verify \
+      || die "Existing Recursive Agent plugin differs from the selected source; preserved at $plugin_dir. Use a separate Ares home for a different bundle."
+    log "Existing Recursive Agent plugin byte-matches source $ARES_RECURSIVE_AGENT_SOURCE_SHA; preserved."
+  else
+    if ! HERMES_HOME="$ARES_HOME" bash "$src/scripts/install-hermes-plugin.sh"; then
+      die "Recursive Agent plugin payload install failed for source $ARES_RECURSIVE_AGENT_SOURCE_SHA."
     fi
-    if [[ -n "$src" ]]; then
-      if HERMES_HOME="$ARES_HOME" bash "$src/scripts/install-hermes-plugin.sh"; then
-        log "Recursive Agent plugin payload installed from $src; the daemon remains an explicit operator-managed prerequisite."
-      else
-        log "Recursive Agent plugin payload install failed; rerun later: HERMES_HOME=\"$ARES_HOME\" bash \"$src/scripts/install-hermes-plugin.sh\""
-      fi
-    fi
+    log "Recursive Agent plugin payload installed from $src at $ARES_RECURSIVE_AGENT_SOURCE_SHA; the daemon remains operator-managed."
   fi
 else
+  export ARES_RECURSIVE_AGENT_MODE ARES_RECURSIVE_AGENT_SOURCE_SHA
   log "Recursive Agent plugin payload skipped (--no-recursive-agent)."
 fi
 

@@ -10,7 +10,17 @@ const MAX_DOCUMENT = 24
 const MAX_PROCESS = 64
 const MAX_PENDING_DOCUMENT = 8
 const MAX_PENDING_PROCESS = 16
+// Outbound (renderer -> backend) sends in flight.
 const QUEUE_COUNT = 128
+// Inbound events delivered but not yet acknowledged by the renderer. The
+// backend streams up to ~550 events/s, so a 128-event window turned any
+// renderer stall longer than ~250 ms into a terminal socket failure (close
+// 1006) that detached every running session. Byte caps bound memory and the
+// congestion watchdog (CONGESTION_MS without ack progress) bounds a genuinely
+// wedged renderer; the count only needs to stay finite.
+const INBOUND_QUEUE_COUNT = 8192
+const DOCUMENT_INBOUND_QUEUE_COUNT = 16384
+const DOCUMENT_SEND_COUNT = 256
 const PROCESS_QUEUE_BYTES = 512 * 1024 * 1024
 const HANDSHAKE_MS = 15_000
 const CONGESTION_MS = 15_000
@@ -139,6 +149,8 @@ export class NativeSocketTransport {
       resolve: (route: NativeSocketRoute, current: () => void) => Promise<ResolvedNativeBackend>
       dial: (url: string, headers: Record<string, string>, maxPayload: number) => NativeWire
       emit: (owner: Owner, event: NativeSocketEvent) => void
+      /** Optional: why a socket was retired locally (never carries payloads). */
+      diagnostic?: (info: { reason: string; channel: string; queued: number; bytes: number; sends: number }) => void
     }
   ) {}
   private admit(owner: Owner): number {
@@ -224,7 +236,8 @@ export class NativeSocketTransport {
 
     return {
       bytes: own.reduce((sum, row) => sum + row.bytes + row.sendBytes, 0),
-      count: own.reduce((sum, row) => sum + row.queued.size + row.sends, 0)
+      count: own.reduce((sum, row) => sum + row.queued.size + row.sends, 0),
+      sends: own.reduce((sum, row) => sum + row.sends, 0)
     }
   }
   private emit(entry: Entry, event: Omit<NativeSocketEvent, 'correlation' | 'handle' | 'sequence'>) {
@@ -266,7 +279,19 @@ export class NativeSocketTransport {
     // Hard teardown bounds failed upgrades and backpressured close handshakes.
     entry.wire?.terminate()
   }
-  private failure(entry: Entry, oauth = false) {
+  private failure(entry: Entry, oauth = false, reason = 'transport_failed') {
+    try {
+      this.deps.diagnostic?.({
+        reason,
+        channel: entry.request.channel.kind,
+        queued: entry.queued.size,
+        bytes: entry.bytes,
+        sends: entry.sends
+      })
+    } catch {
+      /* diagnostics must never alter transport behavior */
+    }
+
     this.emit(entry, { type: 'error', needsOauthLogin: oauth })
     this.finish(entry)
   }
@@ -346,10 +371,10 @@ export class NativeSocketTransport {
           if (
             (binary && entry.request.channel.kind !== 'tts') ||
             size > this.limit(entry) ||
-            entry.queued.size >= QUEUE_COUNT ||
+            entry.queued.size >= INBOUND_QUEUE_COUNT ||
             entry.bytes + size > this.limit(entry) ||
             this.documentQueue(entry).bytes + size > GATEWAY_MESSAGE_BYTES ||
-            this.documentQueue(entry).count >= 256 ||
+            this.documentQueue(entry).count >= DOCUMENT_INBOUND_QUEUE_COUNT ||
             this.queueBytes + size > PROCESS_QUEUE_BYTES
           ) {
             throw new Error('Native event queue overflow')
@@ -361,8 +386,8 @@ export class NativeSocketTransport {
           const sequence = entry.sequence + 1
           entry.queued.set(sequence, size)
           this.emit(entry, { type: 'message', data })
-        } catch {
-          this.failure(entry)
+        } catch (error: any) {
+          this.failure(entry, false, String(error?.message || 'message_rejected'))
         }
       })
       let congestedSince = 0
@@ -377,7 +402,7 @@ export class NativeSocketTransport {
           congestedSince ||= Date.now()
 
           if (Date.now() - Math.max(congestedSince, entry.progress) > CONGESTION_MS) {
-            this.failure(entry)
+            this.failure(entry, false, 'congestion_timeout')
           }
         } else {
           congestedSince = 0
@@ -424,10 +449,10 @@ export class NativeSocketTransport {
       entry.sends >= QUEUE_COUNT ||
       entry.sendBytes + bytes > this.limit(entry) ||
       this.documentQueue(entry).bytes + bytes > GATEWAY_MESSAGE_BYTES ||
-      this.documentQueue(entry).count >= 256 ||
+      this.documentQueue(entry).sends >= DOCUMENT_SEND_COUNT ||
       this.queueBytes + bytes > PROCESS_QUEUE_BYTES
     ) {
-      this.failure(entry)
+      this.failure(entry, false, 'send_congestion_or_payload_limit')
       throw new Error('Native send congestion or payload limit')
     }
 
@@ -437,7 +462,7 @@ export class NativeSocketTransport {
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.failure(entry)
+        this.failure(entry, false, 'send_timeout')
         reject(new Error('Native send timed out'))
       }, CONGESTION_MS)
 

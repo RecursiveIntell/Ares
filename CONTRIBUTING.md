@@ -109,7 +109,7 @@ A well-built third-party-product plugin can clear automated review and still be 
 | Requirement | Notes |
 |-------------|-------|
 | **Git** | With the `git-lfs` extension installed |
-| **Python 3.11–3.14** | Locked project admission range; validate the exact platform/toolchain before activation |
+| **Python >=3.14,<3.15** | Locked project admission range; validate the exact platform/toolchain before activation |
 | **uv** | Fast Python package manager ([install](https://docs.astral.sh/uv/)) |
 | **Node.js 20+** | Optional — needed for browser tools and WhatsApp bridge (matches root `package.json` engines) |
 
@@ -159,8 +159,8 @@ tree means no relative path from the workspace resolves to it.
 git clone https://github.com/NousResearch/hermes-agent.git
 cd hermes-agent
 
-# Create venv with Python 3.11, OUTSIDE the source tree
-uv venv ~/.hermes/venvs/hermes-dev --python 3.11
+# Create venv with Python 3.14, OUTSIDE the source tree
+uv venv ~/.hermes/venvs/hermes-dev --python 3.14
 export VIRTUAL_ENV="$HOME/.hermes/venvs/hermes-dev"
 export PATH="$VIRTUAL_ENV/bin:$PATH"
 

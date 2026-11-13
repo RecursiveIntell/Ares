@@ -1878,3 +1878,58 @@ class TestFallbackWarning:
             if r.levelno == logging.WARNING and "falling back" in r.getMessage()
         ]
         assert len(fallback_warnings) == 0
+
+
+def test_dotted_deepseek_v41_resolves_to_family_window_not_catch_all():
+    """``deepseek-v4.1-*`` must not fall through to the 128K ``deepseek`` fallback.
+
+    The V4 family ships a 1M window, but the dotted ``v4.1`` generation matches
+    neither ``deepseek-v4-pro`` nor ``deepseek-v4-flash`` as a substring, so
+    without an explicit key it resolved to the 128K catch-all and silently
+    capped large-context work. Longest-key matching must prefer
+    ``deepseek-v4.1`` over ``deepseek``.
+    """
+    with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+         patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+         patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+         patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+         patch("agent.models_dev.lookup_models_dev_context", return_value=None):
+        for model in (
+            "deepseek-v4.1-flash",
+            "deepseek-v4.1-pro",
+            "deepseek-v4.1-flash:cloud",
+            "deepseek-v4.1-flash:latest",
+        ):
+            assert get_model_context_length(model, provider="ollama-launch") == 1_000_000
+
+        # The 128K fallback must still cover genuinely older/unknown ids.
+        assert get_model_context_length(
+            "deepseek-coder-legacy", provider="ollama-launch"
+        ) == 128_000
+
+
+def test_gpt6_family_resolves_from_catalog_without_a_live_probe():
+    """gpt-6.1-sol / gpt-6.1-terra / gpt-6-luna must not fall to the 256K default.
+
+    These are the Codex auxiliary models in active use. The catalog carried the
+    gpt-5.6 generation but no gpt-6 entry, so a host with no cached probe resolved
+    them to DEFAULT_FALLBACK_CONTEXT (256K) — well below the 832K-token prompts
+    observed against them. Both base slugs and Ollama-style ``:cloud`` suffixes
+    must resolve, and an unknown gpt-6 variant must keep the conservative default.
+    """
+    with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+         patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+         patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+         patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+         patch("agent.models_dev.lookup_models_dev_context", return_value=None):
+        for model in (
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6-luna",
+            "gpt-6-luna:cloud",
+            "gpt-6.1-sol-2026-11-01",
+        ):
+            assert get_model_context_length(model) == 1_050_000, model
+
+        # An unlisted gpt-6 variant must NOT inherit the window.
+        assert get_model_context_length("gpt-6-unlisted-hypothetical") == 256_000

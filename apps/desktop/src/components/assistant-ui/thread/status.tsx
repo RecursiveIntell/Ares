@@ -17,6 +17,7 @@ import { $backgroundResume } from '@/store/background-delegation'
 import { sessionCompacting } from '@/store/compaction'
 import { sessionAwaitingInput } from '@/store/prompts'
 import { sessionProviderWait } from '@/store/provider-wait'
+import { sessionActivity } from '@/store/session-activity'
 import { type DraftingTool, sessionDraftingTool } from '@/store/tool-drafting'
 
 // A status line is scaffolding like any other — "Editing" while the model
@@ -64,6 +65,7 @@ function useThreadSessionStatus() {
   // while the app still said it was working.
   const busy = useStore(view.$busy)
   const turnStartedAt = useStore(view.$turnStartedAt)
+  const activity = useStore(useMemo(() => sessionActivity(sessionId), [sessionId]))
   const compacting = useStore(useMemo(() => sessionCompacting(sessionId), [sessionId]))
   const drafting = useStore(useMemo(() => sessionDraftingTool(sessionId), [sessionId]))
   const providerWait = useStore(useMemo(() => sessionProviderWait(sessionId), [sessionId]))
@@ -73,6 +75,7 @@ function useThreadSessionStatus() {
   const awaitingInput = useStore(useMemo(() => sessionAwaitingInput(sessionId), [sessionId]))
 
   return {
+    activity,
     awaitingInput,
     busy,
     compacting,
@@ -142,11 +145,37 @@ export const CenteredThreadSpinner: FC = () => {
   )
 }
 
+/**
+ * Name a synthetic turn. A background notification or the post-turn goal judge
+ * keeps the session busy after the transcript already looks finished; naming
+ * that is the difference between "stuck" and "working". Empty for user turns,
+ * where the drafting/compaction hints are more specific.
+ */
+function useActivityLabel(activity: string): string {
+  const { t } = useI18n()
+
+  if (activity === 'notification') {
+    return t.assistant.thread.activityBackground
+  }
+
+  if (activity === 'goal_judge') {
+    return t.assistant.thread.activityGoalCheck
+  }
+
+  if (activity === 'goal_continuation') {
+    return t.assistant.thread.activityGoalStep
+  }
+
+  return ''
+}
+
 export const ResponseLoadingIndicator: FC = () => {
   const { t } = useI18n()
-  const { compacting, drafting, providerWait, turnStartedAt } = useThreadSessionStatus()
+  const { activity, compacting, drafting, providerWait, turnStartedAt } = useThreadSessionStatus()
   const elapsed = useElapsedSeconds(true, undefined, turnStartedAt)
-  const hint = useStatusHint(compacting, drafting, providerWait)
+  const activityLabel = useActivityLabel(activity)
+  const statusHint = useStatusHint(compacting, drafting, providerWait)
+  const hint = activityLabel || statusHint
 
   return (
     <StatusRow data-slot="aui_response-loading" label={hint || t.assistant.thread.loadingResponse}>

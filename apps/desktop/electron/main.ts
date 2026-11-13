@@ -2503,7 +2503,7 @@ function findSystemPython() {
   //      that didn't check the launcher option, so PATH-only checks
   //      miss real Python 3.13 installs (user-reported case).
   //
-  // The locked project admission covers Python 3.11–3.14. pywinpty 3.0.5
+  // The locked project admission covers Python 3.14 only. pywinpty 3.0.5
   // supplies cp314 Windows wheels, so 3.14 is no longer excluded from the
   // resolver's candidate ladder. The later backend probe still verifies the
   // actual Hermes imports before a candidate is trusted.
@@ -2526,8 +2526,8 @@ function findSystemPython() {
   //          py.exe's default is (which on a 3.14-only box would be
   //          3.14).
 
-  const SUPPORTED_VERSIONS = ['3.11', '3.12', '3.13', '3.14']
-  const SUPPORTED_VERSIONS_NO_DOT = ['311', '312', '313', '314']
+  const SUPPORTED_VERSIONS = ['3.14']
+  const SUPPORTED_VERSIONS_NO_DOT = SUPPORTED_VERSIONS.map(version => version.replace('.', ''))
 
   // Pass 1: registry. Use `reg query` since main process doesn't have
   // a reliable in-process registry API across all electron versions.
@@ -6984,7 +6984,11 @@ const nativeSocketTransport = new NativeSocketTransport({
       followRedirects: false,
       rejectUnauthorized: true
     }),
-  emit: (owner, event) => owner.senderFrame.send('hermes:transport:event', event)
+  emit: (owner, event) => owner.senderFrame.send('hermes:transport:event', event),
+  diagnostic: info =>
+    rememberLog(
+      `[native-socket] retired reason=${info.reason} channel=${info.channel} queued=${info.queued} bytes=${info.bytes} sends=${info.sends}`
+    )
 })
 
 // Bind the resolved endpoint to its actual owning cache generation, including

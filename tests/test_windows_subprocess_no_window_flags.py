@@ -378,12 +378,20 @@ def test_lazy_deps_uv_install_hides_console_window(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         captured.append((cmd, kwargs))
+        if len(cmd) > 1 and cmd[-1] == "--version":
+            # Version-probe calls (uv-pin admission) report an in-range uv.
+            return _Completed(stdout="uv 0.12.24", returncode=0)
         return _Completed(stdout="installed", returncode=0)
 
     monkeypatch.delenv(lazy_deps._LAZY_TARGET_ENV, raising=False)
     monkeypatch.setattr(lazy_deps, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
     monkeypatch.setattr(lazy_deps.subprocess, "run", fake_run)
-    monkeypatch.setattr(lazy_deps.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    # The uv tier resolves through managed_uv.resolve_uv_admitted (range
+    # admission, Task 1.1). Stub it so the test is hermetic: a real in-range
+    # uv on the host would otherwise run for real and bypass the fake.
+    monkeypatch.setattr(
+        "hermes_cli.managed_uv.resolve_uv_admitted", lambda: "/usr/bin/uv"
+    )
 
     res = lazy_deps._venv_pip_install(("left-pad",))
 

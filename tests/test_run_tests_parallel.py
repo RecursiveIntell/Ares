@@ -272,6 +272,34 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
 
 
 
+def test_help_exits_before_discovery(tmp_path: Path) -> None:
+    """``--help`` must print usage and exit without any test discovery.
+
+    Regression witness (audit Task 6.4): bare ``-``-tokens were routed to the
+    pytest passthrough BEFORE ``parser.parse_args`` saw them, so
+    ``run_tests_parallel.py --help`` started a full 37k-test discovery run
+    (reproduced 2026-11-10: exit 124 after timeout, "Discovered 3667 test
+    files"). Help must be handled by the runner's own parser, immediately.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    proc = subprocess.run(
+        [sys.executable, str(runner), "--help"],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "usage" in proc.stdout.lower(), proc.stdout
+    assert "Discovered" not in proc.stdout, (
+        "--help reached test discovery and started executing the suite:\n"
+        f"{proc.stdout[:2000]}"
+    )
+
+
 def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:
     """``-k test_alpha`` reaches pytest as a selector, not as a path.
 

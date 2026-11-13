@@ -55,7 +55,7 @@ def npm_proxy(tmp_path):
                       "DEV_SANDBOX_INTERACTIVE": "false", "DEV_SANDBOX_USER": "test",
                       "DEV_SANDBOX_HOME": "/home/test"}
     subprocess.run(["bash", str(REPO_ROOT / "scripts/sandbox/stage2-run.sh"), "true"],
-                   env=env, check=True, capture_output=True, timeout=15)
+                   env=env, check=True, capture_output=True, timeout=60)
     argv = json.loads(capture.read_text())
     projected = {argv[index + 1]: argv[index + 2]
                  for index, value in enumerate(argv) if value == "--setenv"}

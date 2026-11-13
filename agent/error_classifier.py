@@ -37,6 +37,7 @@ class FailoverReason(enum.Enum):
     # Billing / quota
     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
+    hard_quota = "hard_quota"            # Account-period quota wall — fallback or stop, never wait/retry
     # Upstream model rate-limited (aggregator 429) — fallback to a different
     # model, NOT credential rotation. The user's key is healthy.
     upstream_rate_limit = "upstream_rate_limit"
@@ -255,6 +256,46 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = [
     "per minute",
     "per second",
 ]
+
+_HARD_QUOTA_PERIODS = frozenset({"weekly", "monthly", "annual", "yearly"})
+
+
+def _structured_field_values(value: Any, key: str) -> list[str]:
+    """Collect stringified values for one structured response key."""
+
+    wanted = key.lower().replace("_", "")
+    found: list[str] = []
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for raw_key, raw_value in current.items():
+                normalized = str(raw_key).lower().replace("_", "")
+                if normalized == wanted and raw_value is not None:
+                    found.append(str(raw_value))
+                if isinstance(raw_value, (dict, list, tuple)):
+                    stack.append(raw_value)
+        elif isinstance(current, (list, tuple)):
+            stack.extend(current)
+    return found
+
+
+def _is_terminal_go_quota(error_type: str, error_msg: str, body: dict) -> bool:
+    """Identify typed opencode-go account-period exhaustion narrowly."""
+
+    structured_types = {
+        value.strip().lower() for value in _structured_field_values(body, "type")
+    }
+    typed = (
+        error_type.strip().lower() == "gousagelimiterror"
+        or "gousagelimiterror" in structured_types
+    )
+    messaged = "go usage limit exceeded" in error_msg
+    periods = {
+        value.strip().lower()
+        for value in _structured_field_values(body, "limitName")
+    }
+    return typed and messaged and bool(periods & _HARD_QUOTA_PERIODS)
 
 # Payload-too-large patterns detected from message text (no status_code attr).
 # Proxies and some backends embed the HTTP status in the error message.
@@ -914,6 +955,20 @@ def classify_api_error(
         return _result(reason, **plugin_classification)
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
+
+    # opencode-go account-period exhaustion is not a transient request-rate
+    # throttle. Its reset metadata can be days away; feeding that through the
+    # generic 429 path schedules a long wait and strands delegated work. Keep
+    # classification separate from route authority: an existing fallback may
+    # be useful, but this classifier neither creates nor selects one.
+    if status_code == 429 and _is_terminal_go_quota(error_type, error_msg, body):
+        return _result(
+            FailoverReason.hard_quota,
+            retryable=False,
+            should_rotate_credential=False,
+            should_fallback=True,
+            error_context={"quota_period": "account_period"},
+        )
 
     # Provider content-policy / safety-filter block. The provider has made a
     # deterministic refusal decision about THIS prompt — retrying unchanged

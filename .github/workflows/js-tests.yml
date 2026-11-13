@@ -4,6 +4,9 @@ name: JS Tests
 on:
   workflow_call:
 
+permissions:
+  contents: read
+
 jobs:
   workspaces:
     name: List npm workspaces

@@ -79,17 +79,9 @@ jobs:
           set -euo pipefail
           rustup toolchain install 1.94.0 --profile minimal --component rustfmt --component clippy
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y bubblewrap libseccomp-dev strace
-      - name: Admit Bubblewrap on the ephemeral hosted runner
-        run: |
-          set -euo pipefail
-          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-          if sysctl -n kernel.unprivileged_userns_clone >/dev/null 2>&1; then
-            sudo sysctl -w kernel.unprivileged_userns_clone=1
-          fi
-          bwrap --ro-bind / / -- /usr/bin/true
+          sudo apt-get install --no-install-recommends -y curl libcap-dev libseccomp-dev meson ninja-build strace xz-utils
+      - name: Build and admit pinned Bubblewrap
+        run: bash ares/scripts/ci/install-ci-bubblewrap.sh
       - name: Run native paired-root gates
         working-directory: recursive-agent
         run: |
@@ -107,7 +99,7 @@ jobs:
         working-directory: ares
         run: |
           set -euo pipefail
-          uv sync --frozen --extra dev --extra anthropic --python 3.13
+          uv sync --frozen --extra dev --extra anthropic --python 3.14
           HERMES_TEST_CONTEXT_DAEMON_BIN="$GITHUB_WORKSPACE/recursive-agent/target/debug/ra-daemon" \
             HERMES_PYTHON="$PWD/.venv/bin/python" HERMES_TEST_WORKERS=1 HERMES_TEST_FILE_RETRIES=0 \
             scripts/run_tests.sh tests/ares_runtime/test_context_native_paired.py -- -q
@@ -126,7 +118,7 @@ jobs:
         with:
           version: '0.9.28'
       - name: Install locked test dependencies
-        run: uv sync --frozen --extra dev --extra anthropic --python 3.13
+        run: uv sync --frozen --extra dev --extra anthropic --python 3.14
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: RecursiveIntell/Libraries

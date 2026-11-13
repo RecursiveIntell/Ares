@@ -1,0 +1,38 @@
+{
+  "schema": "ares-release-manifest/v1",
+  "repositories": {
+    "Libraries": {
+      "url": "https://github.com/RecursiveIntell/Libraries.git",
+      "ref": "refs/heads/main",
+      "commit": "d9f3c60f1584285c22ce97e797cfb3f1c9adc7e7"
+    },
+    "agent-memory-kits": {
+      "url": "https://github.com/RecursiveIntell/agent-memory-kits.git",
+      "ref": "refs/heads/main",
+      "commit": "a3f2a818e6e34bda012965d071869b547113e477"
+    },
+    "agent-graph-mcp": {
+      "url": "https://github.com/RecursiveIntell/agent-graph-mcp.git",
+      "ref": "refs/heads/main",
+      "commit": "8b4a79fef7377c28f720a22f4ffba25790aae67a"
+    },
+    "recursive-agent": {
+      "url": "https://github.com/RecursiveIntell/recursive-agent.git",
+      "ref": "refs/heads/main",
+      "commit": "ac578e0d92c3db917d3e04abe6ab662196cd5c24"
+    }
+  },
+  "submodules": {
+    "semantic-memory-mcp": {
+      "parent": "Libraries",
+      "path": "semantic-memory-mcp",
+      "url": "https://github.com/RecursiveIntell/semantic-memory-mcp.git",
+      "commit": "1b2756cf9e2995cc82f9231fc21f1c0f032b07b1"
+    }
+  },
+  "toolchains": {
+    "python_runtime": "3.14",
+    "manifest_python": "3.14",
+    "rust": "1.99.1"
+  }
+}

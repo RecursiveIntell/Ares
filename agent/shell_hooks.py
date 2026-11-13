@@ -623,8 +623,14 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
 
 def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]]]:
     """Build the closure that ``invoke_hook()`` will call per firing."""
+    # Hooks come from one profile's config.yaml. Managers are cached per home,
+    # but a retained callback can still be invoked under another home context.
+    # Bind it to its registration home before allowing subprocess execution.
+    registered_home = _resolved_home()
 
     def _callback(**kwargs: Any) -> Optional[Dict[str, Any]]:
+        if _resolved_home() != registered_home:
+            return None
         # Matcher gate — only meaningful for tool-scoped events.
         if spec.event in {"pre_tool_call", "post_tool_call"}:
             if not spec.matches_tool(kwargs.get("tool_name")):
@@ -636,6 +642,10 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
     _callback.__qualname__ = _callback.__name__
     return _callback
+
+
+def _resolved_home() -> Path:
+    return get_hermes_home().resolve(strict=False)
 
 
 def _fail_closed_block(spec: ShellHookSpec, reason: str) -> Dict[str, Any]:

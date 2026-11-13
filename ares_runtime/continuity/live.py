@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import hashlib
-import json
 from typing import Any, Callable
 
 from ares_runtime.collaboration import canonical_json

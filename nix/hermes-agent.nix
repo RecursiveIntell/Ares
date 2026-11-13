@@ -9,7 +9,7 @@
   stdenv,
   makeWrapper,
   callPackage,
-  python312,
+  python314,
   electron,
   ripgrep,
   git,
@@ -41,7 +41,7 @@ let
   mkHermesVenv =
     extraDependencyGroups:
     callPackage ./python.nix {
-      inherit uv2nix pyproject-nix pyproject-build-systems;
+      inherit uv2nix pyproject-nix pyproject-build-systems python314;
       pythonSrc = hermesNpmLib.pythonSrc;
       dependency-groups = [ "all" ] ++ extraDependencyGroups;
     };
@@ -109,12 +109,12 @@ let
 
   runtimePath = lib.makeBinPath runtimeDeps;
 
-  sitePackagesPath = python312.sitePackages;
+  sitePackagesPath = python314.sitePackages;
 
   # Walk propagatedBuildInputs to include transitive Python deps in PYTHONPATH.
   # Without this, a plugin listing e.g. requests as a dep would fail at runtime
   # if requests isn't already in the sealed uv2nix venv.
-  allExtraPythonPackages = python312.pkgs.requiredPythonModules extraPythonPackages;
+  allExtraPythonPackages = python314.pkgs.requiredPythonModules extraPythonPackages;
 
   pythonPath = lib.makeSearchPath sitePackagesPath allExtraPythonPackages;
 

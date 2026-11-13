@@ -72,8 +72,8 @@ Ares does **not** claim that every installed service is reachable or exercised, 
 ### Prerequisites
 
 - Git
-- [uv](https://docs.astral.sh/uv/) — the installer provisions its own copy under `<ARES_HOME>/bin` and manages Python 3.13.
-- Python **3.11–3.14** is admitted by the current project metadata (`>=3.11,<3.15`). The inherited POSIX installer provisions 3.11 by default; the committed Desktop resolver explicitly probes 3.11–3.14. Resolver support is a source-level admission decision, not proof that every native extension or installation path works on each Python minor and operating system.
+- [uv](https://docs.astral.sh/uv/) — the installer provisions its own copy under `<ARES_HOME>/bin` and manages Python 3.14.
+- Python **3.14** is the supported minor line (`>=3.14,<3.15`). Installers, CI, container/Nix definitions and Desktop interpreter discovery target this line. Source-level admission is not proof that every native extension or installation path works on every operating system; exact artifact and platform checks remain required.
 - A model provider configured through the normal Hermes setup flow
 
 - The Ares runtime controller is currently exercised through the Python module entry point on POSIX systems. `scripts/install.sh` and `scripts/install.ps1` are inherited Hermes installers; they do not create the Ares `ares` launcher or the Ares stable-runtime layout.
@@ -193,9 +193,9 @@ After setup, the generated launcher resolves through `current`; it does not
 fall back to the checkout that was used to create the release. Each selected
 release has its own `.venv`, is cloned at an immutable Git revision, and is
 built in a staging directory before the release becomes visible. The launch
-environment removes `PYTHONPATH`, `PYTHONHOME`, `PYTHONUSERBASE`, `VIRTUAL_ENV`,
-and `UV_PROJECT_ENVIRONMENT`, sets `PYTHONNOUSERSITE=1`, and marks the process
-with `ARES_RUNTIME_MODE=stable` plus the selected release identity.
+environment removes `PYTHONHOME`, `PYTHONPATH`, `PYTHONUSERBASE`, `VIRTUAL_ENV`,
+and `UV_PROJECT_ENVIRONMENT`, points `HERMES_HOME` at the Ares agent home, and
+marks the process with `ARES_MANAGED_RUNTIME=1`.
 
 `ares setup` may copy `config.yaml`, `.env`, `auth.json`, `active_profile`,
 `profiles/`, `skills/`, and `plugins/` once from `--seed-from` (default
@@ -483,8 +483,8 @@ project's `requires-python` constraint is the source of truth for admissible
 future minor versions. A failed repair leaves the existing runtime in place
 when possible and reports that the next update should retry.
 
-The current project admission range is `>=3.11,<3.15` (Python 3.11 through
-3.14). This is a packaging/source contract, not proof that every provider,
+The current project admission range is `>=3.14,<3.15` (Python 3.14).
+This is a packaging/source contract, not proof that every provider,
 native extension, Desktop build, or optional service works on every minor and
 every operating system.
 
@@ -555,13 +555,16 @@ garbage-collection rules are in [`docs/ares-candidate-custody.md`](docs/ares-can
 
 When enabled explicitly, `ARES_STRICT_EFFECT_TOOL_ARGS_V1=1` rejects unknown
 fields, missing required fields, and type coercion for effectful tool payloads.
-`ARES_RUNTIME_PERMITS_V1=1` requires the configured daemon permit bridge for
-effectful tools. The bridge checks an exact tool/argument binding, uses the
-daemon-owned canonical digest helper, requires a private same-user Unix socket
-and peer credentials, and returns daemon-derived evidence/preflight/receipt
-facts. It never mints permits or persists a local substitute receipt. Missing,
-malformed, stale, or denied bridge state fails closed. These flags are
-experimental/runtime-gated controls; they are not a security certification.
+`ares.permit_daemon` in `config.yaml` requires the configured daemon permit
+bridge for effectful tools, scoped to one explicitly configured canary session;
+the selected session, the explicit operator enablement, and the daemon verifier
+still decide whether an effect is admitted. The bridge checks an exact
+tool/argument binding, uses the daemon-owned canonical digest helper, requires a
+private same-user Unix socket and peer credentials, and returns daemon-derived
+evidence/preflight/receipt facts. It never mints permits or persists a local
+substitute receipt. Missing, malformed, stale, or denied bridge state fails
+closed. These controls are experimental/runtime-gated; they are not a security
+certification.
 
 ## Repository map
 

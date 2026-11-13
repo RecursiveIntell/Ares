@@ -68,6 +68,7 @@ def _redact_terminal_error_text(value: Any) -> str:
 # ---------------------------------------------------------------------------
 from tools.interrupt import is_interrupted, _interrupt_event  # noqa: F401 — re-exported
 from tools.registry import tool_error
+from hermes_cli.config_defaults import DEFAULT_TERMINAL_IMAGE
 from tools.shell_heredoc import strip_inert_heredoc_bodies
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
 
@@ -1760,7 +1761,7 @@ def _ensure_terminal_env_bridged() -> None:
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
-    default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
+    default_image = DEFAULT_TERMINAL_IMAGE
     _ensure_terminal_env_bridged()
     env_type = os.getenv("TERMINAL_ENV", "local")
     
@@ -4070,7 +4071,7 @@ if __name__ == "__main__":
     print("  result = terminal_tool(command='python server.py', background=True)")
 
     print("\nEnvironment Variables:")
-    default_img = "nikolaik/python-nodejs:python3.11-nodejs20"
+    default_img = DEFAULT_TERMINAL_IMAGE
     print(
         "  TERMINAL_ENV: "
         f"{os.getenv('TERMINAL_ENV', 'local')} "

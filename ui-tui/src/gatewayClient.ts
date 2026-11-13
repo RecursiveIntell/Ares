@@ -145,6 +145,48 @@ interface Pending {
   timeout: ReturnType<typeof setTimeout>
 }
 
+const STOP_ERROR_DATA_KEYS = new Set([
+  'effect_disposition',
+  'failure_code',
+  'host_boot_id',
+  'operation_id',
+  'owner_reconciliation_required',
+  'request_id',
+  'target_request_id'
+])
+
+export class GatewayRpcError extends Error {
+  readonly code: number | undefined
+  readonly data: Readonly<Record<string, boolean | number | string>>
+
+  constructor(message: string, code?: number, data: Record<string, boolean | number | string> = {}) {
+    super(message)
+    this.name = 'GatewayRpcError'
+    this.code = code
+    this.data = Object.freeze({ ...data })
+  }
+}
+
+const redactRpcErrorData = (raw: unknown): Record<string, boolean | number | string> => {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {}
+  }
+
+  const data: Record<string, boolean | number | string> = {}
+
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!STOP_ERROR_DATA_KEYS.has(key)) {
+      continue
+    }
+
+    if (typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string') {
+      data[key] = value
+    }
+  }
+
+  return data
+}
+
 export class GatewayClient extends EventEmitter {
   private proc: ChildProcess | null = null
   private ws: WebSocket | null = null
@@ -715,10 +757,15 @@ export class GatewayClient extends EventEmitter {
     }
   }
 
-  private toError(raw: unknown): Error {
-    const err = raw as { message?: unknown } | null | undefined
+  private toError(raw: unknown): GatewayRpcError {
+    const err = raw as { code?: unknown; data?: unknown; message?: unknown } | null | undefined
+    const code = typeof err?.code === 'number' ? err.code : undefined
 
-    return new Error(typeof err?.message === 'string' ? err.message : 'request failed')
+    return new GatewayRpcError(
+      typeof err?.message === 'string' ? err.message : 'request failed',
+      code,
+      redactRpcErrorData(err?.data)
+    )
   }
 
   private settle(p: Pending, err: Error | null, result: unknown) {

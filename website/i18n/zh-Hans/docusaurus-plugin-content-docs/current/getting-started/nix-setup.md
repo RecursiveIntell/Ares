@@ -716,14 +716,14 @@ services.hermes-agent.settings.plugins.enabled = [
 
 ### 开发 Shell
 
-该 flake 提供了一个包含 Python 3.12、uv、Node.js 和所有运行时工具的开发 shell：
+该 flake 配置了使用 Python 3.14、uv、Node.js 和所列运行时工具的开发 shell。本次运行时迁移的 Nix 验证尚未完成。
 
 ```bash
 cd hermes-agent
 nix develop
 
 # Shell 提供：
-#   - Python 3.12 + uv（首次进入时将依赖安装到 .venv）
+#   - Python 3.14 + uv（首次进入时将依赖安装到 .venv）
 #   - Node.js 22、ripgrep、git、openssh、ffmpeg 在 PATH 上
 #   - 戳记文件优化：依赖未变更时重新进入几乎即时
 

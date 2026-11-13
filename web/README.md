@@ -10,22 +10,25 @@ Browser-based dashboard for managing Hermes Agent configuration, API keys, and m
 
 ## Development
 
-```bash
-# Start the backend API server
-cd ../
-python -m hermes_cli.main dashboard --no-open
+This development recipe uses the default profile and a loopback backend. Start Vite first so it is ready before requesting the short-lived browser launch URL:
 
-# In another terminal, start the Vite dev server (with HMR + API proxy)
+```bash
+# From the repository root, start Vite (with HMR + API proxy)
 cd web/
 npm install
 npm run dev
+
+# In another terminal at the repository root, start the backend API server
+python -m hermes_cli.main -p default dashboard --no-open --print-launch-url
 ```
 
-Open the **Vite URL** printed in the terminal (usually `http://localhost:5173`). That is the live-reload UI.
+For the default loopback backend, take the printed authenticated launch URL and replace only its backend origin with the **Vite origin** printed in the first terminal (usually `http://localhost:5173`). Preserve the complete `#bootstrap=...` fragment and open the resulting Vite URL within 60 seconds. This is the live-reload UI; opening the bare Vite URL in a fresh tab does not authenticate it.
 
-`hermes dashboard` on port 9119 serves the **built** bundle from `hermes_cli/web_dist/`, not the Vite dev server — changes in `web/src/` will not appear there until you run `npm run build` and restart the dashboard (or use `dashboard --no-open` + Vite as above).
+The launch URL is sensitive and single-use: do not share it or open it against the backend first. If the grant expires or has already been redeemed, stop and restart the backend command above to print a fresh launch URL. After restarting the backend, reopen the Vite tab with its new launch fragment.
 
-The Vite dev server proxies `/api` requests to `http://127.0.0.1:9119` (the FastAPI backend).
+`hermes dashboard` on port 9119 serves the **built** bundle from `hermes_cli/web_dist/`, not the Vite dev server — changes in `web/src/` will not appear there until you run `npm run build` and restart the dashboard (or use the authenticated Vite development flow above).
+
+The Vite dev server proxies `/auth` and `/api` requests to `http://127.0.0.1:9119` (the FastAPI backend), preserving the browser-facing origin for the bootstrap check.
 
 ## Build
 

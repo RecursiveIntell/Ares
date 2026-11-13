@@ -404,19 +404,19 @@ class TestChannelIdentity:
     def test_linux_beta_not_normalized_to_stable(self):
         import hermes_cli.browser_connect as bc
         with patch.object(bc.subprocess, "run",
-                          return_value=Mock(stdout="google-chrome-beta.desktop\n")):
+                          return_value=Mock(stdout="google-chrome-beta.desktop\n", returncode=0)):
             assert bc._detect_default_linux() == bc.UNSUPPORTED_CHANNEL
 
     def test_linux_stable_still_resolves(self):
         import hermes_cli.browser_connect as bc
         with patch.object(bc.subprocess, "run",
-                          return_value=Mock(stdout="google-chrome.desktop\n")):
+                          return_value=Mock(stdout="google-chrome.desktop\n", returncode=0)):
             assert bc._detect_default_linux() == "chrome"
 
     def test_linux_flatpak_beta_not_stable(self):
         import hermes_cli.browser_connect as bc
         with patch.object(bc.subprocess, "run",
-                          return_value=Mock(stdout="com.google.chrome.beta.desktop\n")):
+                          return_value=Mock(stdout="com.google.chrome.beta.desktop\n", returncode=0)):
             assert bc._detect_default_linux() == bc.UNSUPPORTED_CHANNEL
 
     def test_darwin_canary_not_normalized(self):

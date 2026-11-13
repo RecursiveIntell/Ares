@@ -32,6 +32,7 @@ CLASSIFIER_KEYS = (
     "ci_review_files",
     "context_continuity",
     "current_owner_integration",
+    "exec_conformance",
 )
 CLASSIFIER_BOOLEAN_KEYS = frozenset(CLASSIFIER_KEYS) - {"ci_review_files"}
 
@@ -49,7 +50,7 @@ KNOWN_JOBS = frozenset(
         "rust-tests",
         "context-continuity",
         "current-owner-integration",
-        "e2e-desktop",
+        "exec-conformance",
         "docs-site",
         "history-check",
         "contributor-check",
@@ -63,9 +64,11 @@ KNOWN_JOBS = frozenset(
     }
 )
 
-# The current workflow intentionally disables this lane with a literal false.
-# It is an explicit, reviewable exception, not a general skipped-is-green rule.
-DISABLED_JOBS = frozenset({"e2e-desktop"})
+# No lane is currently disabled. The Desktop E2E lane (removed Nov 2026,
+# tracking issue #76627) used to live here as the explicit reviewable
+# exception; the mechanism is kept so a future parked lane stays explicit
+# instead of silently skipped.
+DISABLED_JOBS = frozenset()
 VALID_RESULTS = frozenset({"success", "failure", "cancelled", "skipped"})
 # Reusable-call success cannot substitute for each mandatory inner owner job.
 QUALIFICATION_RESULTS = {
@@ -151,6 +154,8 @@ def _applicable(event_name: str, flags: Mapping[str, bool], needs: Mapping[str, 
         return event_name != "pull_request" or flags["context_continuity"]
     if job == "current-owner-integration":
         return event_name != "pull_request" or flags["current_owner_integration"]
+    if job == "exec-conformance":
+        return event_name != "pull_request" or flags["exec_conformance"]
     if job == "docs-site":
         return flags["site"]
     if job == "history-check":
@@ -180,7 +185,7 @@ def evaluate(
 ) -> dict[str, Any]:
     """Evaluate a complete workflow needs graph without mutating its inputs."""
     failures: list[str] = []
-    if not isinstance(event_name, str) or event_name not in {"pull_request", "push", "workflow_dispatch"}:
+    if not isinstance(event_name, str) or event_name not in {"pull_request", "push", "workflow_dispatch", "merge_group"}:
         failures.append(f"unsupported event_name: {event_name!r}")
     if not isinstance(classifier_outputs, Mapping):
         failures.append("classifier outputs must be an object")

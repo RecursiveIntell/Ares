@@ -40,6 +40,7 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
+from agent.stream_diag import is_provider_stream_parse_error
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     _review_fork_first_request_pending,
@@ -5741,6 +5742,7 @@ def run_conversation(
                 is_rate_limited = classified.reason in {
                     FailoverReason.rate_limit,
                     FailoverReason.billing,
+                    FailoverReason.hard_quota,
                     FailoverReason.upstream_rate_limit,
                 }
                 # Relay-wrapped output-cap errors: some gateways wrap an
@@ -5815,6 +5817,10 @@ def run_conversation(
                                 agent._buffer_status(
                                     "⚠️ Billing or credits exhausted — switching to fallback provider..."
                                 )
+                        elif classified.reason == FailoverReason.hard_quota:
+                            agent._buffer_status(
+                                "⚠️ Account-period quota exhausted — switching to an authorized fallback provider..."
+                            )
                         elif _is_transport_failure:
                             agent._buffer_status(
                                 "⚠️ Provider unreachable — switching to fallback provider..."
@@ -6460,6 +6466,11 @@ def run_conversation(
                     # ssl.SSLError explicitly so the error classifier's
                     # retryable=True mapping takes effect instead.
                     and not isinstance(api_error, ssl.SSLError)
+                    # Corrupted provider SSE chunk (jiter serde vocabulary,
+                    # e.g. "key must be a string at line 1 column 28") is
+                    # transient wire trouble, not a local bug — exclude it so
+                    # the retry/fallback path runs (#65147, Ares port).
+                    and not is_provider_stream_parse_error(api_error)
                     # Provider/SDK "NoneType is not iterable" failures are
                     # shape mismatches from upstream (e.g. chatgpt.com Codex
                     # backend response.completed.output=null) — not local

@@ -394,6 +394,10 @@ class TestDelegationCleanup:
 
         profile_home = tmp_path / "profile-a"
         token = set_hermes_home_override(profile_home)
+        # Task 2.2 fail-closed bounding: an unbounded child is refused before
+        # run_conversation. Give this probe the same explicit timeout the
+        # sibling tests use.
+        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 2.0)
         try:
             result = _run_single_child(
                 task_index=0,

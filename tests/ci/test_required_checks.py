@@ -25,6 +25,7 @@ CLASSIFIER_KEYS = (
     "ci_review_files",
     "context_continuity",
     "current_owner_integration",
+    "exec_conformance",
 )
 
 
@@ -75,9 +76,11 @@ def jobs_for(classifier_values: dict[str, str], *, event: str = "pull_request") 
         if event == "pull_request" and (classifier_values["ci_review"] == "true" or classifier_values["mcp_catalog"] == "true")
         else "skipped"
     }
-    # This job is intentionally disabled in the current workflow and is an
-    # explicit applicability exception, not a blanket skipped-is-green rule.
-    result["e2e-desktop"] = {"result": "skipped"}
+    # No lane is currently disabled (the Desktop E2E exception was removed
+    # with the lane in Nov 2026); the evaluator keeps the mechanism so a
+    # future parked lane stays explicit instead of silently skipped.
+    applies = event != "pull_request" or classifier_values["exec_conformance"] == "true"
+    result["exec-conformance"] = {"result": "success" if applies else "skipped"}
     result["osv-scanner"] = {"result": "success"}
     for job, lane, outputs in NATIVE_CALLS:
         applies = event != "pull_request" or classifier_values[lane] == "true"
@@ -98,7 +101,7 @@ def test_required_success_and_explicit_non_applicable_skip_pass():
     result = run(values)
     assert result["status"] == "PASS"
     assert result["required_jobs"]
-    assert "e2e-desktop" in result["explicit_exceptions"]
+    assert result["explicit_exceptions"] == []
 
 
 @pytest.mark.parametrize("bad_result", ["skipped", "cancelled", "timed_out", "action_required", "failure", "neutral"])
@@ -158,12 +161,32 @@ def test_classifier_and_needs_are_copied_before_evaluation():
     assert jobs == original_jobs
 
 
-def test_disabled_desktop_lane_must_remain_an_explicit_skip():
+def test_removed_desktop_lane_is_unknown_and_fails_closed():
     values = classifier()
     jobs = jobs_for(values)
-    jobs["e2e-desktop"] = {"result": "success"}
+    jobs["e2e-desktop"] = {"result": "skipped"}
     result = run(values, jobs=jobs)
     assert result["status"] == "FAIL"
+    assert any("e2e-desktop" in failure for failure in result["failures"])
+
+
+def test_merge_group_runs_all_lanes_and_skips_pr_only_jobs():
+    values = {key: "true" for key in CLASSIFIER_KEYS}
+    values["ci_review_files"] = ""
+    result = run(values, event="merge_group")
+    assert result["status"] == "PASS"
+    for job in ("history-check", "lockfile-diff", "supply-chain", "review-labels"):
+        assert job not in result["required_jobs"]
+
+
+@pytest.mark.parametrize("bad_result", ["failure", "cancelled", "skipped", "neutral"])
+def test_applicable_exec_conformance_non_success_fails_closed(bad_result):
+    values = classifier(exec_conformance="true")
+    jobs = jobs_for(values)
+    jobs["exec-conformance"] = {"result": bad_result}
+    result = run(values, jobs=jobs)
+    assert result["status"] == "FAIL"
+    assert any("exec-conformance" in failure for failure in result["failures"])
 
 
 def test_critical_supply_chain_finding_requires_review_label_gate():

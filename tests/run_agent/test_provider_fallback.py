@@ -77,6 +77,7 @@ class TestFallbackChainInit:
     [
         (FailoverReason.auth, "authentication failed"),
         (FailoverReason.billing, "billing or quota exhausted"),
+        (FailoverReason.hard_quota, "account quota exhausted"),
         (FailoverReason.rate_limit, "rate limit"),
         (FailoverReason.upstream_rate_limit, "upstream model rate limit"),
         (FailoverReason.overloaded, "provider overloaded"),

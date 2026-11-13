@@ -165,7 +165,7 @@ ls ~/.local/bin/hermes
 
 #### Python 版本过旧
 
-**原因：** Hermes 需要 Python 3.11 或更新版本。
+**原因：** Hermes 需要 Python `>=3.14,<3.15`。
 
 **解决方案：**
 ```bash
@@ -211,7 +211,7 @@ terminal:
 
 **解决方案：**
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+curl -LsSf https://astral.sh/uv/0.12.24/install.sh | sh
 source ~/.bashrc
 ```
 

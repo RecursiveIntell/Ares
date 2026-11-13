@@ -235,6 +235,27 @@ def logical_request_bytes(payload: Mapping[str, Any]) -> bytes:
                       separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
+def openai_sdk_request_body(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the JSON body, keeping SDK transport controls out of its preimage.
+
+    Use the pinned SDK's own extra_body merge, including its Omit handling.
+    Unknown body members remain subject to strict JSON serialization; this is
+    not a coercion or an allowlist of model parameters. Physical wire bytes
+    and endpoint identity are still observed independently at the send owner.
+    """
+    from openai._base_client import _merge_mappings
+
+    body = {key: value for key, value in payload.items() if key not in {
+        "extra_body", "timeout", "extra_headers", "headers", "extra_query",
+    }}
+    extra = payload.get("extra_body")
+    if extra is not None:
+        if type(extra) is not dict:
+            raise ContractError("CONTEXT_DISPATCH_WIRE_OVERRIDE_UNQUALIFIED")
+        body = _merge_mappings(body, extra)
+    return body
+
+
 import contextvars
 from contextlib import contextmanager
 
@@ -251,7 +272,25 @@ def model_call_owner_scope(agent):
         _model_call_owner.reset(token)
 
 
-def produce_dispatch_materialization(agent, payload, *, purpose, route=None):
+def produce_dispatch_materialization(agent, payload, *, purpose, route=None, execution_id=None):
+    """One ephemeral call basis for ordinary and continuity dispatch callers.
+
+    The persisted lineage artifact is unchanged. An explicit invocation's
+    normalized intent travels only in the existing deferred call basis, not
+    in provider bytes or an ambient copied execution Context.
+    """
+    result = _produce_dispatch_materialization(agent, payload, purpose=purpose, route=route, execution_id=execution_id)
+    if agent is not None or purpose == "conversation":
+        from ares_runtime.physical_dispatch import explicit_reasoning_override
+
+        owner = agent if agent is not None else _model_call_owner.get()
+        explicit = explicit_reasoning_override(owner)
+        if explicit is not None:
+            result["explicit_reasoning_request"] = explicit
+    return result
+
+
+def _produce_dispatch_materialization(agent, payload, *, purpose, route=None, execution_id=None):
     """Use actual source, SessionDB, input-phase and lease owners or qualify none.
 
     A missing owner is data, not authorization. The consuming enforce governor
@@ -270,19 +309,23 @@ def produce_dispatch_materialization(agent, payload, *, purpose, route=None):
     from hermes_state_continuity import ContextContinuationError
     try:
         source = read_dispatch_source_identity()
-        request_digest = "sha256:" + hashlib.sha256(logical_request_bytes(payload)).hexdigest()
+        api_mode = route.get("api_mode") or getattr(agent, "api_mode", None)
+        body = (openai_sdk_request_body(payload)
+                if api_mode in {"chat_completions", "codex_responses"} else payload)
+        request_digest = "sha256:" + hashlib.sha256(logical_request_bytes(body)).hexdigest()
         artifact = db.record_model_dispatch_materialization(
             agent.session_id,
             turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
             source=source, request_digest=request_digest, purpose=purpose,
             provider_identity=route.get("provider") or getattr(agent, "provider", None),
             model_ref=payload.get("model") or getattr(agent, "model", None),
-            api_mode=route.get("api_mode") or getattr(agent, "api_mode", None),
+            api_mode=api_mode,
+            execution_id=execution_id,
         )
     except (ContractError, ContextContinuationError, ValueError, TypeError) as error:
-        return {"materialization": None, "qualification_error": getattr(error, "code", "MATERIALIZATION_UNAVAILABLE")}
-    return {"materialization": artifact, "qualification_error": None}
+        return {"materialization": None, "execution_id": execution_id, "qualification_error": getattr(error, "code", "MATERIALIZATION_UNAVAILABLE")}
+    return {"materialization": artifact, "execution_id": execution_id, "qualification_error": None}
 
 
 __all__ = ["MANAGED_CALL_CONTEXT_SCHEMA", "ManagedCallContextV1", "ManagedCallContextV2",
-           "produce_dispatch_materialization", "logical_request_bytes"]
+           "produce_dispatch_materialization", "logical_request_bytes", "openai_sdk_request_body"]

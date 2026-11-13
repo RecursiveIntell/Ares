@@ -6,6 +6,24 @@ are rebound onto server.py's globals at install time — see method_ctx.py.
 
 from .method_ctx import HandlerRegistry
 
+from hermes_cli.goals import GoalPersistenceCause
+
+
+def _goal_persistence_message(cause: str) -> str:
+    """Per-cause user-facing message for a failed goal persistence (F0.1)."""
+    cause = (cause or "").strip()
+    if cause == GoalPersistenceCause.UNAVAILABLE:
+        return (
+            "Goal set in this session but NOT yet persisted (storage warming up). "
+            "It will flush automatically; if the app restarts before then it is lost. "
+            "Do not rely on /goal status alone to verify."
+        )
+    if cause == GoalPersistenceCause.CONFLICT:
+        return "Another writer changed the goal concurrently — check /goal status and retry."
+    if cause == GoalPersistenceCause.INVALID_SESSION:
+        return "No live session to attach the goal to."
+    return "Goal persistence failed — please retry."
+
 _registry = HandlerRegistry()
 method = _registry.method
 _profile_scoped = _registry.profile_scoped
@@ -820,6 +838,10 @@ def _(rid, params: dict) -> dict:
             state = mgr.resume()
             if state is None:
                 return _ok(rid, {"type": "exec", "output": "No goal to resume."})
+            # An explicit resume is the operator lifting a Stop-era hold; the
+            # hold otherwise suppresses judging until the next user turn.
+            with session["history_lock"]:
+                session.pop(_GOAL_STOP_HOLD, None)
             # Resume must restart work, not just flip persisted state
             # (#75362). An `exec` result is display-only — nothing would
             # re-enter the conversation loop until the user typed another
@@ -853,13 +875,64 @@ def _(rid, params: dict) -> dict:
                 },
             )
 
+        # /goal complete <evidence> — explicit completion authority.
+        #
+        # Mirrors the CLI (hermes_cli/cli_commands_mixin.py) and the messaging
+        # gateway (gateway/slash_commands.py) branches exactly: bare `done`
+        # clears, but `done <text>` is completion evidence. Judge prose is never
+        # evidence, so this is the only path that can move a goal out of
+        # WAITING_FOR_AUTHORITY.
+        #
+        # Without this branch the fallthrough below called mgr.set(), silently
+        # REPLACING the standing goal with the literal text "complete …" — the
+        # exact command the authority gate's own next_action tells the operator
+        # to run, and the exact command the other two surfaces already accept.
+        if lower == "complete" or lower.startswith("complete ") or lower.startswith("done "):
+            evidence = arg.split(None, 1)[1].strip() if " " in arg else ""
+            if not evidence:
+                return _ok(
+                    rid,
+                    {
+                        "type": "exec",
+                        "output": (
+                            "Usage: /goal complete <evidence> "
+                            "(model text alone is not completion evidence)."
+                        ),
+                    },
+                )
+            try:
+                completed = mgr.confirm_completion(evidence, source="user-command")
+            except ValueError as exc:
+                return _err(rid, 4004, f"/goal complete: {exc}")
+            if not completed:
+                return _ok(rid, {"type": "exec", "output": "No active goal to complete."})
+            state = mgr.state
+            title = str(getattr(state, "goal", "") or "")
+            # Shape matches the desktop's done-pill grammar
+            # (`✓ Goal done (…): <title>`); the old prose would leave the chip
+            # showing "Goal active · waiting for authority" after completion.
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": f"✓ Goal done (explicit evidence recorded): {title}".rstrip(),
+                },
+            )
+
         # Otherwise — treat the remaining text as the new goal.
         try:
             state = mgr.set(arg)
         except ValueError as exc:
             return _err(rid, 4004, f"invalid goal: {exc}")
         except RuntimeError as exc:
-            return _err(rid, 5032, f"Goal persistence unconfirmed: {exc}")
+            cause = getattr(exc, "cause", None) or "write_failed"
+            # Local import: registered handlers are rebound onto server.py's
+            # namespace, which does not carry methods_tools module globals —
+            # a bare call here would raise NameError on the installed handler.
+            from .methods_tools import _goal_persistence_message as _gpm
+
+            detail = _gpm(cause)
+            return _err(rid, 5032, detail or f"Goal persistence unconfirmed: {exc}")
 
         notice = (
             f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}\n"

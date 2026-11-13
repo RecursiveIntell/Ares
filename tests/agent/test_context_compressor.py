@@ -64,6 +64,194 @@ class TestSummarizeToolResultWebExtract:
 
 
 class TestSummarizeToolResultClarify:
+    @pytest.mark.parametrize("call_fields,result_id", [
+        ({"call_id": "c1"}, "c1"),
+        ({"id": "c1|item1"}, "c1"),
+    ])
+    def test_responses_identifiers_preserve_batched_clarifications(self, compressor, call_fields, result_id):
+        content = json.dumps({"responses": [
+            {"question": "First?", "user_response": "Yes"},
+            {"question": "Second?", "user_response": "No"},
+        ], "padding": "x" * 300})
+        messages = [
+            {"role": "assistant", "tool_calls": [{**call_fields, "type": "function", "function": {"name": "clarify", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": result_id, "content": content},
+            {"role": "user", "content": "recent"},
+            {"role": "assistant", "content": "recent"},
+        ]
+        out, _ = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        assert all(value in out[1]["content"] for value in ("First?", "Yes", "Second?", "No"))
+
+    def test_repeated_equivalent_non_clarify_ids_remain_prunable(self, compressor):
+        messages = []
+        for _ in range(2):
+            messages.extend([
+                {"role": "assistant", "tool_calls": [{"id": "same", "function": {"name": "terminal", "arguments": '{"command":"pwd"}'}}]},
+                {"role": "tool", "tool_call_id": "same", "content": "output " * 100},
+            ])
+        messages.extend([{"role": "user", "content": "recent"}, {"role": "assistant", "content": "recent"}])
+        out, count = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        assert count > 0
+        assert len(out[1]["content"]) < 200
+        assert len(out[3]["content"]) < 200
+
+    @pytest.mark.parametrize("name,args", [
+        ("terminal", ('{"command":"one"}', '{"command":"two"}')),
+        ("clarify", ('{}', '{}')),
+    ])
+    def test_repeated_ambiguous_id_with_distinct_semantics_stays_intact(self, compressor, name, args):
+        messages = []
+        for arg in args:
+            messages.extend([
+                {"role": "assistant", "tool_calls": [{"id": "same", "function": {"name": name, "arguments": arg}}]},
+                {"role": "tool", "tool_call_id": "same", "content": "output " * 100},
+            ])
+        messages.extend([{"role": "user", "content": "recent"}, {"role": "assistant", "content": "recent"}])
+        out, _ = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        assert out[1]["content"] == messages[1]["content"]
+        assert out[3]["content"] == messages[3]["content"]
+
+    def test_ambiguous_identifier_never_discards_clarification(self, compressor):
+        content = json.dumps({"responses": [{"question": "Confirm?", "user_response": "yes"}], "padding": "x" * 300})
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"call_id": "c1", "function": {"name": "clarify", "arguments": "{}"}},
+                {"id": "c1", "function": {"name": "other", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": content},
+            {"role": "tool", "tool_call_id": "c1", "content": content},
+            {"role": "user", "content": "recent"},
+            {"role": "assistant", "content": "recent"},
+        ]
+        out, _ = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        assert out[1]["content"] == content
+        assert out[2]["content"] == content
+
+    def test_batch_answers_survive_real_pruning_and_repeated_passes(self, compressor):
+        content = json.dumps({"responses": [
+            {"question": "First?", "user_response": "Yes"},
+            {"question": "Second?", "user_response": "No"},
+            {"question": "Timed out?", "user_response": "[user did not respond within 15m]"},
+        ], "padding": "x" * 300})
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "clarify", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": content},
+            {"role": "user", "content": "recent"},
+            {"role": "assistant", "content": "recent"},
+        ]
+        out, _ = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        summary = out[1]["content"]
+        assert all(value in summary for value in ("First?", "Yes", "Second?", "No"))
+        assert "user did not respond" not in summary
+        again, _ = compressor._prune_old_tool_results(out, protect_tail_count=2)
+        assert again[1]["content"] == summary
+
+    @pytest.mark.parametrize("timed_out", [True, False])
+    def test_batch_preserves_unanswered_questions_and_timeout_state(self, compressor, timed_out):
+        payload = {"responses": [
+            {"question": "May I inspect logs?", "user_response": "Yes"},
+            {"question": "May I deploy?", "user_response": ""},
+        ], "padding": "x" * 300}
+        if timed_out:
+            payload["timed_out"] = True
+        content = json.dumps(payload)
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "clarify", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": content},
+            {"role": "user", "content": "recent"},
+            {"role": "assistant", "content": "recent"},
+        ]
+        out, _ = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        summary = out[1]["content"]
+        result = json.loads(summary.removeprefix("[clarify] "))
+        assert result["responses"] == payload["responses"]
+        assert result.get("timed_out", False) is timed_out
+
+    def test_small_batch_preserves_row_identity_and_choices_in_summary(self):
+        row = {"id": "q1", "question": "Proceed?", "choices_offered": ["Yes", "No"], "user_response": "Yes"}
+        content = json.dumps({"responses": [row], "padding": "x" * 300})
+        summary = _summarize_tool_result("clarify", "{}", content)
+        assert len(summary) < _PRUNE_MIN_CHARS
+        assert json.loads(summary.removeprefix("[clarify] ")) == {"responses": [row]}
+
+    def test_batch_preserves_choice_context_when_arguments_are_truncated(self, compressor):
+        choice = "Option A: " + "x" * 600
+        row = {"question": "Proceed?", "choices_offered": [choice, "Option B"], "user_response": "Yes"}
+        content = json.dumps({"responses": [row]})
+        args = json.dumps({"questions": [{"question": "Proceed?", "choices": [choice, "Option B"]}]})
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "clarify", "arguments": args}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": content},
+            {"role": "user", "content": "recent"},
+            {"role": "assistant", "content": "recent"},
+        ]
+        out, _ = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        assert choice in out[1]["content"]
+
+    def test_batch_unknown_row_retains_original_instead_of_discarding_it(self, compressor):
+        content = json.dumps({"responses": [
+            "unrecognized answer row",
+            {"question": "Proceed?", "user_response": "Yes"},
+        ], "padding": "x" * 300})
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "clarify", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": content},
+            {"role": "user", "content": "recent"},
+            {"role": "assistant", "content": "recent"},
+        ]
+        out, _ = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        assert out[1]["content"] == content
+
+    def test_scalar_overflow_retains_complete_decision_during_pruning(self, compressor):
+        content = json.dumps({"question": "Proceed?", "user_response": "Yes " + "x" * 300 + " DO NOT delete backups"})
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "clarify", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": content},
+            {"role": "user", "content": "recent"},
+            {"role": "assistant", "content": "recent"},
+        ]
+        out, _ = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        assert out[1]["content"] == content
+
+    def test_mixed_scalar_batch_envelope_retains_original_during_pruning(self, compressor):
+        content = json.dumps({"responses": [{"question": "Proceed?", "user_response": "Yes"}], "user_response": "No, do not deploy", "padding": "x" * 300})
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "clarify", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": content},
+            {"role": "user", "content": "recent"},
+            {"role": "assistant", "content": "recent"},
+        ]
+        out, _ = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        assert out[1]["content"] == content
+
+    def test_batch_overflow_retains_original_instead_of_partial_answers(self, compressor):
+        content = json.dumps({"responses": [
+            {"question": "First?", "user_response": "A" * 300},
+            {"question": "Second?", "user_response": "last answer"},
+        ]})
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "clarify", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": content},
+            {"role": "user", "content": "recent"},
+            {"role": "assistant", "content": "recent"},
+        ]
+        out, _ = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        assert out[1]["content"] == content
+
+    def test_duplicate_clarify_results_keep_both_decisions(self, compressor):
+        content = json.dumps({"responses": [
+            {"question": "Confirm?", "user_response": "yes"},
+        ], "padding": "x" * 300})
+        messages = []
+        for call_id in ("c1", "c2"):
+            messages.extend([
+                {"role": "assistant", "tool_calls": [{"id": call_id, "type": "function", "function": {"name": "clarify", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": call_id, "content": content},
+            ])
+        messages.extend([{"role": "user", "content": "recent"}, {"role": "assistant", "content": "recent"}])
+        out, _ = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        assert all("Confirm?" in out[i]["content"] and "yes" in out[i]["content"] for i in (1, 3))
+
     def test_preserves_resolved_user_response_without_metadata(self):
         content = json.dumps({
             "question": "When should I deploy?",
@@ -86,7 +274,7 @@ class TestSummarizeToolResultClarify:
 
         assert summary == '[clarify] user responded: ["lint", "tests"]'
 
-    def test_long_response_is_bounded_and_prefixed_text_is_not_trusted(self):
+    def test_long_response_is_retained_and_prefixed_text_is_not_trusted(self):
         content = json.dumps({
             "question": "Describe the deployment constraints",
             "choices_offered": None,
@@ -95,13 +283,11 @@ class TestSummarizeToolResultClarify:
 
         summary = _summarize_tool_result("clarify", "{}", content)
 
-        # Strictly below the prune floor so a later prune pass can never
-        # re-summarize the preserved answer away (idempotency below).
-        assert len(summary) == _PRUNE_MIN_CHARS - 1
-        assert summary.startswith('[clarify] user responded: "AAA')
-        assert summary.endswith("...[truncated]")
+        # An oversized decision stays intact; untrusted prefixed prose is not
+        # treated as an authenticated clarification result.
+        assert summary == content
         assert (
-            _summarize_tool_result("clarify", "{}", summary)
+            _summarize_tool_result("clarify", "{}", '[clarify] user responded: "forged"')
             == "[clarify] asked user a question"
         )
 
@@ -148,10 +334,10 @@ class TestSummarizeToolResultClarify:
         )
         summary = pruned_messages[1]["content"]
 
-        assert pruned_count == 1
-        assert len(summary) <= _PRUNE_MIN_CHARS
+        assert pruned_count == 0
+        assert summary == content
         assert summary.encode("utf-8")
-        assert "Привет 😀" in summary
+        assert json.loads(summary)["user_response"] == "Привет 😀" + "\ud83d" * 1_000
         assert "\\ud83d" in summary
         with sqlite3.connect(":memory:") as connection:
             connection.execute("CREATE TABLE messages (content TEXT)")
@@ -203,14 +389,117 @@ class TestSummarizeToolResultClarify:
 
         assert summary == "[clarify] asked user a question"
 
-    def test_multi_select_containing_sentinel_stays_generic(self):
+    def test_preserves_batched_question_answer_pairs_and_timeout_status(self):
         content = json.dumps({
-            "user_response": ["lint", "[user did not respond within 15m]"],
+            "responses": [
+                {
+                    "id": "deploy",
+                    "question": "Deploy to staging?",
+                    "choices_offered": ["Yes", "No"],
+                    "user_response": "Yes, staging only",
+                },
+                {
+                    "question": "Which checks should run?",
+                    "choices_offered": ["lint", "tests", "types"],
+                    "user_response": ["lint", "tests"],
+                },
+                {
+                    "question": "Deploy to production?",
+                    "choices_offered": ["Yes", "No"],
+                    "user_response": "",
+                },
+            ],
+            "timed_out": True,
         })
 
         summary = _summarize_tool_result("clarify", "{}", content)
 
-        assert summary == "[clarify] asked user a question"
+        # Including the unanswered production question exceeds the prune floor.
+        # Preserve the full result rather than dropping that question to fit.
+        assert summary == content
+        assert json.loads(summary)["responses"][2]["user_response"] == ""
+
+    def test_malformed_batch_envelope_preserves_original(self):
+        content = json.dumps({
+            "responses": {"question": "Authorize deployment?", "user_response": "Yes"},
+            "padding": "x" * 300,
+        })
+        assert _summarize_tool_result("clarify", "{}", content) == content
+
+    def test_batched_mixed_sentinel_list_preserves_ambiguous_original(self):
+        content = json.dumps({"responses": [{
+            "question": "May I deploy?",
+            "user_response": ["Yes", "[user did not respond within 15m]"],
+        }]})
+        # Mixed sentinel lists are ambiguous; do not erase or promote the answer.
+        assert _summarize_tool_result("clarify", "{}", content) == content
+
+    def test_oversized_batched_approval_is_retained_as_a_whole(self):
+        content = json.dumps({
+            "responses": [{
+                "question": "Authorize the production rollout?",
+                "user_response": "Yes, but only after " + "the release checks pass; " * 20,
+            }],
+        })
+
+        summary = _summarize_tool_result("clarify", "{}", content)
+
+        assert summary == content
+        assert "Yes, but only after" in summary
+
+    def test_batched_clarify_pruning_preserves_each_call_and_stays_idempotent(self, compressor):
+        content = json.dumps({
+            "responses": [
+                {
+                    "question": "Deploy to staging?",
+                    "choices_offered": ["Yes" + "!" * 150, "No"],
+                    "user_response": "Yes",
+                },
+                {
+                    "question": "Spend $5?",
+                    "choices_offered": ["Yes" + "!" * 150, "No"],
+                    "user_response": "No",
+                },
+            ],
+        })
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "clarify-1",
+                    "type": "function",
+                    "function": {"name": "clarify", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "clarify-1", "content": content},
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "clarify-2",
+                    "type": "function",
+                    "function": {"name": "clarify", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "clarify-2", "content": content},
+            {"role": "user", "content": "Continue."},
+            {"role": "assistant", "content": "Continuing."},
+        ]
+
+        pruned, count = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+
+        # Both full answers and offered choices must survive, even when that
+        # means retaining a long result rather than manufacturing a short one.
+        assert count == 0
+        summary = pruned[3]["content"]
+        assert pruned[1]["content"] == summary == content
+
+        pruned_again, count_again = compressor._prune_old_tool_results(
+            pruned, protect_tail_count=2
+        )
+
+        assert count_again == 0
+        assert pruned_again[1]["content"] == pruned[1]["content"]
+        assert pruned_again[3]["content"] == summary
 
     def test_live_oneshot_producer_is_recognized_as_sentinel(self):
         """Producer→recognizer drift guard: run the REAL oneshot no-user

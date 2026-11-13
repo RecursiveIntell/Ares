@@ -65,7 +65,7 @@ def test_non_streaming_cancel_does_not_surface_network_error():
     fake_client.chat.completions.create.side_effect = _create
     agent._create_request_openai_client.return_value = fake_client
     agent._close_request_openai_client = MagicMock()
-    agent._abort_request_openai_client = MagicMock()
+    agent._abort_request_openai_client = MagicMock(return_value=1)
 
     t0 = time.time()
     with pytest.raises(InterruptedError):

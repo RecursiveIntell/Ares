@@ -8,7 +8,7 @@ import {
   DropdownMenuSubTrigger
 } from '@/components/ui/dropdown-menu'
 
-import { type FastControl, ModelEditSubmenu } from './model-edit-submenu'
+import { type FastControl, ModelEditSubmenu, resolveFastControl } from './model-edit-submenu'
 
 // Radix calls these on open; jsdom doesn't implement them.
 beforeAll(() => {
@@ -59,6 +59,16 @@ function renderSubmenu(opts: {
 // component drive a live chat session AND a detached per-task override — if it
 // ever writes directly again, picking an effort for a kanban card would reach
 // over and change the user's live chat.
+describe('resolveFastControl never strands a Fast toggle on a model without Fast', () => {
+  it('carried-over Fast on a model with no param and no -fast sibling renders no control', () => {
+    expect(resolveFastControl('claude-sonnet-5-5', ['claude-sonnet-5-5'], false, true)).toEqual({ kind: 'none' })
+  })
+
+  it('a param-capable model still reports its own state', () => {
+    expect(resolveFastControl('claude-opus-5-5', ['claude-opus-5-5'], true, true)).toEqual({ kind: 'param', on: true })
+  })
+})
+
 describe('ModelEditSubmenu reports edits without performing them', () => {
   it('param fast: reports the toggle', () => {
     const onSetOptions = vi.fn()

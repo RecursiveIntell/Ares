@@ -11,11 +11,33 @@ the subagent.steer gateway RPC that fronts the helper.
 import threading
 from unittest.mock import MagicMock
 
+import pytest
+
 from tools.delegate_tool import (
     _register_subagent,
     _unregister_subagent,
     steer_subagent,
 )
+
+
+def _budgeted_parent():
+    """Task 2.2 (debit from parent): a probe parent with a real budget."""
+    from agent.iteration_budget import IterationBudget
+
+    parent = MagicMock()
+    parent.iteration_budget = IterationBudget(500)
+    return parent
+
+
+@pytest.fixture(autouse=True)
+def _bounded_child_wall_clock(monkeypatch):
+    """Task 2.2 is fail-closed: bound every probe child on the wall clock.
+
+    Mirrors tests/agent/test_delegated_window_enforcement.py, which patches
+    _get_child_timeout as the sanctioned bounding seam; without a bound the
+    child refusal (delegated_expiry) rejects the probe before it starts.
+    """
+    monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 600.0)
 
 
 class _StubAgent:
@@ -164,8 +186,12 @@ class TestMissedSteerRetention:
         from unittest.mock import MagicMock, patch
 
         from tools.delegate_tool import delegate_task
+        from agent.iteration_budget import IterationBudget
 
         parent = MagicMock()
+        # Task 2.2 (debit from parent): child construction debits a real
+        # parent budget; a bare MagicMock would be refused as unbounded.
+        parent.iteration_budget = IterationBudget(500)
         parent._delegate_depth = 0
         parent.model = "test-model"
         parent.interactive_mode = False
@@ -201,8 +227,12 @@ class TestMissedSteerRetention:
         from unittest.mock import MagicMock, patch
 
         from tools.delegate_tool import delegate_task
+        from agent.iteration_budget import IterationBudget
 
         parent = MagicMock()
+        # Task 2.2 (debit from parent): child construction debits a real
+        # parent budget; a bare MagicMock would be refused as unbounded.
+        parent.iteration_budget = IterationBudget(500)
         parent._delegate_depth = 0
         parent.model = "test-model"
         parent.interactive_mode = False
@@ -230,6 +260,7 @@ class TestMissedSteerRetention:
     def test_accepted_steer_racing_completion_is_durably_retained(self):
         """Acceptance wins the registry race, so completion must retain its text."""
         from tools.delegate_tool import _run_single_child
+        from agent.iteration_budget import IterationBudget
 
         running = threading.Event()
         allow_return = threading.Event()
@@ -271,7 +302,10 @@ class TestMissedSteerRetention:
         child.run_conversation.side_effect = run_conversation
         child.steer.side_effect = steer
         child._drain_pending_steer.side_effect = drain
+        # Task 2.2 (debit from parent): child construction debits a real
+        # parent budget; a bare MagicMock would be refused as unbounded.
         parent = MagicMock()
+        parent.iteration_budget = IterationBudget(500)
 
         result_box: dict = {}
         runner = threading.Thread(
@@ -304,6 +338,7 @@ class TestMissedSteerRetention:
     def test_steer_after_run_return_is_rejected_before_completion_callback(self):
         """Once the child returns, a blocked completion callback cannot extend acceptance."""
         from tools.delegate_tool import _run_single_child
+        from agent.iteration_budget import IterationBudget
 
         callback_entered = threading.Event()
         release_callback = threading.Event()
@@ -330,7 +365,7 @@ class TestMissedSteerRetention:
         }
 
         runner = threading.Thread(
-            target=lambda: _run_single_child(0, "late", child=child, parent_agent=MagicMock())
+            target=lambda: _run_single_child(0, "late", child=child, parent_agent=_budgeted_parent())
         )
         runner.start()
         assert callback_entered.wait(5)
@@ -421,6 +456,7 @@ class TestSubagentSteerRPC:
     def test_run_single_child_binds_exact_runtime_owner_artifacts(self):
         from gateway.session_context import clear_session_vars, set_session_vars
         from tools.delegate_tool import _run_single_child
+        from agent.iteration_budget import IterationBudget
 
         observed: dict[str, bool] = {}
         owner_transport = self._Transport()

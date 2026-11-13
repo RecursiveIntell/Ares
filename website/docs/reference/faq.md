@@ -146,7 +146,7 @@ The installer adds `~/.local/bin` to your PATH. If you use a non-standard shell 
 
 #### Python version too old
 
-**Cause:** Hermes requires Python 3.11 or newer.
+**Cause:** Hermes requires Python `>=3.14,<3.15`.
 
 **Solution:**
 ```bash
@@ -192,7 +192,7 @@ terminal:
 
 **Solution:**
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+curl -LsSf https://astral.sh/uv/0.12.24/install.sh | sh
 source ~/.bashrc
 ```
 

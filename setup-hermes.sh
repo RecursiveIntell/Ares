@@ -10,7 +10,7 @@
 #
 # This script:
 # 1. Detects desktop/server vs Android/Termux setup path
-# 2. Creates a Python 3.11 virtual environment
+# 2. Creates a Python 3.14 virtual environment
 # 3. Installs the appropriate dependency set for the platform
 # 4. Creates .env from template (if not exists)
 # 5. Symlinks the 'hermes' CLI command into a user-facing bin dir
@@ -33,7 +33,7 @@ cd "$SCRIPT_DIR"
 # wrong user's home directory when running under sudo -u <user>.  See #21269.
 export UV_NO_CONFIG=1
 
-PYTHON_VERSION="3.11"
+PYTHON_VERSION="3.14"
 
 is_termux() {
     [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"com.termux/files/usr"* ]]
@@ -69,13 +69,25 @@ UV_CMD=""
 if is_termux; then
     echo -e "${CYAN}→${NC} Termux detected — using Python's stdlib venv + pip instead of uv"
 else
-    if command -v uv &> /dev/null; then
-        UV_CMD="uv"
-    elif [ -x "$HOME/.local/bin/uv" ]; then
-        UV_CMD="$HOME/.local/bin/uv"
-    elif [ -x "$HOME/.cargo/bin/uv" ]; then
-        UV_CMD="$HOME/.cargo/bin/uv"
-    fi
+    # Reviewed-range admission (uv-pin contract): every candidate is
+    # version-checked against [0.9.28, 0.13.0) before use.
+    _uv_admitted() {
+        local _cand="$1" _ver
+        _ver="$("$_cand" --version 2>/dev/null)" || return 1
+        case "$_ver" in
+            uv\ 0.9.2[89]|uv\ 0.9.3[0-9]|uv\ 0.1[0-2].*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    for _cand in "$(command -v uv 2>/dev/null)" "$HOME/.local/bin/uv" "$HOME/.cargo/bin/uv"; do
+        [ -n "$_cand" ] && [ -x "$_cand" ] || continue
+        if _uv_admitted "$_cand"; then
+            UV_CMD="$_cand"
+            break
+        fi
+        echo -e "${YELLOW}→${NC} skipping uv at $_cand: outside the reviewed range [0.9.28, 0.13.0)"
+    done
+    unset -f _uv_admitted 2>/dev/null || true
 
     if [ -n "$UV_CMD" ]; then
         UV_VERSION=$($UV_CMD --version 2>/dev/null)
@@ -89,7 +101,9 @@ else
         # failures (sh exits 0 on empty stdin under no pipefail).
         _uv_log="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-install.$$.log")"
         _uv_installer="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-installer.$$.sh")"
-        if ! curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>"$_uv_log"; then
+        # Reviewed uv pin (OD-1): versioned installer URL, never "latest".
+        UV_PIN="0.12.24"
+        if ! curl -LsSf "https://astral.sh/uv/${UV_PIN}/install.sh" -o "$_uv_installer" 2>"$_uv_log"; then
             echo -e "${RED}✗${NC} Failed to download uv installer."
             sed 's/^/    /' "$_uv_log" >&2
             echo -e "${CYAN}→${NC} Install manually: https://docs.astral.sh/uv/"
@@ -135,11 +149,11 @@ echo -e "${CYAN}→${NC} Checking Python $PYTHON_VERSION..."
 if is_termux; then
     if command -v python >/dev/null 2>&1; then
         PYTHON_PATH="$(command -v python)"
-        if "$PYTHON_PATH" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+        if "$PYTHON_PATH" -c 'import sys; raise SystemExit(0 if (3, 14) <= sys.version_info[:2] < (3, 15) else 1)' 2>/dev/null; then
             PYTHON_FOUND_VERSION=$($PYTHON_PATH --version 2>/dev/null)
             echo -e "${GREEN}✓${NC} $PYTHON_FOUND_VERSION found"
         else
-            echo -e "${RED}✗${NC} Termux Python must be 3.11+"
+            echo -e "${RED}✗${NC} Termux Python must be >=3.14,<3.15"
             echo "    Run: pkg install python"
             exit 1
         fi

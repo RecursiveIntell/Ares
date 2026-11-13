@@ -126,6 +126,23 @@ _DEFAULT_MAX_CONCURRENT_CHILDREN = 10
 # so without this flag a config of max_concurrent_children>10 spams the log on
 # every turn / agent spawn even when delegate_task is never called.
 _HIGH_CONCURRENCY_WARNED = False
+def _child_debiting_budget(parent_agent, child_max_iterations):
+    """Child budget debited from the parent's live budget (Task 2.2, debit from parent).
+
+    ``child_max_iterations`` is the same authoritative per-child cap the child is built
+    with (``effective_max_iter``, from delegation.max_iterations), not a guessed parent
+    attribute. Raises rather than falling back, so a missing parent budget cannot
+    silently restore an unbounded child.
+    """
+    from agent.delegated_budget import DebitingIterationBudget
+    from agent.iteration_budget import IterationBudget
+
+    parent_budget = getattr(parent_agent, "iteration_budget", None)
+    if not isinstance(parent_budget, IterationBudget):
+        raise RuntimeError("delegation requires a parent iteration budget; refusing unbounded child")
+    return DebitingIterationBudget(max_total=int(child_max_iterations), parent=parent_budget)
+
+
 MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected unless max_spawn_depth raised.
 # Configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
 # stays as the default fallback and is still the symbol tests import.
@@ -1175,6 +1192,7 @@ def _build_child_system_prompt(
     context: Optional[str] = None,
     *,
     workspace_path: Optional[str] = None,
+    context_length: Optional[int] = None,
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
@@ -1215,7 +1233,9 @@ def _build_child_system_prompt(
             from agent.prompt_builder import build_context_files_prompt
 
             _ctx_files = build_context_files_prompt(
-                cwd=str(workspace_path), skip_soul=True
+                cwd=str(workspace_path),
+                skip_soul=True,
+                context_length=context_length,
             )
         except Exception:
             logger.debug(
@@ -1727,23 +1747,53 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
+    # Resolve the child's effective route before reading project context. The
+    # context-file cap is model-window-aware, and using the parent's window for
+    # a differently routed child silently truncates binding repository law.
+    parent_api_key = getattr(parent_agent, "api_key", None)
+    if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
+        parent_api_key = parent_agent._client_kwargs.get("api_key")
+    effective_model_for_cb = model or getattr(parent_agent, "model", None)
+    prompt_provider = override_provider or getattr(parent_agent, "provider", None)
+    prompt_base_url = override_base_url or getattr(parent_agent, "base_url", None)
+    if not override_base_url:
+        prompt_base_url = _inherit_parent_base_url(parent_agent, prompt_base_url)
+    prompt_api_key = override_api_key or parent_api_key
+    parent_route_matches = (
+        effective_model_for_cb == getattr(parent_agent, "model", None)
+        and prompt_provider == getattr(parent_agent, "provider", None)
+    )
+    prompt_config_context_length = (
+        getattr(parent_agent, "_config_context_length", None)
+        if parent_route_matches
+        else None
+    )
+    try:
+        from agent.model_metadata import get_model_context_length
+
+        child_context_length = get_model_context_length(
+            effective_model_for_cb or "",
+            base_url=prompt_base_url or "",
+            api_key=prompt_api_key or "",
+            provider=prompt_provider or "",
+            config_context_length=prompt_config_context_length,
+        )
+    except Exception:
+        logger.debug(
+            "subagent: child context-window resolution failed", exc_info=True
+        )
+        child_context_length = None
+
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,
         context,
         workspace_path=workspace_hint,
+        context_length=child_context_length,
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
     )
-    # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
-    parent_api_key = getattr(parent_agent, "api_key", None)
-    if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
-        parent_api_key = parent_agent._client_kwargs.get("api_key")
-
-    # Resolve the child's effective model early so it can ride on every event.
-    effective_model_for_cb = model or getattr(parent_agent, "model", None)
-
     # Build progress callback to relay tool calls to parent display.
     # Identity kwargs thread the subagent_id through every emitted event so the
     # TUI can reconstruct the spawn tree and route per-branch controls.
@@ -2000,7 +2050,10 @@ def _build_child_agent(
                 ),
                 openrouter_min_coding_score=child_openrouter_min_coding_score,
                 tool_progress_callback=child_progress_cb,
-                iteration_budget=None,  # fresh budget per subagent
+                # Task 2.2 (debit from parent): the child's iterations are charged against
+                # the parent's remaining budget, so parent + children cannot exceed the
+                # parent's cap. The child keeps its own per-child ceiling.
+                iteration_budget=_child_debiting_budget(parent_agent, max_iterations),
                 **child_optional_kwargs,
             )
         except BaseException:
@@ -2092,6 +2145,29 @@ def _build_child_agent(
     except Exception:
         logger.debug("subagent_start hook invocation failed", exc_info=True)
 
+    # Task 2.2 audit record: the child's attenuated grant (tools, budget, window). This is
+    # evidence only. Building it must never stop a child; the enforcement points (budget
+    # debit, window bound, effect boundary) are independent of this record.
+    try:
+        _parent_budget = getattr(parent_agent, "iteration_budget", None)
+        _parent_remaining = _parent_budget.remaining if _parent_budget is not None else 0
+        # The canonical authority scope is a single string per field, so it cannot express a
+        # toolset. The tool surface is therefore recorded as audit data, while the containment
+        # itself is enforced by delegation's existing toolset intersection. The canonical scope
+        # here carries only the child's window bound, which the record checks against itself.
+        child._grant_record = {
+            "schema": "ares.delegation.grant/v1",
+            "child_id": str(getattr(child, "session_id", "") or f"child-{task_index}"),
+            "toolsets": sorted(toolsets or []),
+            "parent_toolsets": sorted(getattr(parent_agent, "enabled_toolsets", None) or []),
+            "budget": {
+                "child_max": int(max_iterations),
+                "parent_remaining": int(_parent_remaining),
+            },
+            "window_not_after": None,
+        }
+    except Exception:
+        logger.debug("subagent: grant audit record not built", exc_info=True)
     return child
 
 
@@ -2460,6 +2536,7 @@ def _run_single_child(
     owner_session_id: Optional[str] = None,
     owner_transport: Any = None,
     owner_session_record: Any = None,
+    window_not_after: Any = None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -2823,12 +2900,23 @@ def _run_single_child(
                 )
 
         _child_context = contextvars.copy_context()
+        # Task 2.2: compute the effective bound BEFORE submitting the child. A closed grant
+        # window is refused here, so the child never starts.
+        from agent.delegated_expiry import child_effective_deadline as _child_deadline
+        from datetime import datetime as _dt, timezone as _tz
+        _now = _dt.now(_tz.utc)
+        _deadline = _child_deadline(
+            now=_now,
+            own_timeout_seconds=child_timeout,
+            window_not_after=window_not_after,
+        )
+        _effective_timeout = (_deadline - _now).total_seconds()
         _child_future = _timeout_executor.submit(
             _child_context.run,
             _run_with_thread_capture,
         )
         try:
-            result = _child_future.result(timeout=child_timeout)
+            result = _child_future.result(timeout=_effective_timeout)
         except Exception as _timeout_exc:
             # No consumer boundary remains once this owner stops waiting for
             # the child. Close acceptance before any completion callback and
@@ -3521,9 +3609,10 @@ def _run_child_lifecycle(
     goal: str,
     child=None,
     parent_agent=None,
+    window_not_after=None,
 ) -> Dict[str, Any]:
     """Run one child and apply the same host lifecycle used by delegate_task."""
-    result = _run_single_child(task_index, goal, child, parent_agent)
+    result = _run_single_child(task_index, goal, child, parent_agent, window_not_after=window_not_after)
     result.setdefault("task_index", task_index)
     task = {"goal": goal}
     _finalize_child_results(
@@ -3636,6 +3725,7 @@ def delegate_task(
     message: Optional[str] = None,
     parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    window_not_after=None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -3947,6 +4037,7 @@ def delegate_task(
                 _t["goal"],
                 child,
                 parent_agent,
+                window_not_after=window_not_after,
                 owner_session_id=_origin_ui_session_id or None,
                 owner_transport=_origin_owner_transport,
                 owner_session_record=_origin_owner_session_record,
@@ -5010,6 +5101,7 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
+        window_not_after=kw.get("window_not_after"),
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),

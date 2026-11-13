@@ -86,18 +86,13 @@ _MESSAGES = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 # ---------------------------------------------------------------------------
 
 
-def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
-    """Two agents sharing a session_id must not both rotate it.
+@pytest.mark.parametrize("in_place", [False, True], ids=["rotation", "in-place"])
+def test_concurrent_compressions_same_session_serialize(tmp_path: Path, in_place: bool) -> None:
+    """Two agents sharing a physical session contend in either persistence mode.
 
-    The per-session compression lock (added in #34351) serializes concurrent
-    compress() calls keyed on the same session_id.  Exactly one agent must
-    rotate (the lock winner); the other must return its messages unchanged (the
-    lock loser, which detects ``len(returned) == len(input)`` and backs off).
-
-    This is the gateway analogue of the fork test in
-    ``test_compression_concurrent_fork.py`` but scoped to the two-agent /
-    same-session shape most likely to occur in practice: the main-turn agent
-    and its background-review fork both hitting the compression threshold.
+    Exactly one agent enters the stub compressor; the other returns its input.
+    This does not exercise the real governor or different physical sessions
+    belonging to the same logical lineage.
     """
     db = SessionDB(db_path=tmp_path / "state.db")
     shared_sid = "SHARED_SESSION_CONCURRENT"
@@ -105,6 +100,8 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
 
     agent_a = _build_agent_with_db(db, shared_sid)
     agent_b = _build_agent_with_db(db, shared_sid)
+    setattr(agent_a, "compression_in_place", in_place)
+    setattr(agent_b, "compression_in_place", in_place)
 
     # Force genuine simultaneous lock contention instead of relying on a
     # ``time.sleep`` inside the compressor stub to make the threads overlap.
@@ -173,14 +170,11 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
         f"got {unchanged_count}."
     )
 
-    # Exactly one session_id rotation must have occurred.
+    # In-place keeps both IDs; rotation changes only the winner's ID.
     rotated = sum(
         1 for a in (agent_a, agent_b) if a.session_id != shared_sid
     )
-    assert rotated == 1, (
-        f"Expected exactly one agent to rotate session_id, got {rotated}. "
-        "Both agents rotating produces a session fork (Damien's incident shape)."
-    )
+    assert rotated == (0 if in_place else 1)
 
     # The lock must be released so future compression on the NEW session_id works.
     assert db.get_compression_lock_holder(shared_sid) is None, (

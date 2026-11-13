@@ -23,6 +23,9 @@ import uuid
 from datetime import datetime
 from urllib.parse import urlparse
 
+from hermes_cli.goals import GoalPersistenceCause, GoalPersistenceError
+from hermes_cli.goals import _goal_persistence_message as _module_goal_persistence_message
+
 from rich import box as rich_box
 from rich.markup import escape as _escape
 from rich.panel import Panel
@@ -2835,6 +2838,10 @@ class CLICommandsMixin:
             return
         _cprint(f"  {format_dispatch_note(result, prompt)}")
 
+    def _goal_persistence_message(cause: str) -> str:
+        """Delegate to the canonical helper in hermes_cli.goals (F0.1)."""
+        return _module_goal_persistence_message(cause)
+
     def _handle_goal_command(self, cmd: str) -> None:
         """Dispatch /goal subcommands: set / draft / show / gate / status / pause / resume / clear."""
         from cli import _DIM, _RST, _cprint
@@ -3025,6 +3032,9 @@ class CLICommandsMixin:
         except ValueError as exc:
             _cprint(f"  Invalid goal: {exc}")
             return
+        except GoalPersistenceError as exc:
+            _cprint(f"  ✗ {_goal_persistence_message(exc.cause)}")
+            return
 
         _cprint(f"  ⊙ Goal set ({state.max_turns}-turn budget): {state.goal}")
         if state.has_contract():
@@ -3038,9 +3048,16 @@ class CLICommandsMixin:
             f"exhausted. Use /goal status, /goal show, /goal pause, /goal resume, /goal clear.{_RST}"
         )
         # Kick the loop off immediately so the user doesn't have to send a
-        # separate message after setting the goal.
+        # separate message after setting the goal. The _queue_internal_input
+        # shim (cli.py:12820) stamps the synthetic display kind; on a
+        # subprocess surface with no _pending_input reader the getattr probe
+        # degrades to the raw queue, exactly like the RESUME path below.
         try:
-            self._pending_input.put(state.goal)
+            queue_internal = getattr(self, "_queue_internal_input", None)
+            if callable(queue_internal):
+                queue_internal(state.goal, source="goal_continuation")
+            else:
+                self._pending_input.put(state.goal)
         except Exception:
             pass
 
@@ -3069,6 +3086,9 @@ class CLICommandsMixin:
         except ValueError as exc:
             _cprint(f"  Invalid goal: {exc}")
             return
+        except GoalPersistenceError as exc:
+            _cprint(f"  ✗ {_goal_persistence_message(exc.cause)}")
+            return
 
         _cprint(f"  ⊙ Goal set ({state.max_turns}-turn budget): {state.goal}")
         if state.has_contract():
@@ -3085,8 +3105,13 @@ class CLICommandsMixin:
                 f"  {_DIM}Couldn't draft a contract (aux model unavailable) — "
                 f"running as a free-form goal. The per-turn judge still applies.{_RST}"
             )
+        # DRAFT kickoff: same shim-alignment the SET path got (F2.1).
         try:
-            self._pending_input.put(state.goal)
+            queue_internal = getattr(self, "_queue_internal_input", None)
+            if callable(queue_internal):
+                queue_internal(state.goal, source="goal_continuation")
+            else:
+                self._pending_input.put(state.goal)
         except Exception:
             pass
 

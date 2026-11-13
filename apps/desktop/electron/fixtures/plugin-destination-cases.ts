@@ -425,7 +425,7 @@ export async function exerciseDestinationCase(
   const oldBefore = tryDigest(oldFile)!
   const stagingBefore = stages(realRoot)
   const log = path.join(base, 'clone-calls.jsonl')
-  const git = path.join(base, 'fake-git')
+  const git = path.join(base, 'fake-git.cjs')
 
   const cloneScript = `#!${fixtureNodeExecutable}
 const fs = require('node:fs'); const path = require('node:path');

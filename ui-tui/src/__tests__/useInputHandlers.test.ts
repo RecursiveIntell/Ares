@@ -60,9 +60,9 @@ describe('shouldAllowIdleHotkeyExit', () => {
   })
 })
 
-describe('resolveCtrlCComposerAction — draft wins over interrupt', () => {
-  it('clears a non-empty composer even while the agent is streaming', () => {
-    expect(resolveCtrlCComposerAction({ busy: true, hasDraft: true, hasSession: true })).toBe('clear')
+describe('resolveCtrlCComposerAction — Stop and draft discard are distinct', () => {
+  it('requests Stop while preserving a non-empty composer during a running turn', () => {
+    expect(resolveCtrlCComposerAction({ busy: true, hasDraft: true, hasSession: true })).toBe('interrupt')
   })
 
   it('interrupts a running turn when the composer is empty', () => {

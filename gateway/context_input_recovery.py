@@ -9,6 +9,17 @@ from gateway.context_input import GatewayContextInput, input_authorizer
 from hermes_state_continuity import ContextContinuationError
 
 
+def _dispatch_governor_mode() -> str:
+    try:
+        from hermes_cli.config import load_config
+
+        section = (load_config() or {}).get("dispatch_governor") or {}
+        mode = section.get("mode", "observe") if isinstance(section, dict) else "observe"
+    except Exception:
+        mode = "observe"
+    return mode if mode in {"observe", "enforce"} else "observe"
+
+
 def schedule_input_recovery(runner, platform=None):
     """Native discovery is not execution authority; ordinary turn owns custody."""
     from gateway.run import _profile_runtime_scope, logger
@@ -42,7 +53,12 @@ def schedule_input_recovery(runner, platform=None):
                 if not receipts:
                     continue
                 if phase is not None and phase["state"] not in {"answered", "cancelled"}:
-                    if phase["dispatch_attempts"] or phase["attempts"] >= 3 or time.time() >= phase["deadline_at"]:
+                    if phase["dispatch_attempts"]:
+                        if _dispatch_governor_mode() != "enforce":
+                            continue
+                        if not db.abandon_unsent_context_dispatch(entry.session_id, governor_mode="enforce"):
+                            continue
+                    if phase["attempts"] >= 3 or time.time() >= phase["deadline_at"]:
                         continue
                     if phase["state"] == "active" and _process_identity(phase["controller_pid"]) == phase["process_identity"]:
                         continue

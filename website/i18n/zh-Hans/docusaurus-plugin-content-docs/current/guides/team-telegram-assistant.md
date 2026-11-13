@@ -375,7 +375,7 @@ Cron 任务的 prompt 在完全全新的会话中运行，不保留任何先前�
 ```bash
 # 在 ~/.hermes/.env 中
 TERMINAL_BACKEND=docker
-TERMINAL_DOCKER_IMAGE=nikolaik/python-nodejs:python3.11-nodejs20
+TERMINAL_DOCKER_IMAGE=nikolaik/python-nodejs:python3.14-nodejs26
 ```
 
 或在 `~/.hermes/config.yaml` 中：

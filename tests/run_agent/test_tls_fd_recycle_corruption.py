@@ -346,17 +346,57 @@ def test_agent_abort_request_openai_client_does_not_call_client_close(caplog):
     # And critically: client.close() never ran here.
     client.close.assert_not_called()
 
-    # The log line is parseable: same ``tcp_force_closed=N`` field shape as
-    # the existing ``close`` log so dashboards keep working, plus a
-    # ``deferred_close=stranger_thread`` marker to make the new path
-    # observable in production triage.
+    # The initial abort record is provisional. It reports the transport action
+    # without claiming the provider request's eventual outcome.
     msgs = [r.getMessage() for r in caplog.records]
     assert any(
-        "OpenAI client aborted (interrupt_abort" in m
+        "OpenAI client abort requested (interrupt_abort" in m
         and "tcp_force_closed=1" in m
         and "deferred_close=stranger_thread" in m
+        and "outcome=pending" in m
         for m in msgs
     ), f"missing abort log line; got: {msgs!r}"
+
+
+def test_zero_socket_abort_is_downgraded_after_worker_settles(caplog):
+    from agent.chat_completion_helpers import _resolve_request_abort_outcome
+
+    worker = threading.Thread(target=lambda: None)
+    worker.start()
+
+    with caplog.at_level(logging.INFO, logger="agent.chat_completion_helpers"):
+        outcome = _resolve_request_abort_outcome(
+            worker,
+            reason="interrupt_abort",
+            shutdown_count=0,
+            grace_seconds=0.5,
+        )
+
+    assert outcome == "worker_settled"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("cooperative worker settlement" in message for message in messages)
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+
+
+def test_zero_socket_abort_warns_only_when_the_worker_remains_live(caplog):
+    from agent.chat_completion_helpers import _resolve_request_abort_outcome
+
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait)
+    worker.start()
+    try:
+        with caplog.at_level(logging.WARNING, logger="agent.chat_completion_helpers"):
+            outcome = _resolve_request_abort_outcome(
+                worker,
+                reason="interrupt_abort",
+                shutdown_count=0,
+                grace_seconds=0,
+            )
+        assert outcome == "worker_still_running"
+        assert any("worker_settled=false" in record.getMessage() for record in caplog.records)
+    finally:
+        release.set()
+        worker.join(timeout=1)
 
 
 

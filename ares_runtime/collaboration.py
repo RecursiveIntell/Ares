@@ -2631,6 +2631,15 @@ _ADAPTER: contextvars.ContextVar[PermitReceiptAdapter | None] = contextvars.Cont
     "ares_permit_adapter", default=None
 )
 _EFFECTFUL_TOOLS = frozenset({
+    # Task 2.1: effects the audit named as absent from classification. Each one
+    # runs a side effect (scheduled job, process, skill write, MCP setup, child
+    # delegation) and must reach the same owner as the existing effect tools.
+    "cronjob",
+    "process",
+    "skill_manage",
+    "setup_mcp",
+    "delegate_task",
+    "memory",
     "write_file",
     "patch",
     "terminal",
@@ -2653,7 +2662,30 @@ _EFFECTFUL_TOOLS = frozenset({
     "bfl_flux3_text_to_video",
     "bfl_flux3_video_continuation",
 })
+def _tool_declared_effect_schema(module: str, attribute: str) -> Mapping[str, Any] | None:
+    """Return a tool's own declared parameter schema, or None if unavailable.
+
+    Derived from the tool's ``*_SCHEMA`` so the owner validates against what the
+    model is actually told, not a hand-maintained copy that could drift. A missing
+    module returns None and the tool then fails closed with EFFECT_SCHEMA_MISSING.
+    """
+    import importlib
+
+    try:
+        declared = getattr(importlib.import_module(module), attribute)
+    except (ImportError, AttributeError):
+        return None
+    parameters = declared.get("parameters") if isinstance(declared, Mapping) else None
+    return parameters if isinstance(parameters, Mapping) else None
+
+
 _DEFAULT_EFFECT_SCHEMAS: dict[str, Mapping[str, Any]] = {
+    "cronjob": _tool_declared_effect_schema("tools.cronjob_tools", "CRONJOB_SCHEMA"),
+    "skill_manage": _tool_declared_effect_schema("tools.skill_manager_tool", "SKILL_MANAGE_SCHEMA"),
+    "setup_mcp": _tool_declared_effect_schema("tools.setup_mcp_tool", "SETUP_MCP_SCHEMA"),
+    "delegate_task": _tool_declared_effect_schema("tools.delegate_tool", "DELEGATE_TASK_SCHEMA"),
+    "process": _tool_declared_effect_schema("tools.process_registry", "PROCESS_SCHEMA"),
+    "memory": _tool_declared_effect_schema("tools.memory_tool", "MEMORY_SCHEMA"),
     "write_file": {
         "type": "object",
         "required": ["path", "content"],
@@ -2827,8 +2859,22 @@ def validate_effect_args(args: Any, schema: Mapping[str, Any]) -> None:
     if required - set(args):
         raise ContractError("MISSING_FIELD", sorted(required - set(args))[0])
     for key, spec in schema.get("properties", {}).items():
-        if key in args and not _exact_type(args[key], spec.get("type")):
+        if key in args and not _spec_accepts(args[key], spec):
             raise ContractError("COERCION_REQUIRED", key)
+
+
+def _spec_accepts(value: Any, spec: Any) -> bool:
+    """Exact-type check for one property spec, including ``anyOf``/``oneOf`` unions.
+
+    A union branch must match its declared type exactly; nothing is coerced. A
+    spec that declares neither ``type`` nor a union stays fail-closed.
+    """
+    if not isinstance(spec, Mapping):
+        return False
+    union = spec.get("anyOf", spec.get("oneOf"))
+    if isinstance(union, list) and union:
+        return any(_spec_accepts(value, branch) for branch in union)
+    return _exact_type(value, spec.get("type"))
 
 
 def target_for(tool_name: str, args: Mapping[str, Any]) -> str:

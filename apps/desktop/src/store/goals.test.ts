@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $gateway } from './gateway'
-import { $goalsBySession, applyGoalStatusText, clearSessionGoal, refreshSessionGoal } from './goals'
+import { $goalsBySession, applyGoalState, applyGoalStatusText, clearSessionGoal, refreshSessionGoal } from './goals'
 import { resetSessionGone } from './session-gone'
 
 describe('goal store', () => {
@@ -125,5 +125,72 @@ describe('goal store', () => {
     applyGoalStatusText('s2', '⏸ Goal (paused, 20/20 turns): other work', { hydrate: true })
 
     expect($goalsBySession.get().s2).toMatchObject({ status: 'paused', title: 'other work' })
+  })
+
+  // The backend's `GoalManager.status_line()` emits these shapes for a live
+  // goal. The original parser only understood `⊙ Goal (…active…):`, so every
+  // `⊙ Goal active · …` line fell through and the chip kept whatever it last
+  // understood — typically "Goal waiting" forever.
+  it('parses every active/waiting line the backend actually emits', () => {
+    const cases: Array<[string, string]> = [
+      ['⊙ Goal active · running (4/20 turns): ship the feature', 'active'],
+      ['⊙ Goal active · waiting for authority (4/20 turns): ship the feature', 'waiting'],
+      ['⊙ Goal active · blocked (4/20 turns): ship the feature', 'active'],
+      ['⊙ Goal active · checkpointed · continuation pending (4/20 turns): ship the feature', 'active'],
+      ['⊙ Goal active · turn budget exhausted (20/20 turns): ship the feature', 'active'],
+      ['⏳ Goal active · waiting (30s — CI, 4/20 turns): ship the feature', 'waiting'],
+      ['⏳ Goal (parked on pid 42, 4/20 turns): ship the feature', 'waiting'],
+      ['⊙ Goal set (20-turn budget): ship the feature', 'active'],
+      ['⏸ Goal (paused, 4/20 turns): ship the feature', 'paused'],
+      ['✓ Goal done (4/20 turns): ship the feature', 'done']
+    ]
+
+    for (const [line, status] of cases) {
+      applyGoalStatusText('s1', line)
+
+      expect($goalsBySession.get().s1, line).toMatchObject({
+        status,
+        title: 'ship the feature'
+      })
+      clearSessionGoal('s1')
+    }
+  })
+
+  it('applies authoritative structured goal state', () => {
+    applyGoalState('s1', {
+      max_turns: 20,
+      outcome: 'CONTINUATION_REQUIRED',
+      status: 'active',
+      title: 'ship it',
+      turns_used: 3
+    })
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'active', title: 'ship it' })
+
+    applyGoalState('s1', { outcome: 'WAITING_FOR_AUTHORITY', status: 'active', title: 'ship it' })
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'waiting', title: 'ship it' })
+
+    applyGoalState('s1', { status: 'paused', title: 'ship it' })
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'paused' })
+
+    applyGoalState('s1', { status: 'done', title: 'ship it' })
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'done' })
+
+    applyGoalState('s1', { status: 'cleared', title: 'ship it' })
+
+    expect($goalsBySession.get().s1).toBeUndefined()
+  })
+
+  it('structured state clears a stale waiting pill', () => {
+    applyGoalStatusText('s1', '⏳ Goal (parked on pid 42, 4/20 turns): ship it')
+
+    expect($goalsBySession.get().s1?.status).toBe('waiting')
+
+    applyGoalState('s1', { outcome: 'GOAL_ACTIVE', status: 'active', title: 'ship it', waiting: false })
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'active', title: 'ship it' })
   })
 })

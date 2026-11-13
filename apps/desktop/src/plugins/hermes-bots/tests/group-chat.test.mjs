@@ -6,6 +6,23 @@ import vm from 'node:vm'
 
 const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
+// Evaluate the actual rendered working-line expression, not a copied model of
+// its priority rules. The surrounding component remains in the plugin owner.
+function renderedWorkingLine(room, roomClarifies = []) {
+  const component = pluginSource.indexOf('function GroupChatWorkspace(')
+  assert.ok(component >= 0, 'group workspace exists')
+  const prefix = 'children: room.turns?.some('
+  const start = pluginSource.indexOf(prefix, component)
+  const end = pluginSource.indexOf("\n                }, 'working')", start)
+  assert.ok(start >= component && end > start, 'working-line expression exists')
+  const expression = pluginSource.slice(start + 'children: '.length, end).trim()
+  return vm.runInNewContext(`(${expression})`, {
+    room,
+    roomClarifies,
+    groupSpeakerLabel: member => member.name
+  })
+}
+
 /** Load the plugin in a vm with a scripted cli.exec so member turns are
  *  deterministic. `turnScript(profile, prompt)` returns the member's reply
  *  text (or throws to simulate a failed turn). */
@@ -1689,6 +1706,33 @@ test('source contract: the working line names the member on turn', () => {
   assert.match(pluginSource, /is thinking…/)
   assert.match(pluginSource, /room\.turn = turns\.find/)
   assert.match(pluginSource, /r\.turn = null/)
+})
+
+test('source contract: queued turns are named, never reduced to a generic working line', () => {
+  // The nameless "The room is working…" fallback must be unreachable while
+  // queued/budget-queued turns exist — starved pumps told the user nothing
+  // before (who is waiting, whether anything was even started).
+  assert.match(pluginSource, /waiting for a turn slot…/)
+  assert.match(pluginSource, /turn\.phase === 'budget-queued'/)
+})
+
+test('rendered working line names queued members without implying they are thinking', () => {
+  const room = { turns: [
+    { phase: 'queued', member: { name: 'alpha' } },
+    { phase: 'budget-queued', member: { name: 'beta' } }
+  ] }
+  assert.equal(renderedWorkingLine(room), 'alpha, beta waiting for a turn slot…')
+})
+
+test('rendered working line preserves actionable clarification ahead of queued peers', () => {
+  const room = { turns: [{ phase: 'queued', member: { name: 'alpha' } }] }
+  assert.equal(renderedWorkingLine(room, [{ requestId: 'needs-user-answer' }]), 'Waiting for your answer…')
+})
+
+test('rendered working line preserves active and stop-state priority over the queue', () => {
+  const queued = { phase: 'queued', member: { name: 'alpha' } }
+  assert.equal(renderedWorkingLine({ turns: [queued, { phase: 'running', member: { name: 'beta' } }] }), 'beta is thinking…')
+  assert.equal(renderedWorkingLine({ turns: [queued, { phase: 'stop-unconfirmed', member: { name: 'beta' } }] }), 'Interruption is unconfirmed. Stop can retry.')
 })
 
 test('source contract: creating a group with a taken name mints a fresh room, never reopens the old log', () => {

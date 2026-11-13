@@ -453,6 +453,17 @@ DEFAULT_CONTEXT_LENGTHS = {
     # GPT-5.6 series (Sol/Terra/Luna, GA 2026-07-09) — 1.05M on the direct
     # OpenAI API (same as gpt-5.5). Codex OAuth caps these at 272K.
     # (Lookups length-sort keys at match time, so dict order is cosmetic.)
+    # GPT-6 series (gpt-6.1-sol / gpt-6.1-terra / gpt-6-luna) is the family
+    # actually in use for Codex auxiliary work. No catalog entry existed, so a
+    # host without a prior live probe resolved these to the 256K default —
+    # an understatement for a model observed accepting 832K-token prompts
+    # (see the gpt-6.1-sol/gpt-6-luna observation noted in the token-weight
+    # discussion below) and resolving to 1,050,000 on a probed host.
+    # Explicit slugs rather than a bare "gpt-6" prefix so unknown future
+    # variants keep falling back instead of inheriting an unverified window.
+    "gpt-6.1-sol": 1050000,
+    "gpt-6.1-terra": 1050000,
+    "gpt-6-luna": 1050000,
     "gpt-5.6-luna": 1050000,
     "gpt-5.6-terra": 1050000,
     "gpt-5.6-sol": 1050000,
@@ -485,7 +496,13 @@ DEFAULT_CONTEXT_LENGTHS = {
     # and inherit the same 1M window. The ``deepseek`` substring entry
     # below remains as a 128K fallback for older / unknown DeepSeek model
     # ids (e.g. via custom endpoints).
+    # The dotted ``deepseek-v4.1`` generation (pro / flash, including Ollama
+    # ``:cloud`` and ``:latest`` suffixes) also ships a 1M window; it is a
+    # separate key because the dotted id does not contain ``deepseek-v4-pro``
+    # or ``deepseek-v4-flash`` as substrings and previously fell through to the
+    # 128K catch-all. Longest-key matching picks it over ``deepseek``.
     # https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+    "deepseek-v4.1": 1_000_000,
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
     "deepseek-chat": 1_000_000,

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-import hashlib
 import json
 import logging
 from contextlib import contextmanager, nullcontext
@@ -24,7 +23,6 @@ from agent.model_metadata import estimate_request_tokens_rough
 from hermes_cli.goals import GoalState
 
 from .budget import stateless_payload_token_upper_bound
-from .compiler import Mode
 from .live import LiveContinuationError, build_live_candidate
 
 
@@ -197,15 +195,13 @@ def _codex_sdk_request_body(payload):
     checked separately, before any trusted transport derivation.
     """
     try:
-        from openai._base_client import _merge_mappings
-        body = {key: value for key, value in payload.items()
-                if key not in {"extra_body", "timeout", "extra_headers", "headers"}}
-        extra = payload.get("extra_body")
-        if extra is not None:
-            if type(extra) is not dict:
-                raise ContextDispatchError("CONTEXT_DISPATCH_WIRE_OVERRIDE_UNQUALIFIED")
-            body = _merge_mappings(body, extra)
-        return body
+        from ares_runtime.managed_calls import openai_sdk_request_body
+        from ares_runtime.collaboration import ContractError
+
+        try:
+            return openai_sdk_request_body(payload)
+        except ContractError as exc:
+            raise ContextDispatchError(exc.code) from None
     except ContextDispatchError:
         raise
     except Exception:
@@ -267,7 +263,9 @@ class ContextDispatchPhysicalScope:
             from ares_runtime.physical_dispatch import _restore_call, bind_deferred_result
             # A new callback may be a changed request or fallback route. Only
             # SDK-internal physical retries share this logical materialization.
-            self._model_call_basis = produce_dispatch_materialization(self.agent, payload, purpose="conversation")
+            self._model_call_basis = produce_dispatch_materialization(
+                self.agent, payload, purpose="conversation", execution_id=self.attempt_id
+            )
             with _restore_call(self._model_call_basis):
                 response = callback(payload)
                 return bind_deferred_result(response, self._model_call_basis)
@@ -675,14 +673,24 @@ def _active_goal_required(db: Any, session_id: str) -> bool:
     return state.status != "cleared"
 
 
+class ReconciliationMarkerError(RuntimeError):
+    """The durable reconciliation marker could not be written (audit L5).
+
+    Raised instead of being swallowed, so a failed rebase that also cannot be
+    marked durably is visible to the caller rather than silently forgotten.
+    """
+
+
 def _mark_reconciliation_required(db: Any, transition_id: str) -> None:
     marker = getattr(type(db), "mark_context_rebase_reconciliation_required", None)
     if not callable(marker):
         return
     try:
         marker(db, transition_id)
-    except Exception:
-        pass
+    except Exception as exc:
+        raise ReconciliationMarkerError(
+            f"could not durably mark transition {transition_id} for reconciliation"
+        ) from exc
 
 
 def _carry_session_scoped_state(
@@ -1229,11 +1237,19 @@ def reconcile_context_rebase(
         if custody is not None:
             custody.complete_context_rebase_adoption(holder, child_session_id, reconciled_custody)
     except Exception as exc:
+        marker_failure = None
         if db is not None and transition_id is not None:
-            _mark_reconciliation_required(db, transition_id)
+            try:
+                _mark_reconciliation_required(db, transition_id)
+            except ReconciliationMarkerError as marker_exc:
+                # Keep the original reconciliation outcome, but do not drop the
+                # fact that the durable marker also failed (audit L5).
+                marker_failure = str(marker_exc)
         code = str(exc) if isinstance(exc, AutomaticRebaseError) else getattr(
             exc, "code", "CONTEXT_REBASE_RECONCILIATION_FAILED"
         )
+        if marker_failure is not None:
+            code = f"{code};RECONCILIATION_MARKER_NOT_DURABLE"
         return AutomaticRebaseResult(
             AutomaticRebaseStatus.RECONCILIATION_REQUIRED, str(code), child_session_id,
             transition_id=transition_id, before_tokens=before_tokens, after_tokens=after_tokens,

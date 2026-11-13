@@ -17,10 +17,10 @@ Usage:
     python mini_swe_runner.py --task "Create a hello world Python script" --env local
     
     # Run with Docker
-    python mini_swe_runner.py --task "List files in /tmp" --env docker --image python:3.11-slim
+    python mini_swe_runner.py --task "List files in /tmp" --env docker --image python:3.14-slim
     
     # Run with Modal (cloud)
-    python mini_swe_runner.py --task "Install numpy and test it" --env modal --image python:3.11-slim
+    python mini_swe_runner.py --task "Install numpy and test it" --env modal --image python:3.14-slim
     
     # Batch mode from JSONL file
     python mini_swe_runner.py --prompts_file prompts.jsonl --output_file trajectories.jsonl --env docker
@@ -116,7 +116,7 @@ TERMINAL_TOOL_DEFINITION = {
 
 def create_environment(
     env_type: str = "local",
-    image: str = "python:3.11-slim",
+    image: str = "python:3.14-slim",
     cwd: str = "/tmp",
     timeout: int = 60,
     **kwargs
@@ -166,7 +166,7 @@ class MiniSWERunner:
         base_url: str = None,
         api_key: str = None,
         env_type: str = "local",
-        image: str = "python:3.11-slim",
+        image: str = "python:3.14-slim",
         cwd: str = "/tmp",
         max_iterations: int = 15,
         command_timeout: int = 60,
@@ -635,7 +635,7 @@ def main(
     base_url: str = None,
     api_key: str = None,
     env: str = "local",
-    image: str = "python:3.11-slim",
+    image: str = "python:3.14-slim",
     cwd: str = "/tmp",
     max_iterations: int = 15,
     timeout: int = 60,
@@ -652,7 +652,7 @@ def main(
         base_url: API base URL (optional)
         api_key: API key (optional, uses env vars)
         env: Environment type - "local", "docker", or "modal"
-        image: Docker/Modal image (default: python:3.11-slim)
+        image: Docker/Modal image (default: python:3.14-slim)
         cwd: Working directory (default: /tmp)
         max_iterations: Maximum tool-calling iterations (default: 15)
         timeout: Command timeout in seconds (default: 60)

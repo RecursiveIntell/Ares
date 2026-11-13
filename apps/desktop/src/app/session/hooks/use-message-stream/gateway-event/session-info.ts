@@ -350,6 +350,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
 
             return {
               ...state,
+              activity: typeof payload!.activity === 'string' ? payload!.activity : null,
               busy,
               reconnecting: false,
               // running=true from the backend is turn-live proof, same as
@@ -405,6 +406,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
 
           return {
             ...state,
+            activity: null,
             awaitingResponse: false,
             busy,
             interruptPending: busy ? state.interruptPending : false,

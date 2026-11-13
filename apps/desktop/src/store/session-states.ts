@@ -558,6 +558,13 @@ export function clearAllSessionStates() {
  *  the user must explicitly answer. */
 export function reconcileBusyStatesOnReconnect(scope?: string) {
   const states = $sessionStates.get()
+  // Durable sessions whose in-flight turn lost its runtime binding here. The
+  // backend keeps such a turn running only until `detached_execution_max_s`
+  // (300s) and then interrupts it, and ONLY a session.resume for that session
+  // cancels the timer. The foreground route and open tiles resume themselves;
+  // every other running session (background rows, closed tiles) must be
+  // rebound here or it is killed mid-work five minutes after a socket drop.
+  const retiredStoredIds = new Set<string>()
 
   for (const [runtimeId, state] of Object.entries(states)) {
     if (!state || (!state.busy && !state.awaitingResponse)) {
@@ -568,6 +575,10 @@ export function reconcileBusyStatesOnReconnect(scope?: string) {
 
     if (scope === undefined ? recorded !== undefined : recorded !== scope) {
       continue
+    }
+
+    if (state.busy && state.storedSessionId) {
+      retiredStoredIds.add(state.storedSessionId)
     }
 
     sessionTileDelegate()?.retireBusyClaim?.(runtimeId)
@@ -594,6 +605,28 @@ export function reconcileBusyStatesOnReconnect(scope?: string) {
 
     setBusy(unresolved)
     setAwaitingResponse(Boolean(state?.awaitingResponse || state?.reconnecting))
+  }
+
+  rebindRetiredBusySessions(retiredStoredIds)
+}
+
+/** Resume each durable session whose running turn lost its runtime id so the
+ *  backend cancels its detached-orphan reaper. `force` because the cached
+ *  binding is exactly the one the reconnect just proved stale; the shared
+ *  single-flight guard keeps this convergent with route/tile resumes. Failure
+ *  is non-fatal here: the session stays `reconnecting` and the user-facing
+ *  recovery paths (submit/stop/route resume) still apply. */
+function rebindRetiredBusySessions(storedIds: ReadonlySet<string>) {
+  const delegate = sessionTileDelegate()
+
+  if (!delegate?.resumeTile) {
+    return
+  }
+
+  for (const storedSessionId of storedIds) {
+    void Promise.resolve()
+      .then(() => delegate.resumeTile(storedSessionId, { force: true }))
+      .catch(() => undefined)
   }
 }
 

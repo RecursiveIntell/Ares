@@ -13,6 +13,11 @@ export interface QueuedPromptEntry {
    *  text the agent receives. A queued `/skill` invocation carries the whole
    *  expanded skill body as `text` — the UI shows the invocation instead. */
   displayText?: string
+  /** Why this entry is waiting, when it is not just "after the current turn".
+   *  A message typed while an approval/sudo/secret prompt owns the turn is
+   *  queued on purpose; saying so is the difference between "queued" and
+   *  "swallowed". */
+  note?: string
   attachments: ComposerAttachment[]
   queuedAt: number
 }
@@ -143,7 +148,7 @@ export const markQueuedPromptDeliveryUnknown = (key: string | null | undefined, 
 
 export const enqueueQueuedPrompt = (
   key: string | null | undefined,
-  payload: { text: string; attachments: ComposerAttachment[]; displayText?: string }
+  payload: { text: string; attachments: ComposerAttachment[]; displayText?: string; note?: string }
 ): null | QueuedPromptEntry => {
   const sid = sidOf(key)
 
@@ -155,6 +160,7 @@ export const enqueueQueuedPrompt = (
     id: nextId(),
     text: payload.text,
     ...(payload.displayText ? { displayText: payload.displayText } : {}),
+    ...(payload.note ? { note: payload.note } : {}),
     attachments: cloneAttachments(payload.attachments),
     queuedAt: Date.now()
   }

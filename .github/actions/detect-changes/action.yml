@@ -57,6 +57,9 @@ outputs:
   current_owner_integration:
     description: Run canonical owner to Ares consumer qualification.
     value: ${{ steps.classify.outputs.current_owner_integration }}
+  exec_conformance:
+    description: Run execution-path conformance gates.
+    value: ${{ steps.classify.outputs.exec_conformance }}
   mcp_catalog:
     description: Require MCP catalog security review label.
     value: ${{ steps.classify.outputs.mcp_catalog }}
@@ -88,8 +91,11 @@ runs:
         set -euo pipefail
 
         # Only pull_request events are gated. Other events (push, release,
-        # dispatch) leave CHANGED empty, so the classifier fails open and every
-        # lane runs. Post-merge / on-demand validation is never weakened.
+        # dispatch, merge_group) leave CHANGED empty, so the classifier fails
+        # open and every lane runs. Post-merge, on-demand, and merge-queue
+        # validation is never weakened. (merge_group needs no special case:
+        # the queue must validate the full queued combination, and the
+        # temporary merge ref has no PR diff to gate on.)
         if [ "$EVENT_NAME" = "pull_request" ]; then
           # Use the compare endpoint with the pinned base/head SHAs from the
           # event payload instead of the "current PR files" endpoint. The SHAs

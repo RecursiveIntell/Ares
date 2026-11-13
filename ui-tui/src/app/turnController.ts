@@ -5,7 +5,14 @@ import {
   STREAM_SCROLL_BATCH_MS,
   STREAM_TYPING_BATCH_MS
 } from '../config/timing.js'
-import type { SessionInterruptResponse, SubagentEventPayload } from '../gatewayTypes.js'
+import { GatewayRpcError } from '../gatewayClient.js'
+import type {
+  AcceptedTurn,
+  SessionInterruptResponse,
+  SessionTurnPollResponse,
+  StopFailureData,
+  SubagentEventPayload
+} from '../gatewayTypes.js'
 import { appendToolShelfMessage, isToolShelfMessage } from '../lib/liveProgress.js'
 import { hasReasoningTag, splitReasoning } from '../lib/reasoning.js'
 import {
@@ -27,6 +34,30 @@ import { getUiState, patchUiState } from './uiStore.js'
 
 const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
+
+export type StopRecoveryState = 'stop_indeterminate' | 'stop_proven_running' | 'stop_request_pending'
+
+export const stopRecoveryStateFromError = (error: unknown): StopRecoveryState | null => {
+  if (!(error instanceof GatewayRpcError) || error.code !== 5019) {
+    return null
+  }
+
+  const data = error.data as StopFailureData
+
+  if (data.effect_disposition === 'indeterminate') {
+    return 'stop_indeterminate'
+  }
+
+  if (data.effect_disposition === 'not_applied') {
+    return 'stop_proven_running'
+  }
+
+  if (data.effect_disposition === 'not_sent') {
+    return 'stop_request_pending'
+  }
+
+  return null
+}
 
 // Extracts the raw patch from a diff-only segment produced by
 // pushInlineDiffSegment. Used at message.complete to dedupe against final
@@ -135,6 +166,45 @@ class TurnController {
   private turnEpoch = 0
   private interruptPending = false
   private messageStarted = false
+  private acceptedTurn: AcceptedTurn | null = null
+
+  recordAcceptedTurn(acceptedTurn: AcceptedTurn | undefined) {
+    this.acceptedTurn = acceptedTurn ?? null
+  }
+
+  private async reconcileIndeterminateStop({ gw, sid, sys }: InterruptDeps, epoch: number) {
+    const acceptedTurn = this.acceptedTurn
+
+    if (!acceptedTurn || acceptedTurn.session_id !== sid) {
+      return
+    }
+
+    try {
+      const projection = await gw.request<SessionTurnPollResponse>('session.turn.poll', {
+        accepted_turn: acceptedTurn,
+        session_id: sid
+      })
+
+      if (epoch !== this.turnEpoch || getUiState().sid !== sid || !getUiState().busy) {
+        return
+      }
+
+      if (projection.running) {
+        patchUiState({ status: 'Stop uncertain — original turn still running' })
+
+        return
+      }
+
+      this.interruptPending = false
+      this.idle()
+      this.clearReasoning()
+      sys('Stop reconciliation confirmed the original turn settled')
+    } catch {
+      if (epoch === this.turnEpoch && getUiState().sid === sid && getUiState().busy) {
+        patchUiState({ status: 'Stop uncertain — reconciliation unavailable' })
+      }
+    }
+  }
 
   // ── Credits notice machinery (Strategy B) ───────────────────────────
   //
@@ -326,8 +396,22 @@ class TurnController {
     } catch (error) {
       if (epoch === this.turnEpoch && getUiState().sid === sid && getUiState().busy) {
         const detail = error instanceof Error ? error.message : String(error)
-        sys(`Stop was not confirmed: ${detail}`)
-        patchUiState({ status: 'Stop failed — still running' })
+        const recovery = stopRecoveryStateFromError(error)
+
+        if (recovery === 'stop_indeterminate') {
+          sys(`Stop outcome is uncertain; preserving input and awaiting reconciliation: ${detail}`)
+          patchUiState({ status: 'Stop uncertain — reconcile before retrying' })
+          void this.reconcileIndeterminateStop({ appendMessage, gw, sid, sys }, epoch)
+        } else if (recovery === 'stop_proven_running') {
+          sys(`Stop was not applied to the current turn; input preserved: ${detail}`)
+          patchUiState({ status: 'Stop not applied — turn still running' })
+        } else if (recovery === 'stop_request_pending') {
+          sys(`Stop was not sent; input preserved: ${detail}`)
+          patchUiState({ status: 'Stop not sent — turn still running' })
+        } else {
+          sys(`Stop was not confirmed: ${detail}`)
+          patchUiState({ status: 'Stop failed — still running' })
+        }
       }
 
       return
@@ -578,6 +662,7 @@ class TurnController {
     this.turnEpoch++
     this.interruptPending = false
     this.messageStarted = false
+    this.acceptedTurn = null
     this.idle()
     this.clearReasoning()
     this.clearStatusTimer()
@@ -599,6 +684,7 @@ class TurnController {
     this.turnEpoch++
     this.interruptPending = false
     this.messageStarted = false
+    this.acceptedTurn = null
     this.closeReasoningSegment()
 
     // Ink renders markdown via <Md>; the gateway's Rich-rendered ANSI

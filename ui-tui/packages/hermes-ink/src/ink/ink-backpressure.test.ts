@@ -4,7 +4,6 @@ import React from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import Text from './components/Text.js'
-import { MAX_COALESCED_BACKPRESSURE_FRAMES } from './constants.js'
 import Ink from './ink.js'
 
 // Regression for issue #31486 (stdout-backpressure strand): when the
@@ -12,9 +11,8 @@ import Ink from './ink.js'
 // overwhelmed — a wide CR+LF burst on a high-context session), the renderer
 // must COALESCE rather than pile another write on the backed-up pipe. Piling
 // writes keeps the macrotask queue hot and starves the stdin 'readable'
-// callback, which is the observed freeze. The coalesce must be bounded: after
-// MAX_COALESCED_BACKPRESSURE_FRAMES skipped frames it forces a write through
-// so a terminal whose drain callback never fires can't wedge the renderer.
+// callback, which is the observed freeze. A never-draining writable must not
+// authorize another write: Node requires waiting for the actual drain signal.
 
 /**
  * A TTY whose write() reports backpressure (returns false) and WITHHOLDS the
@@ -144,7 +142,7 @@ describe('Ink stdout backpressure coalescing (issue #31486)', () => {
     }
   })
 
-  it('forces a write through after the coalesce ceiling so it never wedges forever', () => {
+  it('never writes again while a backpressured terminal withholds drain', () => {
     vi.useFakeTimers()
 
     try {
@@ -156,17 +154,12 @@ describe('Ink stdout backpressure coalescing (issue #31486)', () => {
       const writesAfterFirst = stdout.chunks.length
 
       // Mark content dirty and drive renders. The drain callback NEVER fires
-      // (pendingDrainCount stays > 0). After MAX_COALESCED_BACKPRESSURE_FRAMES
-      // coalesced retries, the renderer must force a write through.
+      // (pendingDrainCount stays > 0), so no second write is legal.
       ink.render(React.createElement(Text, null, 'forced'))
+      vi.runOnlyPendingTimers()
 
-      // Drive enough retry ticks to exceed the ceiling.
-      for (let i = 0; i <= MAX_COALESCED_BACKPRESSURE_FRAMES + 2; i++) {
-        vi.advanceTimersByTime(4)
-      }
-
-      // A write was forced through despite the never-firing drain callback.
-      expect(stdout.chunks.length).toBeGreaterThan(writesAfterFirst)
+      expect(stdout.chunks.length).toBe(writesAfterFirst)
+      expect(stdout.pendingDrainCount).toBe(1)
 
       ink.unmount()
     } finally {
