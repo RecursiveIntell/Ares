@@ -715,6 +715,45 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertEqual(trace[2]["status"], "ok")
             self.assertIn("result_bytes", trace[2])
 
+    def test_provider_failure_is_not_reported_as_completed(self):
+        """Regression: a child whose provider call failed (HTTP 429 quota wall)
+        returns non-empty prose — "API call failed after 3 retries: ..." — as
+        its final_response. The old summary-presence heuristic counted that as
+        a successful summary and reported ``status=completed`` with
+        ``exit_reason=max_iterations``, which is doubly false: the child never
+        spent its iteration budget, and it did not complete anything.
+
+        The conversation loop already returns a structured ``failed: True`` +
+        ``failure_reason`` (agent/conversation_loop.py); the delegate must
+        honor it before any summary-based inference."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-6-luna"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "API call failed after 3 retries: HTTP 429: The usage limit has been reached",
+                "completed": False,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+                "failed": True,
+                "failure_reason": "rate_limit",
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test provider failure", parent_agent=parent))
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "failed")
+            self.assertEqual(entry["exit_reason"], "error")
+            self.assertEqual(entry["failure_reason"], "rate_limit")
+            self.assertFalse(entry["truncated"])
+            # The error text must still surface to the parent, as the failure
+            # summary — never as a successful deliverable.
+            self.assertIn("HTTP 429", entry["summary"])
+
     def test_empty_sentinel_marks_status_failed(self):
         """Regression: a child that returns the literal '(empty)' sentinel
         (emitted by run_agent.py when the LLM returns empty responses after

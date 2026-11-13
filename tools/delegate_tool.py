@@ -3127,6 +3127,14 @@ def _run_single_child(
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
+        # Structured failure signal from the child's conversation loop
+        # (agent/conversation_loop.py returns ``failed: True`` alongside
+        # ``failure_reason`` when the provider call itself failed). Check it
+        # BEFORE the summary heuristic: an error message like "API call
+        # failed after 3 retries: HTTP 429" is non-empty prose, and counting
+        # it as a successful summary reported the failure as ``completed``.
+        child_failed = bool(result.get("failed"))
+        child_failure_reason = result.get("failure_reason")
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
         # it gives up after repeated empty-LLM-response retries — typically a
@@ -3137,7 +3145,11 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
-        elif summary and not _empty_sentinel:
+        elif child_failed or _empty_sentinel:
+            # Structured failure first (provider/quota/model errors), then the
+            # empty-sentinel heuristic for children that gave up without one.
+            status = "failed"
+        elif summary:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
             # tells the parent *how* the task ended.
@@ -3186,6 +3198,12 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif child_failed:
+            # The provider call itself failed (quota, billing, transport) — the
+            # child never got to spend its iteration budget, so "max_iterations"
+            # would be a lie. Also carries the child's structured failure reason
+            # when the conversation loop provides one.
+            exit_reason = "error"
         elif completed:
             exit_reason = "completed"
         else:
@@ -3204,6 +3222,9 @@ def _run_single_child(
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
+            # Structured classification from the child's conversation loop
+            # (rate_limit / billing / model_error ...). None on success.
+            "failure_reason": child_failure_reason,
             # Explicit, parent-visible truncation flag. A subagent that
             # exhausts its per-child iteration budget still returns a summary,
             # so `status` stays "completed" (see above) — without this the
