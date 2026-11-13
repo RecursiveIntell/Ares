@@ -15624,7 +15624,7 @@ def _run_prompt_submit(
     # This entry also serves auto-continue and goal follow-ups. Required host
     # dispatch cannot fall back to a serving-process turn on those routes.
     if (not _inside_compute_host_child()
-            and _load_dashboard_process_isolation_config()["require_compute_host"]):
+            and bool(_load_dashboard_process_isolation_config().get("require_compute_host"))):
         message = "compute host required; serving-process turn denied"
         with session["history_lock"]:
             if session.get("_closing") or (
