@@ -155,6 +155,10 @@ def delegation_policy_parent(tmp_path, monkeypatch):
     parent._print_fn = None
     parent.tool_progress_callback = None
     parent.thinking_callback = None
+    # Task 2.2 (debit from parent): child construction debits a real parent
+    # budget; a bare MagicMock would be refused as unbounded.
+    from agent.iteration_budget import IterationBudget
+    parent.iteration_budget = IterationBudget(500)
     try:
         yield parent
     finally:

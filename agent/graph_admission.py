@@ -219,7 +219,7 @@ def _write_frame(stream, value):
 
 def _same_uid(stream):
     _, uid, _ = struct.unpack("3i", stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-    if uid != os.getuid():
+    if uid != os.getuid():  # windows-footgun: ok — Linux SO_PEERCRED Unix-socket peer check (class docstring: Linux-only IPC owner)
         raise ValueError("peer identity")
 
 
@@ -244,7 +244,7 @@ class GraphAdmissionSocket:
             pass
         info = self._directory.lstat()
         if (not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700
-                or info.st_uid != os.getuid()):
+                or info.st_uid != os.getuid()):  # windows-footgun: ok — Linux 0o700 directory owner check
             raise OrchestrationError("graph_admission_directory_unqualified")
         if self.endpoint.exists() or self.endpoint.is_symlink():
             raise OrchestrationError("graph_admission_endpoint_occupied")

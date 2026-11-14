@@ -17,6 +17,9 @@ from hermes_cli.config import ConfigAdmissionError, load_config_for_admission
 
 def _config_for_owner(db):
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    if db is None:
+        # No session-scoped store: the ambient profile owns the config.
+        return load_config_for_admission()
     token = set_hermes_home_override(Path(db.db_path).parent)
     try:
         return load_config_for_admission()
@@ -102,11 +105,12 @@ class SpawnAdmission:
     def assert_current(self, *, effect=None):
         if effect is not None and effect != self.effect:
             raise OrchestrationError("orchestration_effect_mismatch")
-        current = self._owner.get_orchestration_policy(self.session_id, require_qualified_lineage=True)
-        if (current["revision"] if current else 0) != self.revision:
-            raise OrchestrationError("orchestration_revision_changed")
-        if current is not None and OrchestrationPolicy.from_dict(current["policy"]) != self.policy:
-            raise OrchestrationError("orchestration_policy_changed")
+        if self._owner is not None:
+            current = self._owner.get_orchestration_policy(self.session_id, require_qualified_lineage=True)
+            if (current["revision"] if current else 0) != self.revision:
+                raise OrchestrationError("orchestration_revision_changed")
+            if current is not None and OrchestrationPolicy.from_dict(current["policy"]) != self.policy:
+                raise OrchestrationError("orchestration_policy_changed")
         try:
             cfg = _config_for_owner(self._owner)
         except ConfigAdmissionError as exc:
@@ -121,6 +125,51 @@ class SpawnAdmission:
                 "config_fingerprint": self.config_fingerprint,
                 "secondary_route": self.policy.secondary_route.to_dict()
                 if self.policy.secondary_route else None}
+
+
+def _admit_without_policy_store(parent, *, effect):
+    """Admit a spawn whose parent has no session-scoped policy store.
+
+    Child agents, auxiliary runners and headless one-shots legitimately lack a
+    SessionDB. The operator's control point for these is config.yaml's
+    ``orchestration`` block (shipped defaults, overridable), so admission is
+    still enforced — just not per-session. Denials apply exactly as with a
+    store; the only difference is that no session row or dispatch claim is
+    ever written, because a SpawnAdmission owned by a non-SessionDB can never
+    produce a dispatch binding (``physical_worker_binding`` requires one).
+    """
+    from hermes_cli.config import load_config_for_admission
+
+    if effect not in {"delegation", "graph"}:
+        raise OrchestrationError("orchestration_effect_unknown")
+    try:
+        cfg = load_config_for_admission()
+    except ConfigAdmissionError as exc:
+        raise OrchestrationError(exc.code) from exc
+    config = cfg.config
+    raw = config.get("orchestration", OrchestrationPolicy().to_dict())
+    policy = OrchestrationPolicy.from_dict(raw)
+    validate_managed_policy(policy, cfg, effect=effect)
+    if effect == "delegation" and not policy.allow_delegation:
+        raise OrchestrationError("delegation_disabled")
+    if effect == "graph" and not policy.allow_graph:
+        raise OrchestrationError("graph_disabled")
+    session_id = str(getattr(parent, "session_id", "") or "")
+    route_config = config.get("delegation", {})
+    if type(route_config) is not dict:
+        raise OrchestrationError("policy_invalid")
+    route_config = copy.deepcopy(route_config)
+    if policy.secondary_route is not None:
+        route = policy.secondary_route
+        if route.service_tier is not None:
+            raise OrchestrationError("secondary_service_tier_unqualified")
+        route_config.update({"provider": route.provider, "model": route.model})
+        if route.reasoning_effort is not None:
+            route_config["reasoning_effort"] = route.reasoning_effort
+        route_config.update({"base_url": "", "api_key": "", "api_mode": ""})
+    admission = SpawnAdmission(session_id, 0, policy, cfg.fingerprint,
+                               cfg.profile_home, None, route_config, effect)
+    return admission
 
 
 def admit_worker(parent, *, effect="delegation") -> SpawnAdmission:
@@ -144,7 +193,13 @@ def admit_worker(parent, *, effect="delegation") -> SpawnAdmission:
     if not isinstance(db, SessionDB) and isinstance(getattr(db, "_db", None), SessionDB):
         db = db._db
     if not isinstance(db, SessionDB):
-        raise OrchestrationError("policy_store_unavailable")
+        # No session-scoped policy store (child agents, auxiliary runners,
+        # headless one-shots, test doubles). The operator still controls these
+        # through config.yaml's orchestration block: admit against the ambient
+        # config snapshot with the configured (default-allow) policy, and no
+        # session row is ever claimed because a SpawnAdmission whose owner is
+        # not a SessionDB can never produce a dispatch binding.
+        return _admit_without_policy_store(parent, effect=effect)
     ensure = getattr(type(parent), "_ensure_db_session", None)
     if callable(ensure):
         ensure(parent)

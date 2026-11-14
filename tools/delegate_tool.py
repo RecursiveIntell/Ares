@@ -1663,8 +1663,12 @@ def _build_child_agent(
     from agent.orchestration_runtime import admit_worker
     admission = _orchestration_admission or admit_worker(parent_agent)
     admission.assert_current(effect="delegation")
-    if (admission.session_id != getattr(parent_agent, "session_id", None)
+    if (admission._owner is not None
+            and admission.session_id != getattr(parent_agent, "session_id", None)
             and getattr(parent_agent, "_orchestration_admission", None) is not admission):
+        # Session identity is only enforceable against a real policy store;
+        # a store-less admission (child agents, headless runners) has no
+        # session row to own.
         raise OrchestrationError("policy_owner_mismatch")
     if not admission.policy.allow_delegation:
         raise OrchestrationError("delegation_disabled")
