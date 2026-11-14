@@ -231,6 +231,11 @@ class DispatchGovernor:
             raise
 
         if current.is_terminal:
+            if self.mode == "enforce":
+                raise EgressDispatchDenied(
+                    "DISPATCH_EXECUTION_TERMINAL",
+                    "terminal execution cannot admit another physical send",
+                )
             return None
         try:
             if current.state in {"admitted", "materialized"}:
@@ -261,8 +266,18 @@ class DispatchGovernor:
                     store.append_dispatch_intent(execution_id, intent)
                     return _GovernorTicket(store, execution_id, self.mode, intent)
                 if current.is_terminal:
+                    if self.mode == "enforce":
+                        raise EgressDispatchDenied(
+                            "DISPATCH_EXECUTION_TERMINAL",
+                            "execution became terminal before physical-send admission",
+                        ) from exc
                     return None
             if exc.code == "ALREADY_TERMINAL":
+                if self.mode == "enforce":
+                    raise EgressDispatchDenied(
+                        "DISPATCH_EXECUTION_TERMINAL",
+                        "execution became terminal before physical-send admission",
+                    ) from exc
                 return None
             if self.mode == "enforce":
                 raise EgressDispatchDenied(

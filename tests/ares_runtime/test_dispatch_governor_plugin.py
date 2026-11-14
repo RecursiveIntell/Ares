@@ -101,10 +101,12 @@ def test_governor_ignores_non_physical_phases_and_missing_execution_id(db):
     assert governor(payload=no_id, dispatch_phase="physical_send") is None
 
 
-def test_governor_does_not_transition_a_terminal_record(db):
+def test_governor_denies_terminal_record_without_mutation(db):
     governor = DispatchGovernor(store_factory=lambda: db, mode="enforce")
     db.transition_execution_record("turn:api:1:0", ExecutionState.DENIED.value)
-    assert governor(payload=_observation(), dispatch_phase="physical_send") is None
+    with pytest.raises(EgressDispatchDenied) as error:
+        governor(payload=_observation(), dispatch_phase="physical_send")
+    assert error.value.code == "DISPATCH_EXECUTION_TERMINAL"
     assert db.read_execution_record("turn:api:1:0").state == "denied"
 
 
