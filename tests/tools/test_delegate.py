@@ -438,18 +438,25 @@ class TestDelegateTask(unittest.TestCase):
         finally:
             parent_db.close()
 
-    def test_child_without_policy_owner_is_refused_before_construction(self):
-        """The new enforcement contract replaces the old store-less fail-open path."""
-        from agent.orchestration_policy import OrchestrationError
+    def test_child_without_policy_owner_admits_against_config(self):
+        """Store-less parents (child agents, headless runners, test doubles)
+        are admitted against the ambient config's orchestration block: the
+        operator's control point for contexts with no session-scoped policy
+        store. Denials still apply — a config that disables delegation is
+        refused before construction. No session row or dispatch claim is
+        written for these admissions (their SpawnAdmission can never produce
+        a dispatch binding)."""
         parent = _make_mock_parent(depth=0)
         parent._session_db = None
         with patch("run_agent.AIAgent") as constructor:
-            with self.assertRaises(OrchestrationError) as caught:
-                _build_child_agent(task_index=0, goal="test", context=None,
-                    toolsets=None, model="test-model", max_iterations=5,
-                    parent_agent=parent, task_count=1)
-        self.assertEqual(caught.exception.code, "policy_store_unavailable")
-        constructor.assert_not_called()
+            child = _build_child_agent(task_index=0, goal="test", context=None,
+                toolsets=None, model="test-model", max_iterations=5,
+                parent_agent=parent, task_count=1)
+        admission = child._orchestration_admission
+        self.assertEqual(type(admission).__name__, "SpawnAdmission")
+        self.assertIsNone(admission._owner)
+        self.assertTrue(admission.policy.allow_delegation)
+        constructor.assert_called_once()
 
     def test_child_dedicated_db_follows_parents_db_path(self):
         """Per-profile parents: the child's dedicated handle must target the

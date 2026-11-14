@@ -7116,6 +7116,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             total_messages, total_tool_calls, row_ids = self._insert_message_rows(
                 conn, child_session_id, input_messages
             )
+            # Orchestration policy inheritance, mirroring _insert_session_row:
+            # a compression child must carry its parent's effective policy in
+            # the SAME owner transaction, or a later create_session(parent=
+            # child) hits the unqualified-lineage guard. The parent row is
+            # pre-existing, so its record is read without the lineage
+            # requirement.
+            inherited = self._read_orchestration_record(
+                conn, parent_session_id, require_qualified_lineage=False,
+            )
+            if inherited is None:
+                # Legacy parent with no session-scoped policy: snapshot the
+                # declared effective default permission record.
+                from agent.orchestration_runtime import _config_for_owner
+                from agent.orchestration_policy import OrchestrationPolicy
+                snapshot = _config_for_owner(self)
+                inherited = {"policy": OrchestrationPolicy.from_dict(
+                    snapshot.config["orchestration"]).to_dict(),
+                    "revision": 0, "source_message_id": None}
+            conn.execute("""INSERT OR IGNORE INTO session_orchestration_policy
+                (session_id,revision,policy_json,origin,source_message_id)
+                VALUES(?,1,?,?,?)""", (child_session_id,
+                json.dumps(inherited["policy"], sort_keys=True, separators=(",", ":")),
+                f"inherit:{parent_session_id}:{inherited['revision']}",
+                inherited["source_message_id"]))
             input_sources = self._bind_compacted_context_inputs_on_conn(conn, parent_session_id,
                 child_session_id, input_messages, row_ids)
             self._record_context_message_projections_on_conn(conn, parent_session_id,

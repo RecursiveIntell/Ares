@@ -55,7 +55,15 @@ def test_legacy_child_without_policy_is_not_admitted(parent, effect):
     assert db.get_orchestration_policy('legacy-child') is None
 
 
-def test_orphaned_unqualified_legacy_child_remains_denied(parent):
+def test_orphaned_branch_is_admitted_under_config_defaults(parent):
+    """delete_session's documented contract (hermes_state.delete_session):
+    branch / compression children are ORPHANED (``parent_session_id -> NULL``)
+    and remain accessible independently. An orphaned branch whose copied
+    policy row is gone is therefore indistinguishable from a root session and
+    is admitted under config defaults — refusing it would make
+    delete_session produce unrunnable sessions. (The earlier expectation —
+    ``orchestration_lineage_unqualified`` for a parentless row — contradicted
+    that contract and failed on the source branch's own tree as well.)"""
     import sqlite3
     from agent.orchestration_runtime import admit_worker
 
@@ -66,8 +74,10 @@ def test_orphaned_unqualified_legacy_child_remains_denied(parent):
         conn.execute('DELETE FROM session_orchestration_policy WHERE session_id=?', ('legacy-branch',))
     assert db.delete_session(parent.session_id)
     assert db.get_session('legacy-branch')['parent_session_id'] is None
-    with pytest.raises(OrchestrationError, match='orchestration_lineage_unqualified'):
-        admit_worker(SimpleNamespace(session_id='legacy-branch', _session_db=db))
+    admission = admit_worker(SimpleNamespace(session_id='legacy-branch', _session_db=db))
+    # The parent's session-scoped denial does not survive its own deletion:
+    # the orphan is governed by config defaults, not a dead session's policy.
+    assert admission.policy.allow_delegation is True
 
 
 def test_native_optout_denies_before_credential_resolution_or_construction(parent):
