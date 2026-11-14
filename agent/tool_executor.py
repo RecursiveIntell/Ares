@@ -649,8 +649,27 @@ def _run_agent_tool_execution_middleware(
                 return
             begin_execution(callback)
 
+        def _worker_config_block():
+            from agent.orchestration_runtime import SpawnAdmission
+            admission = getattr(agent, "_orchestration_admission", None)
+            depth = getattr(agent, "_delegate_depth", 0)
+            if type(admission) is not SpawnAdmission and not (type(depth) is int and depth > 0):
+                return None
+            try:
+                if type(admission) is not SpawnAdmission:
+                    raise RuntimeError("policy_owner_required")
+                admission.assert_config_current()
+            except Exception as exc:
+                from agent.orchestration_policy import OrchestrationError
+                return exc.code if isinstance(exc, OrchestrationError) else "orchestration_config_unavailable"
+            return None
+
         block_message = scope_block
         block_error_type = "tool_scope_block"
+        if block_message is None:
+            block_message = _worker_config_block()
+            if block_message is not None:
+                block_error_type = "orchestration_config_block"
         if block_message is None:
             block_error_type = "plugin_block"
 
@@ -682,6 +701,13 @@ def _run_agent_tool_execution_middleware(
                 if authorization_gate is None
                 else authorization_gate.run(_resolve_pre_tool_block)
             )
+
+        # Recheck after the hook as it may itself change the config. Neither
+        # check is an atomic lease across subsequent subprocess creation.
+        if block_message is None:
+            block_message = _worker_config_block()
+            if block_message is not None:
+                block_error_type = "orchestration_config_block"
 
         guardrail_decision = None
         if block_message is None:

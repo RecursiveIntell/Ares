@@ -28,7 +28,6 @@ import os
 import threading
 import time
 import weakref
-from datetime import datetime, timedelta, timezone
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
@@ -142,22 +141,6 @@ def _child_debiting_budget(parent_agent, child_max_iterations):
     if not isinstance(parent_budget, IterationBudget):
         raise RuntimeError("delegation requires a parent iteration budget; refusing unbounded child")
     return DebitingIterationBudget(max_total=int(child_max_iterations), parent=parent_budget)
-
-
-def _resolve_child_window_not_after(window_not_after) -> Optional["datetime"]:
-    """Single owner for the child's grant window resolution.
-
-    Precedence: explicit caller value > configured dispatcher default > None.
-    An explicit ``None`` from a caller means "not supplied", NOT "force
-    disabled" — otherwise the model-facing dispatch path (which never passes
-    a window) would silently veto the configured default and every child
-    would be unbounded again. Callers who want to force-disable the window
-    for one call should set ``delegation.child_grant_window_seconds: 0``
-    in config, not pass None.
-    """
-    if window_not_after is not None:
-        return window_not_after
-    return _get_child_grant_window()
 
 
 MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected unless max_spawn_depth raised.
@@ -962,8 +945,8 @@ def _get_max_async_children() -> int:
     return _get_max_concurrent_children()
 
 
-def _get_child_timeout() -> Optional[float]:
-    """Read delegation.child_timeout_seconds from config.
+def _get_child_timeout(admitted_config: Optional[Dict[str, Any]] = None) -> Optional[float]:
+    """Read delegation.child_timeout_seconds from the admitted config snapshot.
 
     Returns the number of seconds a single child agent is allowed to run
     before being cut off, or ``None`` when no wall-clock cap applies.
@@ -980,7 +963,7 @@ def _get_child_timeout() -> Optional[float]:
     Set ``delegation.child_timeout_seconds`` to a positive number to opt back
     in to a hard cap (floor 30 s); ``0`` or a negative value means disabled.
     """
-    cfg = _load_config()
+    cfg = _load_config() if admitted_config is None else admitted_config
     val = cfg.get("child_timeout_seconds")
     if val is not None:
         try:
@@ -1002,49 +985,6 @@ def _get_child_timeout() -> Optional[float]:
         else:
             return None if parsed <= 0 else max(30.0, parsed)
     return DEFAULT_CHILD_TIMEOUT
-
-
-def _get_child_grant_window() -> Optional["datetime"]:
-    """Resolve the dispatcher-issued default grant window for a delegated child.
-
-    The bounding gate (``agent.delegated_expiry.child_effective_deadline``) is
-    fail-closed: a child must carry at least one bound — its own wall-clock
-    timeout OR an explicit grant window. ``child_timeout_seconds`` defaults to
-    0 (disabled) so heavy children are never killed by a generic stopwatch,
-    which left production delegations with NEITHER bound: every child was
-    refused at start (ValueError: a child needs an own timeout or a grant
-    window to be bounded). This resolver supplies the missing bound.
-
-    Resolution order (the EARLIER of timeout and window always wins at the
-    gate, so a coarser window cannot override a tighter timeout):
-
-    1. A caller-supplied ``window_not_after`` — unchanged, always wins.
-    2. ``delegation.child_grant_window_seconds`` (0 = disabled, floor 30s) —
-       a coarse outer horizon issued by the dispatcher, NOT the model: it is
-       not a model-facing schema field, so the model cannot set its own bound.
-    3. Otherwise disabled: no window is issued, and an unbounded child is
-       refused by the gate unless ``child_timeout_seconds`` supplies the
-       bound (fail-closed semantics preserved).
-
-    Only aware datetimes are produced (now + timedelta), per the gate's
-    naive-datetime refusal.
-    """
-    cfg = _load_config()
-    val = cfg.get("child_grant_window_seconds")
-    if val is not None:
-        try:
-            parsed = float(val)
-        except (TypeError, ValueError):
-            logger.warning(
-                "delegation.child_grant_window_seconds=%r is not a valid number; "
-                "using default (no grant window)",
-                val,
-            )
-        else:
-            if parsed > 0:
-                return datetime.now(timezone.utc) + timedelta(seconds=max(30.0, parsed))
-            return None
-    return None
 
 
 def _get_max_spawn_depth() -> int:
@@ -1702,14 +1642,13 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
-    # Per-call role controlling whether a child can further delegate.
+    # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
-    # Explicit grant window threaded by the dispatcher; recorded in the
-    # child's grant audit record. None = not supplied (the resolver applies
-    # the configured default at record build and again at run entry).
-    window_not_after: Any = None,
+    override_reasoning_effort=None,
+    _orchestration_admission=None,
+    _routing_config=None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1720,6 +1659,22 @@ def _build_child_agent(
     routing subagents to a different provider:model pair (e.g. cheap/fast
     model on OpenRouter while the parent runs on Nous Portal).
     """
+    from agent.orchestration_policy import OrchestrationError
+    from agent.orchestration_runtime import admit_worker
+    admission = _orchestration_admission or admit_worker(parent_agent)
+    admission.assert_current(effect="delegation")
+    if (admission.session_id != getattr(parent_agent, "session_id", None)
+            and getattr(parent_agent, "_orchestration_admission", None) is not admission):
+        raise OrchestrationError("policy_owner_mismatch")
+    if not admission.policy.allow_delegation:
+        raise OrchestrationError("delegation_disabled")
+    selected = admission.policy.secondary_route
+    if selected is not None and (
+        (model is not None and model != selected.model)
+        or (override_provider is not None and override_provider != selected.provider)
+    ):
+        raise OrchestrationError("secondary_route_conflict")
+
     from run_agent import AIAgent
     import uuid as _uuid
 
@@ -1743,7 +1698,7 @@ def _build_child_agent(
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
-    delegation_cfg = _load_config()
+    delegation_cfg = _routing_config if _routing_config is not None else admission.routing_config
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
@@ -1968,7 +1923,8 @@ def _build_child_agent(
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = (override_reasoning_effort if override_reasoning_effort is not None
+                             else delegation_cfg.get("reasoning_effort"))
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -1976,12 +1932,11 @@ def _build_child_agent(
             if parsed is not None:
                 child_reasoning = parsed
             else:
-                logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
-                )
+                raise OrchestrationError("secondary_reasoning_effort_invalid")
+    except OrchestrationError:
+        raise
     except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+        raise OrchestrationError("secondary_reasoning_effort_unavailable") from exc
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
@@ -2143,6 +2098,7 @@ def _build_child_agent(
     child._delegate_depth = child_depth
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
+    child._orchestration_admission = admission
     child._delegate_role = effective_role
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
@@ -2228,7 +2184,7 @@ def _build_child_agent(
                 "child_max": int(max_iterations),
                 "parent_remaining": int(_parent_remaining),
             },
-            "window_not_after": _resolve_child_window_not_after(window_not_after),
+            "window_not_after": None,
         }
     except Exception:
         logger.debug("subagent: grant audit record not built", exc_info=True)
@@ -2608,13 +2564,23 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
-
-    # Task 2.2 single owner: resolve the effective grant window at entry so
-    # every entry route (explicit delegate_task param, registry kw, the
-    # subagent-lifecycle plugin path) receives the dispatcher-issued default
-    # when no explicit window was supplied. The gate below stays fail-closed:
-    # with both bounds disabled an unbounded child is still refused.
-    window_not_after = _resolve_child_window_not_after(window_not_after)
+    from agent.orchestration_policy import OrchestrationError
+    from agent.orchestration_runtime import assert_child_dispatch
+    try:
+        child_admission = assert_child_dispatch(child)
+    except OrchestrationError as exc:
+        cleanup = "not_required"
+        close = getattr(child, "close", None)
+        if callable(close):
+            try:
+                close()
+                cleanup = "closed"
+            except Exception:
+                cleanup = "failed"
+        return {"task_index": task_index, "status": "blocked", "code": exc.code,
+                "error": str(exc), "api_calls": 0, "summary": None,
+                "exit_reason": "orchestration_blocked", "cleanup_state": cleanup,
+                "duration_seconds": time.monotonic() - child_start}
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2927,10 +2893,17 @@ def _run_single_child(
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
         )
 
-        # Run child with an optional hard timeout (off by default —
-        # result(timeout=None) blocks until the child finishes). Stuck-child
-        # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = _get_child_timeout()
+        # Run child with an optional hard timeout. ``child_timeout_seconds: 0``
+        # (the shipped default) means "no operator-configured wall-clock cap" —
+        # but a child must never be truly unbounded: the grant-window guard
+        # (agent/delegated_expiry.py) refuses to start one without either an own
+        # timeout or a window. When neither bound is present, fall back to
+        # 24 h — deep margin above agent.gateway_timeout (30 min default),
+        # the longest legitimate single turn. Stuck-child protection still
+        # comes from the heartbeat staleness monitor long before this.
+        child_timeout = _get_child_timeout(child_admission.routing_config)
+        if child_timeout is None and window_not_after is None:
+            child_timeout = 24.0 * 3600.0
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
@@ -2947,48 +2920,288 @@ def _run_single_child(
         # Capture the worker thread so the timeout diagnostic can dump its
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
         _worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
+        # Only the normal text stream is captured. Keep a bounded, explicitly
+        # partial tail; no files, reasoning stream, or foreign profile state.
+        _partial_lock = threading.Lock()
+        _partial_text = ""
+        _partial_truncated = False
+        _partial_frozen = False
+        _partial_limit = 8192
 
         def _relay_child_text(delta: str) -> None:
-            # Forward the child's streamed reply text up the progress relay so
-            # gateway watch windows mirror it live (subagent.text → message.delta).
-            # Inert under CLI/TUI: their progress handlers ignore non-tool events.
-            if not delta or not child_progress_cb:
+            nonlocal _partial_text, _partial_truncated
+            if not isinstance(delta, str) or not delta:
+                return
+            with _partial_lock:
+                if _partial_frozen:
+                    # Calls arriving after the owner froze the partial result
+                    # must not relay new progress from an unwinding worker.
+                    return
+                if len(_partial_text) + len(delta) > _partial_limit:
+                    _partial_truncated = True
+                _partial_text = (_partial_text + delta[-_partial_limit:])[-_partial_limit:]
+            if not child_progress_cb:
                 return
             try:
                 child_progress_cb("subagent.text", preview=delta)
             except Exception as e:
                 logger.debug("Child text relay failed: %s", e)
 
-        def _run_with_thread_capture():
-            _worker_thread_holder["t"] = threading.current_thread()
-            from agent.delegation_context import delegated_child_context
+        def _capture_accepted_text(text: str) -> None:
+            """Keep the latest persisted, visible tool-turn commentary."""
+            nonlocal _partial_text, _partial_truncated
+            if not isinstance(text, str) or not text:
+                return
+            with _partial_lock:
+                if _partial_frozen:
+                    return
+                # A persisted assistant message supersedes earlier stream
+                # fragments. Replacing avoids replaying the same text twice.
+                _partial_truncated = len(text) > _partial_limit
+                _partial_text = text[-_partial_limit:]
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+        _no_accepted_callback = object()
+        _previous_accepted_callback = getattr(
+            child, "_delegation_accepted_text_callback", _no_accepted_callback
+        )
+        child._delegation_accepted_text_callback = _capture_accepted_text
 
-        _child_context = contextvars.copy_context()
-        # Task 2.2: compute the effective bound BEFORE submitting the child. A closed grant
+        # Task 2.2: compute the effective bound BEFORE submitting the child —
+        # the earlier of the operator cap / bounded fallback and the grant
+        # window — as a monotonic deadline shared by ALL child turns (including
+        # the schema-retry turn) via _call_with_child_budget. A closed grant
         # window is refused here, so the child never starts.
         from agent.delegated_expiry import child_effective_deadline as _child_deadline
         from datetime import datetime as _dt, timezone as _tz
         _now = _dt.now(_tz.utc)
-        _deadline = _child_deadline(
+        _abs_deadline = _child_deadline(
             now=_now,
             own_timeout_seconds=child_timeout,
             window_not_after=window_not_after,
         )
-        _effective_timeout = (_deadline - _now).total_seconds()
-        _child_future = _timeout_executor.submit(
-            _child_context.run,
-            _run_with_thread_capture,
+        _effective_timeout = (_abs_deadline - _now).total_seconds()
+        _deadline = time.monotonic() + _effective_timeout
+        _run_result = None
+        _child_future = None
+        _file_recovery_requested = getattr(child, '_delegate_result_file_recovery', False) is True
+        _file_recovery_status = 'unavailable' if _file_recovery_requested else None
+        if _file_recovery_requested and _deadline is not None:
+            try:
+                names = getattr(child, 'valid_tool_names', None)
+                if not isinstance(names, (set, frozenset, list, tuple)):
+                    raise ValueError('child tool scope unavailable')
+                if 'write_file' not in names:
+                    if not {'tool_search', 'tool_call'}.issubset(names):
+                        raise ValueError('write_file is outside the child tool scope')
+                    from agent.tool_executor import _tool_search_scoped_names
+                    if 'write_file' not in _tool_search_scoped_names(child):
+                        raise ValueError('write_file is outside the child tool scope')
+                from tools.delegation_run_result import RunResult
+                _run_result = RunResult(child, _deadline, child_task_id)
+                if 'write_file' not in names:
+                    goal += '\nDiscover write_file via tool_search and invoke it through tool_call.'
+                goal += ('\n\nWrite partial findings early using write_file to the '
+                         'following reserved file, then update it as work progresses.\n'
+                         f'RESULT_FILE: {_run_result.path}\n')
+            except Exception as exc:
+                logger.warning('Subagent %d result-file recovery unavailable: %s', task_index, exc)
+        _warning_deadline = (
+            _deadline - child_timeout * 0.2 if child_timeout is not None else None
         )
+        _warning_sent = False
+        _first_text = ""
+        _schema_valid: Optional[bool] = None
+        _schema_errors: List[str] = []
+        _schema_retries = 0
+
+        class _ChildBudgetExpired(Exception):
+            """The controller's shared child deadline actually expired."""
+
+        def _call_with_child_budget(user_message: str, *, schema_retry: bool = False):
+            """All child turns, including schema retry, share one deadline."""
+            nonlocal _warning_sent, _schema_retries, _child_future
+            if _deadline is not None and time.monotonic() >= _deadline:
+                raise _ChildBudgetExpired()
+
+            _finished_at: List[float] = []
+
+            def _run_with_thread_capture():
+                nonlocal _schema_retries
+                try:
+                    _worker_thread_holder["t"] = threading.current_thread()
+                    from agent.delegation_context import delegated_child_context
+
+                    if schema_retry:
+                        # Recheck the canonical owner immediately before this new
+                        # child turn; an opt-out may have landed after the first.
+                        assert_child_dispatch(child)
+                        with _partial_lock:
+                            if _partial_frozen or (_deadline is not None and time.monotonic() >= _deadline):
+                                raise _ChildBudgetExpired()
+                            _schema_retries = 1
+                    with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+                        return child.run_conversation(
+                            user_message=user_message,
+                            task_id=child_task_id,
+                            stream_callback=_relay_child_text,
+                        )
+                finally:
+                    _finished_at.append(time.monotonic())
+
+            context = contextvars.copy_context()
+            future = _timeout_executor.submit(context.run, _run_with_thread_capture)
+            _child_future = future
+            if _deadline is None:
+                return future.result()
+
+            class _WaitPending(Exception):
+                pass
+
+            def _check_finished_in_budget():
+                # Future completion synchronizes the worker's timestamp with
+                # this reader. A worker that finishes after the deadline must
+                # not become success merely because future.done() won a race.
+                if not _finished_at or _finished_at[0] >= _deadline:
+                    raise _ChildBudgetExpired()
+
+            def _wait_for_result(timeout):
+                try:
+                    value = future.result(timeout=timeout)
+                except FuturesTimeoutError:
+                    # Future.result also raises TimeoutError from the child.
+                    # Only a still-pending future denotes a wait timeout.
+                    if not future.done():
+                        raise _WaitPending() from None
+                    try:
+                        value = future.result()
+                    finally:
+                        _check_finished_in_budget()
+                except Exception:
+                    _check_finished_in_budget()
+                    raise
+                _check_finished_in_budget()
+                return value
+
+            if not _warning_sent:
+                try:
+                    return _wait_for_result(max(0.0, _warning_deadline - time.monotonic()))
+                except _WaitPending:
+                    _warning_sent = True
+                    if _subagent_id:
+                        steer_subagent(
+                            _subagent_id,
+                            "The time budget is nearly exhausted. Write your partial results now.",
+                        )
+            try:
+                return _wait_for_result(max(0.0, _deadline - time.monotonic()))
+            except _WaitPending as exc:
+                raise _ChildBudgetExpired() from exc
+
         try:
-            result = _child_future.result(timeout=_effective_timeout)
+            result = _call_with_child_budget(goal)
+
+            # Validate and retry within the same child deadline. The retry is a
+            # real child turn, not controller-side work exempt from the budget.
+            _output_schema = getattr(child, "_delegate_output_schema", None)
+            if isinstance(_output_schema, dict):
+                from tools.delegation_output_schema import (
+                    build_retry_message,
+                    validate_output,
+                )
+
+                _first_text = result.get("final_response") or ""
+                _schema_valid, _schema_errors = validate_output(
+                    _first_text, _output_schema
+                )
+                if (
+                    not _schema_valid
+                    and _first_text.strip()
+                    and not result.get("interrupted", False)
+                ):
+                    _retry_result = None
+                    try:
+                        _retry_result = _call_with_child_budget(
+                            build_retry_message(_schema_errors), schema_retry=True
+                        )
+                    except (_ChildBudgetExpired, OrchestrationError):
+                        raise
+                    except Exception as _retry_exc:
+                        logger.warning(
+                            "Subagent %d schema-retry turn failed: %s",
+                            task_index,
+                            _retry_exc,
+                        )
+                    if isinstance(_retry_result, dict):
+                        _retry_text = _retry_result.get("final_response") or ""
+                        if _retry_text.strip():
+                            result["final_response"] = _retry_text
+                        try:
+                            result["api_calls"] = int(
+                                result.get("api_calls", 0) or 0
+                            ) + int(_retry_result.get("api_calls", 0) or 0)
+                        except (TypeError, ValueError):
+                            pass
+                        _retry_messages = _retry_result.get("messages")
+                        if isinstance(_retry_messages, list) and isinstance(
+                            result.get("messages"), list
+                        ):
+                            result["messages"] = result["messages"] + _retry_messages
+                        _schema_valid, _schema_errors = validate_output(
+                            _retry_text, _output_schema
+                        )
         except Exception as _timeout_exc:
+            with _partial_lock:
+                _partial_frozen = True
+                _captured_partial = _partial_text
+                _captured_truncated = _partial_truncated
+            if (not _captured_partial.strip() and not _captured_truncated and _schema_valid is False and
+                    isinstance(_first_text, str)):
+                _captured_partial = _first_text[-_partial_limit:]
+                _captured_truncated = len(_first_text) > _partial_limit
+            if _captured_truncated:
+                # The start of a retained tail can be inside a credential
+                # assignment whose marker was discarded. Do not submit that
+                # incomplete first line to the redactor as if it were whole.
+                _, separator, _captured_partial = _captured_partial.partition("\n")
+                if not separator:
+                    _captured_partial = ""
+            if isinstance(_timeout_exc, _ChildBudgetExpired) and _run_result is not None:
+                try:
+                    observation = _run_result.freeze()
+                    _file_recovery_status = observation.status
+                    file_text = observation.text
+                    if observation.truncated and file_text:
+                        # Truncating a credential mid-line can leave a prefix too
+                        # short for the canonical redactor to recognize. Never
+                        # emit the incomplete last line as if it were complete.
+                        file_text, separator, _ = file_text.rpartition('\n')
+                        file_text = file_text if separator else ''
+                        _file_recovery_status = 'available_truncated' if file_text.strip() else 'withheld'
+                    if observation.status == 'available' and file_text:
+                        _captured_partial = ((_captured_partial or '') + '\n\n' +
+                                             'Partial result file:\n' + file_text).strip()
+                except Exception:
+                    logger.warning('Subagent %d result-file partial withheld', task_index)
+            _captured_partial = _captured_partial.strip() or None
+            if isinstance(_timeout_exc, _ChildBudgetExpired) and _captured_partial:
+                # This is a new persistence/delivery sink for incomplete text.
+                # Redact the combined buffer (not individual deltas, where a
+                # credential marker may straddle chunks) before it reaches a
+                # result, receipt, or completion notification. Withhold rather
+                # than emit raw text if the canonical redactor is unavailable.
+                try:
+                    from agent.redact import redact_sensitive_text
+
+                    _redacted = redact_sensitive_text(_captured_partial, force=True)
+                    _captured_partial = _redacted.strip() if isinstance(_redacted, str) else None
+                    _captured_partial = _captured_partial or None
+                    if not _captured_partial and _file_recovery_status in ('available', 'available_truncated'):
+                        _file_recovery_status = 'withheld'
+                except Exception:
+                    logger.warning("Subagent %d timeout partial withheld: redaction unavailable", task_index)
+                    _captured_partial = None
+                    if _file_recovery_status in ('available', 'available_truncated'):
+                        _file_recovery_status = 'withheld'
             # No consumer boundary remains once this owner stops waiting for
             # the child. Close acceptance before any completion callback and
             # retain steer text that won the race with this failure/timeout.
@@ -3003,7 +3216,8 @@ def _run_single_child(
             except Exception:
                 pass
 
-            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            is_timeout = isinstance(_timeout_exc, _ChildBudgetExpired)
+            is_blocked = isinstance(_timeout_exc, OrchestrationError)
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
@@ -3049,7 +3263,7 @@ def _run_single_child(
                             if is_timeout
                             else str(_timeout_exc)
                         ),
-                        status="timeout" if is_timeout else "error",
+                        status="timeout" if is_timeout else "blocked" if is_blocked else "error",
                         duration_seconds=duration,
                         summary="",
                     )
@@ -3080,10 +3294,10 @@ def _run_single_child(
 
             _error_entry = {
                 "task_index": task_index,
-                "status": "timeout" if is_timeout else "error",
-                "summary": None,
+                "status": "timeout" if is_timeout else "blocked" if is_blocked else "error",
+                "summary": _captured_partial if is_timeout else None,
                 "error": _err,
-                "exit_reason": "timeout" if is_timeout else "error",
+                "exit_reason": "timeout" if is_timeout else "orchestration_blocked" if is_blocked else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
                 "timeout_seconds": child_timeout if is_timeout else None,
@@ -3096,6 +3310,16 @@ def _run_single_child(
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
+            if is_blocked:
+                _error_entry["code"] = _timeout_exc.code
+            if is_timeout:
+                _error_entry["summary_is_partial"] = bool(_captured_partial)
+                if _file_recovery_requested:
+                    _error_entry['partial_file_recovery'] = _file_recovery_status
+                if _schema_valid is False:
+                    _error_entry["schema_valid"] = False
+                    _error_entry["schema_errors"] = _schema_errors
+                    _error_entry["schema_retries"] = _schema_retries
             if _late_pending_steer:
                 _error_entry["missed_steer"] = _late_pending_steer
                 _error_entry["error"] += (
@@ -3105,70 +3329,26 @@ def _run_single_child(
             _attach_worktree(_error_entry)
             return _error_entry
         finally:
+            # Retire the private projection even if an abandoned worker later
+            # calls the captured function; do not retain raw partial text.
+            with _partial_lock:
+                _partial_frozen = True
+                _partial_text = ""
+                _partial_truncated = False
+            if getattr(child, "_delegation_accepted_text_callback", None) is _capture_accepted_text:
+                if _previous_accepted_callback is _no_accepted_callback:
+                    delattr(child, "_delegation_accepted_text_callback")
+                else:
+                    child._delegation_accepted_text_callback = _previous_accepted_callback
+            if _run_result is not None:
+                if _child_future is None:
+                    _run_result.worker_done()
+                else:
+                    _child_future.add_done_callback(_run_result.worker_done)
+                _run_result.controller_done()
             # Shut down executor without waiting — if the child thread
             # is stuck on blocking I/O, wait=True would hang forever.
             _timeout_executor.shutdown(wait=False)
-
-        # T1-24: structured-output contract validation + ONE bounded retry.
-        # Runs only when a schema was attached at dispatch; schema-less
-        # delegations take none of these branches and their result entry
-        # stays byte-identical (wire-shape pinning).
-        # Pattern from: github/copilot-cli ctx.agent(prompt, {schema}) —
-        # PATTERN ONLY, no code copied.
-        _output_schema = getattr(child, "_delegate_output_schema", None)
-        _schema_valid: Optional[bool] = None
-        _schema_errors: List[str] = []
-        _schema_retries = 0
-        if isinstance(_output_schema, dict):
-            from tools.delegation_output_schema import (
-                build_retry_message,
-                validate_output,
-            )
-
-            _first_text = result.get("final_response") or ""
-            _schema_valid, _schema_errors = validate_output(
-                _first_text, _output_schema
-            )
-            if (
-                not _schema_valid
-                and _first_text.strip()
-                and not result.get("interrupted", False)
-            ):
-                # Exactly one retry turn, carrying the validation errors
-                # verbatim (no schema re-paste — the child already holds
-                # the contract in its context).
-                _schema_retries = 1
-                _retry_result = None
-                try:
-                    _retry_result = child.run_conversation(
-                        user_message=build_retry_message(_schema_errors),
-                        task_id=child_task_id,
-                        stream_callback=_relay_child_text,
-                    )
-                except Exception as _retry_exc:
-                    logger.warning(
-                        "Subagent %d schema-retry turn failed: %s",
-                        task_index,
-                        _retry_exc,
-                    )
-                if isinstance(_retry_result, dict):
-                    _retry_text = _retry_result.get("final_response") or ""
-                    if _retry_text.strip():
-                        result["final_response"] = _retry_text
-                    try:
-                        result["api_calls"] = int(
-                            result.get("api_calls", 0) or 0
-                        ) + int(_retry_result.get("api_calls", 0) or 0)
-                    except (TypeError, ValueError):
-                        pass
-                    _retry_messages = _retry_result.get("messages")
-                    if isinstance(_retry_messages, list) and isinstance(
-                        result.get("messages"), list
-                    ):
-                        result["messages"] = result["messages"] + _retry_messages
-                    _schema_valid, _schema_errors = validate_output(
-                        _retry_text, _output_schema
-                    )
 
         # Linearization boundary for registry steering. From this point on the
         # child cannot consume another steer. Closing under the registry lock
@@ -3869,8 +4049,24 @@ def delegate_task(
             f"multiplies API cost)."
         )
 
-    # Load config
-    cfg = _load_config()
+    # Mandatory session admission is independent of optional tool observers.
+    # It precedes credential resolution, child construction and queueing.
+    from agent.orchestration_policy import OrchestrationError
+    from agent.orchestration_runtime import admit_worker, denial_result
+    try:
+        admission = admit_worker(parent_agent)
+        if admission.policy.secondary_route is not None and credentials_cfg:
+            route = admission.policy.secondary_route
+            if (credentials_cfg.get("model") != route.model
+                    or credentials_cfg.get("provider") != route.provider):
+                raise OrchestrationError("secondary_route_conflict")
+        if credentials_cfg is None:
+            credentials_cfg = admission.routing_config
+    except OrchestrationError as exc:
+        return denial_result(exc)
+
+    # Load the same admitted configuration snapshot for budgets and routing.
+    cfg = admission.routing_config
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -3971,6 +4167,8 @@ def delegate_task(
 
     task_schemas: List[Optional[Dict[str, Any]]] = []
     for i, task in enumerate(task_list):
+        if 'recover_partial_file' in task and type(task['recover_partial_file']) is not bool:
+            return tool_error(f"Task {i} recover_partial_file must be a boolean")
         raw_schema = task.get("output_schema")
         if raw_schema is None and len(task_list) == 1 and output_schema is not None:
             raw_schema = output_schema
@@ -3999,6 +4197,13 @@ def delegate_task(
 
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
         task_list, context, model=creds.get("model"), provider=creds.get("provider")
+    )
+    # The manifest owner is established only by successful exclusive creation.
+    # A failed creation must never grant update authority over an existing leaf.
+    _manifest_identity = next(
+        (identity for writer in live_writers if writer is not None
+         if isinstance((identity := getattr(writer, "_manifest_identity", None)), tuple)),
+        None,
     )
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
@@ -4061,7 +4266,9 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
-                window_not_after=window_not_after,
+                override_reasoning_effort=credentials_cfg.get("reasoning_effort"),
+                _orchestration_admission=admission,
+                _routing_config=credentials_cfg,
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
@@ -4069,6 +4276,8 @@ def delegate_task(
             return tool_error(str(exc))
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
+        child._orchestration_admission = admission
+        child._delegate_result_file_recovery = t.get('recover_partial_file') is True
         if _task_schema is not None:
             try:
                 child._delegate_output_schema = _task_schema
@@ -4138,7 +4347,6 @@ def delegate_task(
                         owner_session_id=_origin_ui_session_id or None,
                         owner_transport=_origin_owner_transport,
                         owner_session_record=_origin_owner_session_record,
-                        window_not_after=window_not_after,
                     )
                     futures[future] = i
 
@@ -4271,9 +4479,9 @@ def delegate_task(
                     _w.finalize(entry)
                 except Exception:
                     logger.debug("Live transcript finalize failed", exc_info=True)
-                if _idx < len(live_paths):
-                    entry["live_transcript"] = live_paths[_idx]
-        update_manifest_statuses(live_deleg_id, results)
+                if _w.path is not None:
+                    entry["live_transcript"] = str(_w.path)
+        update_manifest_statuses(live_deleg_id, results, expected_identity=_manifest_identity)
 
         combined: Dict[str, Any] = {
             "results": results,
@@ -4505,10 +4713,10 @@ def delegate_task(
             if live_paths:
                 payload["live_transcripts"] = list(live_paths)
                 payload["live_transcripts_hint"] = (
-                    "Each subagent streams a human-readable transcript of its "
-                    "operations to the file listed above (append-only, one per "
-                    "task). Read or `tail -f` these paths at any time to watch "
-                    "a child work while it runs."
+                    "Available human-readable transcripts are listed above; "
+                    "a task's log may be missing if its writer could not be "
+                    "created. Filenames carry task indices. Read or `tail -f` "
+                    "the available paths to watch a child work."
                 )
             return json.dumps(payload, ensure_ascii=False)
 
@@ -4568,11 +4776,11 @@ def delegate_task(
                         writer.finalize(entry)
                     except Exception:
                         logger.debug("Live transcript refusal finalize failed", exc_info=True)
-                if index < len(live_paths):
-                    entry["live_transcript"] = live_paths[index]
+                if writer is not None and writer.path is not None:
+                    entry["live_transcript"] = str(writer.path)
                 rejected_results.append(entry)
             try:
-                update_manifest_statuses(live_deleg_id, rejected_results)
+                update_manifest_statuses(live_deleg_id, rejected_results, expected_identity=_manifest_identity)
             except Exception:
                 logger.debug("Live transcript refusal manifest update failed", exc_info=True)
             rejection_payload = {
@@ -5056,6 +5264,15 @@ DELEGATE_TASK_SCHEMA = {
                                 "error messages, constraints. Each child "
                                 "sees only its own context — repeat shared "
                                 "background in every task that needs it."
+                            ),
+                        },
+                        "recover_partial_file": {
+                            "type": "boolean",
+                            "description": (
+                                "Opt in to a local-only run-owned partial results file. "
+                                "The child is told to write it with write_file. On timeout "
+                                "verified redacted content may be returned; remote backends "
+                                "and unavailable recovery fail closed."
                             ),
                         },
                         "output_schema": {

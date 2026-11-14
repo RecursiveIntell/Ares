@@ -3748,6 +3748,44 @@ class ConfigAdmissionError(ValueError):
         super().__init__(code)
 
 
+@dataclass(frozen=True)
+class ConfigAdmissionSnapshot:
+    """Detached owner-built configuration; never aliases the display cache."""
+
+    profile_home: str
+    fingerprint: str
+    _value: Dict[str, Any]
+    managed_keys: tuple[str, ...] = ()
+
+    @property
+    def config(self) -> Dict[str, Any]:
+        return copy.deepcopy(self._value)
+
+
+def _merge_user_config_layer(user_config: Dict[str, Any]) -> Dict[str, Any]:
+    user_config = copy.deepcopy(user_config)
+    if "max_turns" in user_config:
+        agent_user_config = dict(user_config.get("agent") or {})
+        if agent_user_config.get("max_turns") is None:
+            agent_user_config["max_turns"] = user_config["max_turns"]
+        user_config["agent"] = agent_user_config
+        user_config.pop("max_turns", None)
+    return _deep_merge(copy.deepcopy(DEFAULT_CONFIG), user_config)
+
+
+def _finish_config_layers(config, managed_config):
+    """Shared normalization/expansion owner for display and admission reads."""
+    normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+    expanded = _expand_env_vars(normalized)
+    if managed_config:
+        managed_normalized = _normalize_root_model_keys(managed_config)
+        if isinstance(managed_normalized.get("model"), str):
+            managed_normalized = dict(managed_normalized)
+            managed_normalized["model"] = {"default": managed_normalized["model"]}
+        expanded = _deep_merge(expanded, _expand_env_vars(managed_normalized))
+    return expanded, normalized
+
+
 def _read_admission_bytes(path: Path):
     """Capture raw bytes and their admission identity, without parsing YAML."""
     try:
@@ -3865,6 +3903,52 @@ def read_security_policy_config(profile_home: str | os.PathLike | None = None) -
         return value
 
 
+def load_config_for_admission() -> ConfigAdmissionSnapshot:
+    """Strict effective-source snapshot, with the normal owner's precedence.
+
+    Does not use, repair or update last-known-good/display caches. Every source
+    is captured and rechecked; a missing explicitly selected managed scope,
+    malformed YAML, nonmapping root, I/O refusal or source/profile change is a
+    typed refusal. No raw-file diagnostic reader is promoted into behavior.
+    """
+    from hermes_cli import managed_scope
+    from hermes_constants import get_hermes_home
+
+    with _CONFIG_LOCK:
+        home = str(get_hermes_home().resolve())
+        path = get_config_path()
+        try:
+            managed_dir = managed_scope.get_managed_dir_for_admission()
+            user, user_identity = _read_admission_config(path)
+            managed_path = managed_dir / "config.yaml" if managed_dir else None
+            managed, managed_identity = (
+                _read_admission_config(managed_path) if managed_path else ({}, None)
+            )
+            env_refs = _env_ref_snapshot(user)
+            _env_ref_snapshot(managed, env_refs)
+            effective, _normalized = _finish_config_layers(
+                _merge_user_config_layer(user), managed
+            )
+            if (
+                str(get_hermes_home().resolve()) != home
+                or get_config_path() != path
+                or managed_scope.get_managed_dir_for_admission() != managed_dir
+                or _read_admission_config(path)[1] != user_identity
+                or (managed_path and _read_admission_config(managed_path)[1] != managed_identity)
+                or any(os.environ.get(key) != value for key, value in env_refs.items())
+            ):
+                raise ConfigAdmissionError("CONFIG_ADMISSION_SOURCE_CHANGED")
+        except ConfigAdmissionError:
+            raise
+        except Exception as exc:
+            raise ConfigAdmissionError("CONFIG_ADMISSION_OWNER_UNAVAILABLE") from exc
+        fingerprint = hashlib.sha256(json.dumps(
+            {"home": home, "user": user_identity, "managed": managed_identity,
+             "env_refs": env_refs}, sort_keys=True, default=str,
+        ).encode("utf-8")).hexdigest()
+        return ConfigAdmissionSnapshot(home, fingerprint, copy.deepcopy(effective),
+            tuple(sorted(managed_scope._flatten_keys(managed))))
+
 
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
     with _CONFIG_LOCK:
@@ -3923,14 +4007,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 with open(config_path, encoding="utf-8") as f:
                     user_config = fast_safe_load(f) or {}
 
-                if "max_turns" in user_config:
-                    agent_user_config = dict(user_config.get("agent") or {})
-                    if agent_user_config.get("max_turns") is None:
-                        agent_user_config["max_turns"] = user_config["max_turns"]
-                    user_config["agent"] = agent_user_config
-                    user_config.pop("max_turns", None)
-
-                config = _deep_merge(config, user_config)
+                if not isinstance(user_config, dict):
+                    raise ValueError("configuration root must be a mapping")
+                config = _merge_user_config_layer(user_config)
             except Exception as e:
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
@@ -3972,28 +4051,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
-        normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-        expanded = _expand_env_vars(normalized)
-        # Managed scope wins at the leaf. Applied AFTER user expansion so a user
-        # ${VAR} cannot shadow a managed literal: managed values are expanded only
-        # against the process environment, never against user-config-defined refs.
-        # This deliberately inverts the usual env-over-config precedence for the
-        # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
         managed_config = managed_scope.load_managed_config()
-        if managed_config:
-            # Normalize the managed overlay through the same canonicalization as
-            # the user config BEFORE merging (parity with
-            # managed_scope.apply_managed_overlay): a dict-valued
-            # ``model.default`` (``{provider: ..., model: ...}``) or a bare
-            # ``model: <string>`` must be flattened to a string ``default``
-            # paired with ``provider`` so the merged result never exposes a
-            # nested dict to status/fallback/runtime readers.
-            managed_normalized = _normalize_root_model_keys(managed_config)
-            if isinstance(managed_normalized.get("model"), str):
-                managed_normalized = dict(managed_normalized)
-                managed_normalized["model"] = {"default": managed_normalized["model"]}
-            managed_expanded = _expand_env_vars(managed_normalized)
-            expanded = _deep_merge(expanded, managed_expanded)
+        expanded, normalized = _finish_config_layers(config, managed_config)
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``

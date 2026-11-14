@@ -8,7 +8,8 @@ depend on the registry being populated should use it explicitly or via
 ``@pytest.mark.usefixtures("web_registry_populated")``.
 """
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+import threading
 
 import pytest
 
@@ -124,3 +125,38 @@ def disable_lazy_stt_install():
     """
     with patch("tools.transcription_tools._try_lazy_install_stt", return_value=False):
         yield
+
+
+@pytest.fixture
+def delegation_policy_parent(tmp_path, monkeypatch):
+    """A real temporary session owner for tests of admitted delegation.
+
+    This fixture does not replace the production admission guard; the test
+    model and child remain mocks while policy and session storage are real.
+    """
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import SessionDB
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text('delegation:\n  provider: ""\n  model: ""\n')
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    token = set_hermes_home_override(home)
+    db = SessionDB(home / "state.db")
+    db.create_session("delegation-test-parent", "cli", model="test-model")
+    parent = MagicMock()
+    parent.session_id = "delegation-test-parent"
+    parent._session_db = db
+    parent._delegate_depth = 0
+    parent.model = "test-model"
+    parent.interactive_mode = False
+    parent._active_children = []
+    parent._active_children_lock = threading.Lock()
+    parent._print_fn = None
+    parent.tool_progress_callback = None
+    parent.thinking_callback = None
+    try:
+        yield parent
+    finally:
+        db.close()
+        reset_hermes_home_override(token)

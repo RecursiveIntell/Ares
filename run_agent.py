@@ -561,6 +561,13 @@ class AIAgent:
                 DeprecationWarning,
                 stacklevel=2,
             )
+        from agent.subagent_lifecycle import get_active_subagent_parent
+        from agent.orchestration_runtime import admit_worker
+        _origin_parent = get_active_subagent_parent()
+        if _origin_parent is not None:
+            # Imports/aliases and a new-looking session ID cannot make an
+            # in-process, on-behalf construction into an authenticated root.
+            self._orchestration_admission = admit_worker(_origin_parent)
         from agent.agent_init import init_agent
         try:
             init_agent(
@@ -8528,6 +8535,14 @@ class AIAgent:
         #     gateway session the async result would route back to.
         # The schema-level `background` param is intentionally ignored here.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        admission = None
+        if str(function_args.get("action") or "").lower() not in {"list", "steer", "stop"}:
+            from agent.orchestration_policy import OrchestrationError
+            from agent.orchestration_runtime import admit_worker, denial_result
+            try:
+                admission = admit_worker(self)
+            except OrchestrationError as exc:
+                return denial_result(exc)
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
@@ -8539,6 +8554,8 @@ class AIAgent:
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
             parent_agent=self,
+            credentials_cfg=admission.routing_config if admission else None,
+            _orchestration_admission=admission,
         )
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
