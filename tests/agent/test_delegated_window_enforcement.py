@@ -131,7 +131,8 @@ def test_unbounded_default_falls_back_to_a_bounded_child(monkeypatch):
     ~10 ms. The delegate now derives a 24 h fallback cap when neither bound is
     present, so the child starts and the heartbeat staleness monitor remains
     the real stuck-child protection."""
-    monkeypatch.setattr(d, "_get_child_timeout", lambda: None)
+    monkeypatch.setattr(d, "_get_child_timeout", lambda *a, **k: None)
+    from agent.orchestration_runtime import admit_worker
     started = threading.Event()
     finished = threading.Event()
     released = threading.Event()
@@ -143,6 +144,10 @@ def test_unbounded_default_falls_back_to_a_bounded_child(monkeypatch):
         _delegate_depth = 1
         session_id = "child"
         iteration_budget = None
+        # Post-#258 every real child carries its spawn admission (set by
+        # _build_child_agent); a store-less parent yields the config-default
+        # admission. assert_child_dispatch refuses a child without one.
+        _orchestration_admission = admit_worker(_parent())
 
         def run_conversation(self, **kwargs):
             started.set()
