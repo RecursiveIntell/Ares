@@ -16,15 +16,23 @@ from agent.subagent_lifecycle import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _bounded_child_wall_clock(monkeypatch):
-    """Task 2.2 is fail-closed: bound every probe child on the wall clock.
+from hermes_state import SessionDB
 
-    Mirrors tests/agent/test_delegated_window_enforcement.py, which patches
-    _get_child_timeout as the sanctioned bounding seam; without a bound the
-    child refusal (delegated_expiry) rejects the probe before it starts.
-    """
-    monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 600.0)
+_OWNERS = []
+
+
+@pytest.fixture(autouse=True)
+def _close_policy_owners():
+    yield
+    while _OWNERS:
+        _OWNERS.pop().close()
+
+
+def _owned_parent(**kwargs):
+    owner = SessionDB()
+    owner.create_session(kwargs["session_id"], "cli")
+    _OWNERS.append(owner)
+    return SimpleNamespace(**kwargs, _session_db=owner)
 
 
 class FakeChild:
@@ -54,13 +62,11 @@ class FakeChild:
 def lifecycle(monkeypatch):
     from agent.iteration_budget import IterationBudget
 
-    parent = SimpleNamespace(
-        session_id="parent-1",
-        enabled_toolsets=["file"],
-        # Task 2.2 (debit from parent): child construction debits a real
-        # budget and refuses unbounded children.
-        iteration_budget=IterationBudget(500),
-    )
+    parent = _owned_parent(session_id="parent-1", enabled_toolsets=["file"])
+    # Task 2.2 (debit from parent): child construction debits a real budget
+    # and refuses unbounded children. The policy owner above satisfies
+    # admit_worker's SessionDB requirement; this satisfies the budget gate.
+    parent.iteration_budget = IterationBudget(500)
     counter = iter(range(1000))
 
     def build(**_kwargs):
@@ -128,7 +134,7 @@ def test_cancel_uses_explicit_hard_interrupt(lifecycle):
 
 def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     memory = Mock()
-    parent = SimpleNamespace(
+    parent = _owned_parent(
         session_id="parent-aggregate",
         enabled_toolsets=["file"],
         _memory_manager=memory,

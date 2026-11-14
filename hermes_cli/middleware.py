@@ -161,7 +161,8 @@ def run_llm_dispatch(payload: Any, callback: Callable, *, stream: bool = False, 
                                   purpose=context.get("purpose", "conversation"),
                                   route={key: context[key] for key in ("provider", "api_mode") if context.get(key)}) as basis:
             response = callback(payload)
-            if stream and _get_middleware_callbacks(LLM_DISPATCH_MIDDLEWARE):
+            if stream and (_get_middleware_callbacks(LLM_DISPATCH_MIDDLEWARE)
+                           or (basis and basis.get("_orchestration_binding") is not None)):
                 response = bind_deferred_result(response, basis)
     except BaseException as error:
         outcome, cause = _dispatch_error_settlement(error)
@@ -187,7 +188,8 @@ async def async_run_llm_dispatch(payload: Any, callback: Callable, **context: An
         with inference_call_scope(None, payload, purpose=context.get("purpose", "conversation"),
                                   route={key: context[key] for key in ("provider", "api_mode") if context.get(key)}) as basis:
             response = await callback(payload)
-            if _get_middleware_callbacks(LLM_DISPATCH_MIDDLEWARE):
+            if (_get_middleware_callbacks(LLM_DISPATCH_MIDDLEWARE)
+                    or (basis and basis.get("_orchestration_binding") is not None)):
                 response = bind_deferred_result(response, basis)
     except BaseException as error:
         outcome, cause = _dispatch_error_settlement(error)

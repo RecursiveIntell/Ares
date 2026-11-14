@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
 import shutil
+import stat
 import threading
 import time
 import uuid
@@ -80,6 +83,14 @@ def _one_line(text: Any, limit: int) -> str:
     return s
 
 
+def _safe_tool_name(name: Any) -> str:
+    """Render a bounded single-token tool label, never event syntax."""
+    name = str(name or "?")
+    if len(name) > 128 or not name.isprintable() or any(ch.isspace() for ch in name):
+        return "?"
+    return name
+
+
 def _redact(text: str) -> str:
     """Mask credentials before anything reaches the transcript file.
 
@@ -122,9 +133,15 @@ class LiveTranscriptWriter:
         self.task_index = task_index
         self._ok = True
         self._lock = threading.Lock()
+        self._timing_closed = False
         self._stream_buf: List[str] = []
         self._stream_len = 0
         try:
+            # A later append must be able to refuse a substituted symlink.
+            # Disable this best-effort side channel rather than weaken that
+            # guarantee on a platform without no-follow open support.
+            if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_NONBLOCK"):
+                raise OSError("safe transcript append unavailable")
             base = (root if root is not None else live_transcript_root())
             d = base / delegation_id
             d.mkdir(parents=True, exist_ok=True)
@@ -139,7 +156,12 @@ class LiveTranscriptWriter:
                 "(append-only; streams while the subagent runs — tail -f me)",
                 "=" * 40,
             ]
-            self.path.write_text("\n".join(header) + "\n", encoding="utf-8")
+            from tools.spill_safety import open_exclusive
+
+            with open_exclusive(self.path, private=False) as fh:
+                created = os.fstat(fh.fileno())
+                self._file_identity = (created.st_dev, created.st_ino)
+                fh.write("\n".join(header) + "\n")
             self.event("user", "kickoff: " + _one_line(goal, _KICKOFF_MAX)
                        + (f" | context: {_one_line(context, _KICKOFF_MAX)}" if context else ""))
         except Exception as exc:
@@ -149,7 +171,8 @@ class LiveTranscriptWriter:
             self.path = None
 
     # ── low-level ────────────────────────────────────────────────────────
-    def event(self, role: str, text: str) -> None:
+    def event(self, role: str, text: str, *, _timing: bool = False,
+              _terminal: bool = False) -> None:
         """Append one ``HH:MM:SS role ⟩ text`` line. Flushed per event."""
         if not self._ok or self.path is None:
             return
@@ -159,10 +182,27 @@ class LiveTranscriptWriter:
         line = f"{time.strftime('%H:%M:%S')} {role:<9}| {_redact(text)}\n"
         try:
             with self._lock:
+                # Serialize the terminal marker and timing writes. A callback
+                # from an abandoned child must not add a sample after the
+                # owner's terminal event has closed this transcript's timing.
+                if _timing and self._timing_closed:
+                    return
+                if _terminal:
+                    self._timing_closed = True
                 # Append mode per write: no held handle, survives child crash,
                 # and the close() acts as the flush.
-                with open(self.path, "a", encoding="utf-8") as fh:
-                    fh.write(line)
+                fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK)
+                try:
+                    current = os.fstat(fd)
+                    if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                            or (current.st_dev, current.st_ino) != self._file_identity):
+                        raise OSError("live transcript path changed")
+                    with os.fdopen(fd, "a", encoding="utf-8") as fh:
+                        fd = -1
+                        fh.write(line)
+                finally:
+                    if fd != -1:
+                        os.close(fd)
         except Exception as exc:
             self._ok = False
             logger.debug("Live transcript write failed (%s): %s", self.path, exc)
@@ -181,7 +221,7 @@ class LiveTranscriptWriter:
     def tool_start(self, name: str, args_preview: Any = None) -> None:
         self.flush_stream()
         args = _one_line(args_preview, _ARGS_MAX)
-        self.event("tool", f"-> {name or '?'}({args})")
+        self.event("tool", f"-> {_safe_tool_name(name)}({args})")
 
     def tool_result(self, name: str, result: Any = None,
                     duration: Any = None, is_error: bool = False) -> None:
@@ -192,13 +232,13 @@ class LiveTranscriptWriter:
                 dur = f" {float(duration):.1f}s"
         except (TypeError, ValueError):
             pass
-        self.event("result", f"{name or '?'} {status}{dur}: "
+        self.event("result", f"{_safe_tool_name(name)} {status}{dur}: "
                              f"{_one_line(result, _RESULT_MAX)}")
 
-    def marker(self, text: str) -> None:
+    def marker(self, text: str, *, terminal: bool = False) -> None:
         """Lifecycle marker: start / final / error / interrupt / budget."""
         self.flush_stream()
-        self.event("final", _one_line(text, _ASSISTANT_MAX))
+        self.event("final", _one_line(text, _ASSISTANT_MAX), _terminal=terminal)
 
     # ── streamed reply buffering ─────────────────────────────────────────
     def add_stream_delta(self, delta: str) -> None:
@@ -246,6 +286,11 @@ class LiveTranscriptWriter:
             self.thinking(str(preview or ""))
         elif et == "subagent.text":
             self.add_stream_delta(str(preview or ""))
+        elif et == "subagent.api_timing":
+            duration = kwargs.get("duration_seconds")
+            if (isinstance(duration, (int, float)) and not isinstance(duration, bool)
+                    and math.isfinite(duration) and duration >= 0):
+                self.event("timing", f"api-window {duration:.3f}s", _timing=True)
         elif et == "subagent.start":
             self.event("start", _one_line(preview, _KICKOFF_MAX))
         elif et == "subagent.complete":
@@ -258,7 +303,7 @@ class LiveTranscriptWriter:
             summary = kwargs.get("summary") or preview
             if summary:
                 parts.append(f"summary: {_one_line(summary, _RESULT_MAX)}")
-            self.marker(" ".join(parts))
+            self.marker(" ".join(parts), terminal=True)
 
     def finalize(self, entry: Dict[str, Any]) -> None:
         """Terminal marker from the aggregated result entry.
@@ -274,7 +319,7 @@ class LiveTranscriptWriter:
             parts.append("(iteration budget exhausted)")
         if entry.get("error"):
             parts.append(f"error: {_one_line(entry['error'], _RESULT_MAX)}")
-        self.marker(" ".join(parts))
+        self.marker(" ".join(parts), terminal=True)
 
 
 def wrap_progress_callback(inner_cb, writer: LiveTranscriptWriter):
@@ -341,7 +386,14 @@ def create_live_transcripts(
                 paths.append(str(w.path))
         if not paths:
             return None, [None] * n, []
-        _write_manifest(deleg_id, task_list, paths, model=model, provider=provider)
+        # `paths` is intentionally compact for callers displaying available
+        # logs. The manifest needs the writer-indexed view: a failed earlier
+        # task must not shift a later child's log onto the wrong task.
+        indexed_paths = [str(w.path) if w is not None else None for w in writers]
+        manifest_identity = _write_manifest(deleg_id, task_list, indexed_paths, model=model, provider=provider)
+        for writer in writers:
+            if writer is not None:
+                writer._manifest_identity = manifest_identity
         return deleg_id, writers, paths
     except Exception as exc:
         logger.debug("Live transcript creation failed: %s", exc)
@@ -353,8 +405,8 @@ def _manifest_path(delegation_id: str) -> Path:
 
 
 def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
-                    paths: List[str], model: Optional[str] = None,
-                    provider: Optional[str] = None) -> None:
+                    paths: List[Optional[str]], model: Optional[str] = None,
+                    provider: Optional[str] = None) -> Optional[tuple[int, int]]:
     try:
         manifest = {
             "delegation_id": delegation_id,
@@ -377,31 +429,55 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                 for i, t in enumerate(task_list)
             ],
         }
-        _manifest_path(delegation_id).write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        from tools.spill_safety import open_exclusive
+
+        # A reused id or planted leaf is not ours to replace.
+        with open_exclusive(_manifest_path(delegation_id), private=False) as fh:
+            created = os.fstat(fh.fileno())
+            fh.write(json.dumps(manifest, indent=2, ensure_ascii=False))
+        return (created.st_dev, created.st_ino)
     except Exception as exc:
         logger.debug("Live transcript manifest write failed: %s", exc)
+        return None
 
 
 def update_manifest_statuses(delegation_id: Optional[str],
-                             results: List[Dict[str, Any]]) -> None:
+                             results: List[Dict[str, Any]], *,
+                             expected_identity: Optional[tuple[int, int]] = None) -> None:
     """Best-effort per-task status update once the batch has aggregated."""
-    if not delegation_id:
+    if not delegation_id or expected_identity is None:
         return
     try:
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_NONBLOCK"):
+            raise OSError("safe manifest update unavailable")
         mp = _manifest_path(delegation_id)
-        manifest = json.loads(mp.read_text(encoding="utf-8"))
-        by_index = {r.get("task_index"): r for r in results if isinstance(r, dict)}
-        for task in manifest.get("tasks", []):
-            r = by_index.get(task.get("index"))
-            if r is not None:
-                task["status"] = r.get("status", task.get("status"))
-                if r.get("exit_reason"):
-                    task["exit_reason"] = r["exit_reason"]
-        manifest["completed"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        mp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
-                      encoding="utf-8")
+        fd = os.open(mp, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            opened = os.fstat(fd)
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                    or (opened.st_dev, opened.st_ino) != expected_identity):
+                raise OSError("unsafe manifest leaf")
+            with os.fdopen(fd, "r+", encoding="utf-8") as fh:
+                fd = -1
+                manifest = json.load(fh)
+                by_index = {r.get("task_index"): r for r in results if isinstance(r, dict)}
+                for task in manifest.get("tasks", []):
+                    r = by_index.get(task.get("index"))
+                    if r is not None:
+                        task["status"] = r.get("status", task.get("status"))
+                        if r.get("exit_reason"):
+                            task["exit_reason"] = r["exit_reason"]
+                manifest["completed"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                current = os.stat(mp, follow_symlinks=False)
+                if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                        or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)):
+                    raise OSError("manifest path changed during update")
+                fh.seek(0)
+                fh.write(json.dumps(manifest, indent=2, ensure_ascii=False))
+                fh.truncate()
+        finally:
+            if fd != -1:
+                os.close(fd)
     except Exception as exc:
         logger.debug("Live transcript manifest update failed: %s", exc)
 
