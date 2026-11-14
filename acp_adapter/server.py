@@ -1808,6 +1808,16 @@ class HermesACPAgent(acp.Agent):
         if not has_content:
             return PromptResponse(stop_reason="end_turn")
 
+        # Only the current, text-only ACP request is eligible. Do this before
+        # steer salvage/history expansion; quoted/resource content is not control.
+        from hermes_cli.orchestration import operator_control_text
+        control = operator_control_text(user_text) if text_only_prompt else None
+        if control is not None:
+            result = self._handle_slash_command("/orchestration " + control, state)
+            if self._conn:
+                await self._conn.session_update(session_id, acp.update_agent_message_text(result))
+            return PromptResponse(stop_reason="end_turn")
+
         # /steer on an idle session has no in-flight tool call to inject into.
         # Rewrite it so the payload runs as a normal user prompt, matching the
         # gateway's behavior (gateway/run.py ~L4898). Two sub-cases:
@@ -2274,6 +2284,17 @@ class HermesACPAgent(acp.Agent):
         parts = text.split(maxsplit=1)
         cmd = parts[0].lstrip("/").lower()
         args = parts[1].strip() if len(parts) > 1 else ""
+
+        if cmd == "orchestration":
+            import uuid
+            from hermes_cli.orchestration import apply_operator_control
+            from agent.orchestration_policy import OrchestrationError
+            try:
+                result = apply_operator_control(self.session_manager._get_db(),
+                    state.session_id, args or "show", source_message_id="acp-control:" + str(uuid.uuid4()))
+                return json.dumps(result)
+            except (OrchestrationError, AttributeError) as error:
+                return json.dumps({"status": "blocked", "error": str(error)})
 
         handler = {
             "help": self._cmd_help,

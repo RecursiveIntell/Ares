@@ -4,10 +4,12 @@ Pure-data leaf module: DEFAULT_CONFIG and OPTIONAL_ENV_VARS, extracted
 verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 """
 
+from agent.orchestration_policy import OrchestrationPolicy
 DEFAULT_TERMINAL_IMAGE = "nikolaik/python-nodejs:python3.14-nodejs26"
 DEFAULT_SINGULARITY_IMAGE = f"docker://{DEFAULT_TERMINAL_IMAGE}"
 
 DEFAULT_CONFIG = {
+    "orchestration": OrchestrationPolicy().to_dict(),
     "model": "",
     "providers": {},
     "fallback_providers": [],
@@ -2080,15 +2082,6 @@ DEFAULT_CONFIG = {
                                      # (API, tools, iteration budget), never a delegation
                                      # stopwatch. Set a positive number of seconds
                                      # (floor 30s) to enforce a hard cap.
-        "child_grant_window_seconds": 86400,  # dispatcher-issued outer horizon per child
-                                     # (floor 30s). 0 disables. The child runs until the
-                                     # EARLIER of this window and child_timeout_seconds,
-                                     # so a generous default cannot override a tighter
-                                     # timeout. This is the fail-closed bounding gate's
-                                     # bound when child_timeout_seconds is 0 (disabled):
-                                     # with both disabled, unbounded children are
-                                     # refused at start. NOT model-facing — the model
-                                     # cannot set its own bound.
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
         "max_concurrent_children": 10,  # unified concurrency cap: max parallel children per batch

@@ -11,6 +11,8 @@ import subprocess
 import sys
 import threading
 
+import pytest
+
 
 
 def _spawn_sleep(seconds: float = 60) -> subprocess.Popen:
@@ -362,7 +364,29 @@ class TestGatewayCleanupWiring:
 class TestDelegationCleanup:
     """Verify subagent delegation cleans up child agents."""
 
-    def test_run_single_child_calls_close(self, monkeypatch, tmp_path):
+    @pytest.fixture
+    def admit_test_child(self, monkeypatch):
+        from agent.orchestration_runtime import admit_worker
+        from hermes_state import SessionDB
+
+        owners = []
+
+        def admit(parent, child, home):
+            home.mkdir(parents=True, exist_ok=True)
+            (home / 'config.yaml').write_text('delegation:\n  provider: ""\n  model: ""\n')
+            monkeypatch.setenv('HERMES_HOME', str(home))
+            db = SessionDB(home / 'state.db')
+            owners.append(db)
+            parent.session_id = 'cleanup-parent'
+            parent._session_db = db
+            db.create_session(parent.session_id, 'cli', model='fixture')
+            child._orchestration_admission = admit_worker(parent)
+
+        yield admit
+        for db in owners:
+            db.close()
+
+    def test_run_single_child_calls_close(self, monkeypatch, tmp_path, admit_test_child):
         """_run_single_child finally block should call close() on child."""
         from unittest.mock import MagicMock
         from hermes_constants import (
@@ -393,11 +417,12 @@ class TestDelegationCleanup:
         parent._active_children.append(child)
 
         profile_home = tmp_path / "profile-a"
+        admit_test_child(parent, child, profile_home)
         token = set_hermes_home_override(profile_home)
         # Task 2.2 fail-closed bounding: an unbounded child is refused before
         # run_conversation. Give this probe the same explicit timeout the
         # sibling tests use.
-        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 2.0)
+        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda *a, **k: 2.0)
         try:
             result = _run_single_child(
                 task_index=0,
@@ -416,7 +441,7 @@ class TestDelegationCleanup:
         assert child not in parent._active_children
         assert result["status"] == "error"
 
-    def test_active_child_turn_owns_relay_scope_cleanup(self, monkeypatch):
+    def test_active_child_turn_owns_relay_scope_cleanup(self, monkeypatch, tmp_path, admit_test_child):
         from unittest.mock import MagicMock
 
         from hermes_cli.observability import relay_runtime
@@ -429,6 +454,7 @@ class TestDelegationCleanup:
         child.session_id = "active-child-session"
         child._delegate_saved_tool_names = ["tool1"]
         child.run_conversation.side_effect = RuntimeError("test abort")
+        admit_test_child(parent, child, tmp_path / 'active-profile')
         parent._active_children.append(child)
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **kwargs: relay_host)
@@ -449,7 +475,7 @@ class TestDelegationCleanup:
         relay_host.unregister_subagent.assert_not_called()
 
     def test_timed_out_child_keeps_relay_session_until_its_turn_exits(
-        self, monkeypatch, tmp_path
+        self, monkeypatch, tmp_path, admit_test_child
     ):
         from unittest.mock import MagicMock
 
@@ -473,12 +499,13 @@ class TestDelegationCleanup:
         child.session_id = "timed-out-child"
         child._delegate_saved_tool_names = ["tool1"]
         child.get_activity_summary.return_value = {"api_call_count": 1}
+        admit_test_child(parent, child, profile_home)
         parent._active_children.append(child)
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
         # The worker must start before the timeout path can be asserted. A
         # 100ms budget races executor scheduling under the full parallel suite.
-        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 2.0)
+        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda config: 2.0)
 
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(

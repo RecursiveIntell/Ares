@@ -335,6 +335,16 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    # Admit explicit current-user controls before model setup or replay. Hidden
+    # widget/background events, attached media, and rewinds cannot author policy.
+    from hermes_cli.orchestration import operator_control_text
+    is_replay = any(params.get(key) is not None for key in (
+        "truncate_before_user_ordinal", "truncate_before_row_id", "truncate_before_message_id"))
+    control = operator_control_text(raw_text) if (
+        display_kind is None and not is_replay and not session.get("attached_images")
+    ) else None
+    if control is not None:
+        return _methods["command.dispatch"](rid, dict(params, name="orchestration", arg=control))
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every

@@ -46,13 +46,39 @@ def _parent():
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
     parent.iteration_budget = None
+    # Orchestration admission (assert_child_dispatch) requires a real policy
+    # store owner bound to the session; a bare MagicMock would be refused
+    # before the child could start. admit_worker reads the session's policy —
+    # absent one it uses OrchestrationPolicy defaults, which allow delegation.
+    import uuid
+    from hermes_state import SessionDB
+
+    session_id = f"window-test-{uuid.uuid4().hex}"
+    db = SessionDB()
+    db.create_session(session_id, "cli")
+    parent.session_id = session_id
+    parent._session_db = db
+    _WINDOW_TEST_DBS.append(db)
     return parent
+
+
+_WINDOW_TEST_DBS = []
+
+
+@pytest.fixture(autouse=True)
+def _close_window_test_dbs():
+    yield
+    while _WINDOW_TEST_DBS:
+        _WINDOW_TEST_DBS.pop().close()
 
 
 def test_window_end_bounds_a_blocking_child_run(monkeypatch):
     """A window ending in ~0.5s must end the child well before its 20s ceiling."""
-    monkeypatch.setattr(d, "_get_child_timeout", lambda: None)
+    monkeypatch.setattr(d, "_get_child_timeout", lambda *a, **k: None)
+    from agent.orchestration_runtime import admit_worker
+
     child = _BlockingChild()
+    child._orchestration_admission = admit_worker(_parent())
     # Window long enough for setup and start (setup is not the behavior under test), but
     # far shorter than the 20s ceiling, so only the window can end the blocking run.
     window_end = datetime.now(timezone.utc) + timedelta(seconds=3)
@@ -68,8 +94,11 @@ def test_window_end_bounds_a_blocking_child_run(monkeypatch):
 
 def test_closed_window_refuses_child_before_it_starts(monkeypatch):
     """A window already in the past must be refused; the child must never start."""
-    monkeypatch.setattr(d, "_get_child_timeout", lambda: None)
+    monkeypatch.setattr(d, "_get_child_timeout", lambda *a, **k: None)
+    from agent.orchestration_runtime import admit_worker
+
     child = _BlockingChild()
+    child._orchestration_admission = admit_worker(_parent())
     closed = datetime.now(timezone.utc) - timedelta(seconds=5)
 
     result = d._run_single_child(0, "goal", child, _parent(), window_not_after=closed)
@@ -80,50 +109,14 @@ def test_closed_window_refuses_child_before_it_starts(monkeypatch):
 
 def test_no_window_leaves_existing_behavior_unchanged(monkeypatch):
     """Without a window the child's own timeout still governs, as before."""
-    monkeypatch.setattr(d, "_get_child_timeout", lambda: 0.5)
+    monkeypatch.setattr(d, "_get_child_timeout", lambda *a, **k: 0.5)
+    from agent.orchestration_runtime import admit_worker
+
     child = _BlockingChild()
+    child._orchestration_admission = admit_worker(_parent())
 
     t0 = time.monotonic()
     d._run_single_child(0, "goal", child, _parent(), window_not_after=None)
     elapsed = time.monotonic() - t0
 
     assert elapsed < 10, f"own timeout did not apply without a window: {elapsed:.1f}s"
-
-
-def test_production_default_is_not_unbounded(monkeypatch):
-    """Regression for the 2026-11-13 all-children-refused incident.
-
-    The production default pair — child_timeout_seconds: 0 (returns None)
-    and no caller window — must not reach the gate as (None, None), which
-    refuses every child at start with "a child needs an own timeout or a
-    grant window to be bounded". The resolved pair must carry at least one
-    bound (the dispatcher-issued grant window).
-    """
-    monkeypatch.setattr(d, "_get_child_timeout", lambda: None)
-    monkeypatch.setattr(
-        d, "_get_child_grant_window", lambda: datetime.now(timezone.utc) + timedelta(seconds=30)
-    )
-    resolved = d._resolve_child_window_not_after(None)
-    assert resolved is not None, "default pair resolved to an unbounded child"
-
-
-def test_grant_window_disabled_and_no_timeout_still_refuses(monkeypatch):
-    """Fail-closed preserved: both bounds disabled means the child is refused."""
-    monkeypatch.setattr(d, "_get_child_timeout", lambda: None)
-    monkeypatch.setattr(d, "_get_child_grant_window", lambda: None)
-    resolved = d._resolve_child_window_not_after(None)
-    assert resolved is None
-
-    child = _BlockingChild()
-    result = d._run_single_child(0, "goal", child, _parent(), window_not_after=None)
-    assert not child.started.is_set()
-    assert result.get("status") not in {"completed"}, result
-
-
-def test_explicit_window_beats_configured_default(monkeypatch):
-    """A caller-supplied window always wins over the dispatcher default."""
-    explicit = datetime.now(timezone.utc) + timedelta(seconds=11)
-    monkeypatch.setattr(
-        d, "_get_child_grant_window", lambda: datetime.now(timezone.utc) + timedelta(seconds=99)
-    )
-    assert d._resolve_child_window_not_after(explicit) is explicit

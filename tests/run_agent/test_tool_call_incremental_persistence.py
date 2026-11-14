@@ -126,7 +126,7 @@ def test_run_conversation_flushes_assistant_tool_call_before_execution():
     agent = _make_agent()
     tool_call = _mock_tool_call(call_id="c1")
     agent.client.chat.completions.create.side_effect = [
-        _mock_response(content="", finish_reason="tool_calls", tool_calls=[tool_call]),
+        _mock_response(content="unpersisted commentary", finish_reason="tool_calls", tool_calls=[tool_call]),
         _mock_response(content="done", finish_reason="stop"),
     ]
 
@@ -138,6 +138,8 @@ def test_run_conversation_flushes_assistant_tool_call_before_execution():
         flush_snapshots.append(copy.deepcopy(messages))
 
     agent._flush_messages_to_session_db = MagicMock(side_effect=_record_flush)
+    # A None flush result means there is no durable owner, not success.
+    agent._delegation_accepted_text_callback = MagicMock()
 
     # Capture observations at execute time into module-level lists rather than
     # asserting inside _execute_tool_calls — run_conversation's outer loop
@@ -163,6 +165,7 @@ def test_run_conversation_flushes_assistant_tool_call_before_execution():
         result = agent.run_conversation("search something")
 
     assert executed["count"] == 1, "_execute_tool_calls was never reached"
+    agent._delegation_accepted_text_callback.assert_not_called()
     # The assistant tool-call block MUST have been flushed before execution.
     last = snapshot_at_execute[0]
     assert last is not None, "no flush occurred before tool execution"
@@ -190,6 +193,10 @@ def test_interim_assistant_is_durable_before_ui_projection_on_abnormal_exit(tmp_
     )
 
     roles_seen_by_ui: list[str] = []
+    accepted_captures: list[tuple[str, list[str]]] = []
+    agent._delegation_accepted_text_callback = lambda text: accepted_captures.append(
+        (text, _durable_roles(db_path, session_id))
+    )
 
     def _ui_projection(_text, *, already_streamed=False):
         roles_seen_by_ui.extend(_durable_roles(db_path, session_id))
@@ -202,6 +209,7 @@ def test_interim_assistant_is_durable_before_ui_projection_on_abnormal_exit(tmp_
     finally:
         db.close()
 
+    assert accepted_captures == [("I'll inspect the repository now.", ["user", "assistant"])]
     assert roles_seen_by_ui == ["user", "assistant"]
     durable = _durable_messages(db_path, session_id)
     assert [message["role"] for message in durable] == ["user", "assistant"]
@@ -230,11 +238,13 @@ def test_failed_assistant_persist_blocks_ui_projection_and_tool_side_effects():
     )
     agent._flush_messages_to_session_db = MagicMock(return_value=False)
     agent.interim_assistant_callback = MagicMock()
+    agent._delegation_accepted_text_callback = MagicMock()
     agent._execute_tool_calls = MagicMock()
 
     result = agent.run_conversation("inspect the repository")
 
     agent.interim_assistant_callback.assert_not_called()
+    agent._delegation_accepted_text_callback.assert_not_called()
     agent._execute_tool_calls.assert_not_called()
     assert agent.client is not None
     assert agent.client.chat.completions.create.call_count == 1

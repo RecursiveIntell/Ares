@@ -37,7 +37,7 @@ def _bounded_child_wall_clock(monkeypatch):
     _get_child_timeout as the sanctioned bounding seam; without a bound the
     child refusal (delegated_expiry) rejects the probe before it starts.
     """
-    monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 600.0)
+    monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda *a, **k: 600.0)
 
 
 class _StubAgent:
@@ -181,17 +181,14 @@ def test_status_snapshot_never_leaks_owner_or_lifecycle_metadata():
 class TestMissedSteerRetention:
     """The final-answer race: a steer with no boundary left is NAMED, not lost."""
 
-    def test_pending_steer_lands_in_completion_entry(self):
+    def test_pending_steer_lands_in_completion_entry(self, delegation_policy_parent):
         import json
         from unittest.mock import MagicMock, patch
 
         from tools.delegate_tool import delegate_task
         from agent.iteration_budget import IterationBudget
 
-        parent = MagicMock()
-        # Task 2.2 (debit from parent): child construction debits a real
-        # parent budget; a bare MagicMock would be refused as unbounded.
-        parent.iteration_budget = IterationBudget(500)
+        parent = delegation_policy_parent
         parent._delegate_depth = 0
         parent.model = "test-model"
         parent.interactive_mode = False
@@ -222,17 +219,14 @@ class TestMissedSteerRetention:
         # The race must not corrupt the outcome of the work itself.
         assert entry["status"] == "completed"
 
-    def test_no_pending_steer_leaves_entry_untouched(self):
+    def test_no_pending_steer_leaves_entry_untouched(self, delegation_policy_parent):
         import json
         from unittest.mock import MagicMock, patch
 
         from tools.delegate_tool import delegate_task
         from agent.iteration_budget import IterationBudget
 
-        parent = MagicMock()
-        # Task 2.2 (debit from parent): child construction debits a real
-        # parent budget; a bare MagicMock would be refused as unbounded.
-        parent.iteration_budget = IterationBudget(500)
+        parent = delegation_policy_parent
         parent._delegate_depth = 0
         parent.model = "test-model"
         parent.interactive_mode = False
@@ -257,7 +251,7 @@ class TestMissedSteerRetention:
         assert "missed_steer" not in entry
         assert "steer did not land" not in entry["summary"]
 
-    def test_accepted_steer_racing_completion_is_durably_retained(self):
+    def test_accepted_steer_racing_completion_is_durably_retained(self, delegation_policy_parent):
         """Acceptance wins the registry race, so completion must retain its text."""
         from tools.delegate_tool import _run_single_child
         from agent.iteration_budget import IterationBudget
@@ -269,6 +263,8 @@ class TestMissedSteerRetention:
         pending: list[str] = []
 
         child = MagicMock()
+        from agent.orchestration_runtime import admit_worker
+        child._orchestration_admission = admit_worker(delegation_policy_parent)
         child._subagent_id = "sid-linearized-accept"
         child._delegate_depth = 1
         child.model = "test-model"
@@ -335,7 +331,7 @@ class TestMissedSteerRetention:
         assert accepted_box["accepted"] is True
         assert result_box["result"]["missed_steer"] == "retain this exact text"
 
-    def test_steer_after_run_return_is_rejected_before_completion_callback(self):
+    def test_steer_after_run_return_is_rejected_before_completion_callback(self, delegation_policy_parent):
         """Once the child returns, a blocked completion callback cannot extend acceptance."""
         from tools.delegate_tool import _run_single_child
         from agent.iteration_budget import IterationBudget
@@ -352,6 +348,8 @@ class TestMissedSteerRetention:
 
         progress._flush = flush  # type: ignore[attr-defined]
         child = MagicMock()
+        from agent.orchestration_runtime import admit_worker
+        child._orchestration_admission = admit_worker(delegation_policy_parent)
         child._subagent_id = "sid-closed-before-callback"
         child._delegate_depth = 1
         child.model = "test-model"
@@ -453,7 +451,7 @@ class TestSubagentSteerRPC:
         finally:
             _unregister_subagent("sid-rpc-2")
 
-    def test_run_single_child_binds_exact_runtime_owner_artifacts(self):
+    def test_run_single_child_binds_exact_runtime_owner_artifacts(self, delegation_policy_parent):
         from gateway.session_context import clear_session_vars, set_session_vars
         from tools.delegate_tool import _run_single_child
         from agent.iteration_budget import IterationBudget
@@ -466,6 +464,8 @@ class TestSubagentSteerRPC:
             "transport": owner_transport,
         }
         child = MagicMock()
+        from agent.orchestration_runtime import admit_worker
+        child._orchestration_admission = admit_worker(delegation_policy_parent)
         child._subagent_id = "sid-context-owner"
         child._delegate_depth = 1
         child.model = "test-model"
