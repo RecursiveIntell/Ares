@@ -4,10 +4,12 @@ Pure-data leaf module: DEFAULT_CONFIG and OPTIONAL_ENV_VARS, extracted
 verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 """
 
+from agent.orchestration_policy import OrchestrationPolicy
 DEFAULT_TERMINAL_IMAGE = "nikolaik/python-nodejs:python3.14-nodejs26"
 DEFAULT_SINGULARITY_IMAGE = f"docker://{DEFAULT_TERMINAL_IMAGE}"
 
 DEFAULT_CONFIG = {
+    "orchestration": OrchestrationPolicy().to_dict(),
     "model": "",
     "providers": {},
     "fallback_providers": [],
@@ -1625,6 +1627,8 @@ DEFAULT_CONFIG = {
         # Process-isolation rollout controls. Runtime reads these through the
         # raw config loader, so tui_gateway.server also owns explicit defaults.
         "turn_isolation": False,
+        # Dispatch-location requirement only; not an OS sandbox or permit.
+        "require_compute_host": False,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
         # Opt-in dispatch-location requirement (default off). When true,

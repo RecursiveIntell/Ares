@@ -15,7 +15,10 @@ import threading
 import time
 import types
 import unittest
+import uuid
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
@@ -43,7 +46,29 @@ def _bounded_child_wall_clock(monkeypatch):
     _get_child_timeout as the sanctioned bounding seam; without a bound the
     child refusal (delegated_expiry) rejects the probe before it starts.
     """
-    monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 600.0)
+    monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda *a, **k: 600.0)
+
+_POLICY_TEST_DBS = []
+
+
+@pytest.fixture(autouse=True)
+def _close_policy_test_databases():
+    yield
+    while _POLICY_TEST_DBS:
+        _POLICY_TEST_DBS.pop().close()
+
+
+def _run_admitted_test_child(**kwargs):
+    """Legacy lease/heartbeat fixtures explicitly satisfy the new host contract.
+
+    This grants real temporary-owner admission; it does not replace, disable or
+    mock the production guard. Denied/unknown/stale cases live in the dedicated
+    orchestration dispatch suite and still exercise the unwrapped entry point.
+    """
+    from agent.orchestration_runtime import admit_worker
+    from tools.delegate_tool import _run_single_child
+    kwargs["child"]._orchestration_admission = admit_worker(kwargs["parent_agent"])
+    return _run_single_child(**kwargs)
 
 
 def _make_mock_parent(depth=0):
@@ -64,7 +89,10 @@ def _make_mock_parent(depth=0):
     parent.providers_ignored = None
     parent.providers_order = None
     parent.provider_sort = None
-    parent._session_db = None
+    parent.session_id = f"test-parent-{uuid.uuid4().hex}"
+    parent._session_db = SessionDB()
+    parent._session_db.create_session(parent.session_id, "cli", model=parent.model)
+    _POLICY_TEST_DBS.append(parent._session_db)
     parent._delegate_depth = depth
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
@@ -410,32 +438,25 @@ class TestDelegateTask(unittest.TestCase):
         finally:
             parent_db.close()
 
-    def test_child_without_parent_db_still_degrades_to_none(self):
-        """Parent without a SessionDB -> child gets None (pre-fix behaviour).
-
-        The dedicated-handle path must not change the degradation contract:
-        a parent that never opened a session store (headless/oneshot runs,
-        test doubles) still yields ``session_db=None`` children.
-        """
+    def test_child_without_policy_owner_admits_against_config(self):
+        """Store-less parents (child agents, headless runners, test doubles)
+        are admitted against the ambient config's orchestration block: the
+        operator's control point for contexts with no session-scoped policy
+        store. Denials still apply — a config that disables delegation is
+        refused before construction. No session row or dispatch claim is
+        written for these admissions (their SpawnAdmission can never produce
+        a dispatch binding)."""
         parent = _make_mock_parent(depth=0)
         parent._session_db = None
-        with patch("run_agent.AIAgent") as MockAgent:
-            mock_child = MagicMock()
-            MockAgent.return_value = mock_child
-
-            _build_child_agent(
-                task_index=0,
-                goal="test",
-                context=None,
-                toolsets=None,
-                model="test-model",
-                max_iterations=5,
-                parent_agent=parent,
-                task_count=1,
-            )
-
-            _, kwargs = MockAgent.call_args
-            self.assertIsNone(kwargs["session_db"])
+        with patch("run_agent.AIAgent") as constructor:
+            child = _build_child_agent(task_index=0, goal="test", context=None,
+                toolsets=None, model="test-model", max_iterations=5,
+                parent_agent=parent, task_count=1)
+        admission = child._orchestration_admission
+        self.assertEqual(type(admission).__name__, "SpawnAdmission")
+        self.assertIsNone(admission._owner)
+        self.assertTrue(admission.policy.allow_delegation)
+        constructor.assert_called_once()
 
     def test_child_dedicated_db_follows_parents_db_path(self):
         """Per-profile parents: the child's dedicated handle must target the
@@ -456,6 +477,7 @@ class TestDelegateTask(unittest.TestCase):
             profile_db_path.parent.mkdir(parents=True)
             parent = _make_mock_parent(depth=0)
             parent_db = SessionDB(db_path=profile_db_path)
+            parent_db.create_session(parent.session_id, "cli", model=parent.model)
             parent._session_db = parent_db
             child_db = None
             try:
@@ -714,6 +736,45 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertEqual(trace[2]["tool"], "terminal")
             self.assertEqual(trace[2]["status"], "ok")
             self.assertIn("result_bytes", trace[2])
+
+    def test_provider_failure_is_not_reported_as_completed(self):
+        """Regression: a child whose provider call failed (HTTP 429 quota wall)
+        returns non-empty prose — "API call failed after 3 retries: ..." — as
+        its final_response. The old summary-presence heuristic counted that as
+        a successful summary and reported ``status=completed`` with
+        ``exit_reason=max_iterations``, which is doubly false: the child never
+        spent its iteration budget, and it did not complete anything.
+
+        The conversation loop already returns a structured ``failed: True`` +
+        ``failure_reason`` (agent/conversation_loop.py); the delegate must
+        honor it before any summary-based inference."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-6-luna"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "API call failed after 3 retries: HTTP 429: The usage limit has been reached",
+                "completed": False,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+                "failed": True,
+                "failure_reason": "rate_limit",
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test provider failure", parent_agent=parent))
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "failed")
+            self.assertEqual(entry["exit_reason"], "error")
+            self.assertEqual(entry["failure_reason"], "rate_limit")
+            self.assertFalse(entry["truncated"])
+            # The error text must still surface to the parent, as the failure
+            # summary — never as a successful deliverable.
+            self.assertIn("HTTP 429", entry["summary"])
 
     def test_empty_sentinel_marks_status_failed(self):
         """Regression: a child that returns the literal '(empty)' sentinel
@@ -1129,7 +1190,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
             "messages": [],
         }
 
-        result = _run_single_child(
+        result = _run_admitted_test_child(
             task_index=0,
             goal="Investigate rate limits",
             child=child,
@@ -1150,7 +1211,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child._credential_pool.current.return_value = MagicMock(id="cred-a")
         child.run_conversation.side_effect = RuntimeError("boom")
 
-        result = _run_single_child(
+        result = _run_admitted_test_child(
             task_index=1,
             goal="Trigger failure",
             child=child,
@@ -1200,7 +1261,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
 
         # Patch the heartbeat interval to fire quickly
         with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.01):
-            _run_single_child(
+            _run_admitted_test_child(
                 task_index=0,
                 goal="Test heartbeat",
                 child=child,
@@ -1234,7 +1295,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         }
 
         with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.01):
-            _run_single_child(
+            _run_admitted_test_child(
                 task_index=0,
                 goal="Test cleanup",
                 child=child,
@@ -1300,7 +1361,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
             patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IDLE", 2),
             patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IN_TOOL", 40),
         ):
-            _run_single_child(
+            _run_admitted_test_child(
                 task_index=0,
                 goal="Test long-running tool",
                 child=child,
@@ -1365,7 +1426,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
             patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IDLE", 2),
             patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IN_TOOL", 40),
         ):
-            _run_single_child(
+            _run_admitted_test_child(
                 task_index=0,
                 goal="Test slow model wait",
                 child=child,
@@ -1404,6 +1465,9 @@ class TestDelegationReasoningEffort(unittest.TestCase):
     def test_override_reasoning_effort_from_config(self, MockAgent, mock_cfg):
         """delegation.reasoning_effort overrides the parent's level."""
         mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": "low"}
+        # Execution now reads the strict current source, not a display-loader mock.
+        from hermes_cli.config import get_config_path
+        get_config_path().write_text("delegation:\n  max_iterations: 50\n  reasoning_effort: low\n")
         MockAgent.return_value = MagicMock()
         parent = _make_mock_parent()
         parent.reasoning_config = {"enabled": True, "effort": "xhigh"}

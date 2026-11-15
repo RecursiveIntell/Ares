@@ -276,6 +276,16 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             "checkpoint_strategy": "after_n:2",
             "max_checkpoints": 10,
             "token_budget": None,
+            # Proportional budget policy. These replace the independent absolute
+            # knobs (target 20%, 8k summary ceiling, fixed head cap): every term
+            # is now a fraction of the effective input window, so the same code
+            # is safe on an 8k route and a 2M route. See
+            # ares_runtime.context_budget for the invariant these satisfy.
+            "budget_trigger_ratio": 0.80,
+            "budget_target_ratio": 0.45,
+            "budget_summary_ratio": 0.15,
+            "budget_head_ratio": 0.10,
+            "budget_tail_ratio": 0.20,
             "protect_first_n": self.protect_first_n,
             "protect_last_n": self.protect_last_n,
             "telemetry_max_additional_protected_messages": 8,
@@ -1811,6 +1821,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "max_lineage_generation": self._policy["max_lineage_generation"],
                 "max_provenance_bytes": self._policy["max_provenance_bytes"],
                 "min_net_savings_tokens": self._request_min_net_savings_tokens(),
+                "head_max_tokens": self._head_max_tokens(),
             },
             "focus": focus_topic,
         }
@@ -3358,11 +3369,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             logger.warning("context-governor: %s", warning)
             return compacted
         configured_summary_tokens = max(256, configured_summary_chars // 4)
-        summary_budget = min(
-            int(self.context_length * 0.05) if self.context_length else 4000,
-            8000,
-            configured_summary_tokens,
-        )
+        summary_budget = self._budget_summary_tokens(configured_summary_tokens)
         if resolved_clarifications:
             summary_budget = min(summary_budget, max(64, model_summary_max_chars // 4))
 
@@ -4257,6 +4264,69 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         except (TypeError, ValueError):
             return None
 
+    def _context_budget(self):
+        """The canonical budget for the active route, or None if unavailable."""
+        try:
+            window = int(self.context_length or 0)
+        except (TypeError, ValueError):
+            return None
+        if window <= 0:
+            return None
+        try:
+            from ares_runtime.context_budget import (
+                BudgetRatios,
+                ContextBudget,
+                resolve_output_reserve,
+            )
+
+            ratios = BudgetRatios(
+                trigger=float(self._policy.get("budget_trigger_ratio", 0.80)),
+                target=float(self._policy.get("budget_target_ratio", 0.45)),
+                summary=float(self._policy.get("budget_summary_ratio", 0.15)),
+                head=float(self._policy.get("budget_head_ratio", 0.10)),
+                tail=float(self._policy.get("budget_tail_ratio", 0.20)),
+            )
+            reserve = resolve_output_reserve(self.max_tokens, window)
+            return ContextBudget.from_window(window, reserve, ratios)
+        except Exception as exc:  # noqa: BLE001 - never fail a compaction on this
+            logger.debug("context-governor: no context budget for route (%s)", exc)
+            return None
+
+    def _head_max_tokens(self) -> int | None:
+        """Window-relative head-preservation cap from the budget owner.
+
+        None preserves the crate's standalone default so a host without the
+        budget model behaves exactly as before.
+        """
+        budget = self._context_budget()
+        return int(budget.head_cap) if budget is not None else None
+
+    def _budget_summary_tokens(self, configured_tokens: int) -> int:
+        """Summary budget, owned by the canonical ContextBudget model.
+
+        Previously this was ``min(5% of window, 8000, chars//4)``: at a 1M window
+        that capped the summary at 8,000 tokens while a compaction pass discarded
+        ~550,000, so only ~1.5% of the removed content was represented in the
+        summary and everything else survived only as exact-fallback refs.
+
+        ``configured_tokens`` (from ``summary_max_chars``) is retained as an
+        operator sanity ceiling for spend. Set it ABOVE the model's budget value
+        for the proportional budget to bind; when it is lower it wins, exactly as
+        a documented ceiling should.
+        """
+        if self.context_length and int(self.context_length) > 0:
+            budget = self._context_budget()
+            if budget is not None:
+                return max(256, min(int(budget.summary), max(256, configured_tokens)))
+        return max(
+            256,
+            min(
+                int(self.context_length * 0.05) if self.context_length else 4000,
+                8000,
+                configured_tokens,
+            ),
+        )
+
     def _target_tokens(self, current_tokens: int | None) -> int:
         target = None
         explicit = self._policy.get("token_budget")
@@ -4266,14 +4336,23 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         except (TypeError, ValueError):
             pass
         if target is None:
-            if self.context_length:
+            budget = self._context_budget()
+            if budget is not None:
+                target = int(budget.target)
+            elif self.context_length:
                 target = max(512, int(self.context_length * 0.20))
             elif current_tokens:
                 target = max(512, int(current_tokens * 0.20))
             else:
                 target = 8000
         if self.context_length > 0:
-            input_window = self.context_length - (self.max_tokens or 0)
+            try:
+                from ares_runtime.context_budget import resolve_output_reserve
+
+                reserve = resolve_output_reserve(self.max_tokens, int(self.context_length))
+            except Exception:  # noqa: BLE001
+                reserve = int(self.max_tokens or 0)
+            input_window = self.context_length - reserve
             if input_window <= 0:
                 raise ValueError("context-governor response reservation leaves no input budget")
             # Configured policy remains the requested target. The active route

@@ -1605,9 +1605,15 @@ def _build_gateway_agent_history(
             continue
 
         content = msg.get("content")
-        if inject_timestamps and role == "user" and isinstance(content, str):
-            content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
         if separate_observed_context and msg.get("observed") and role == "user" and content:
+            # Observed group rows become API-only context before the ordinary
+            # user replay filter. Apply the same synthetic-note rule here first
+            # so a timestamp cannot hide the prefix or replay a prior request.
+            content = _strip_auto_continue_noise(content)
+            if not content:
+                continue
+            if inject_timestamps and isinstance(content, str):
+                content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
             observed_group_context.append(str(content).strip())
             continue
 
@@ -1630,6 +1636,11 @@ def _build_gateway_agent_history(
                 content = _strip_auto_continue_noise(content)
                 if not content:
                     continue
+                # Filter the stored synthetic note before adding a presentation
+                # timestamp; otherwise its prefix is hidden and its prior prompt
+                # enters model history on timestamp-enabled gateway routes.
+                if inject_timestamps and isinstance(content, str):
+                    content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
             # Simple text message - just need role and content.
             if msg.get("mirror"):
                 mirror_src = msg.get("mirror_source", "another session")
@@ -1776,6 +1787,7 @@ from agent.replay_cleanup import (  # noqa: E402
 
 
 _AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn"
+_TUI_ADVISORY_CONTINUE_NOTE_PREFIX = "[System note: A previous turn may have been interrupted"
 _AUTO_CONTINUE_FALLBACK_PREFIX = "[System note: A new message"
 
 
@@ -1786,6 +1798,7 @@ def _is_auto_continue_noise(content: Any) -> bool:
         return False
     return (
         content.startswith(_AUTO_CONTINUE_NOTE_PREFIX)
+        or content.startswith(_TUI_ADVISORY_CONTINUE_NOTE_PREFIX)
         or content.startswith(_AUTO_CONTINUE_FALLBACK_PREFIX)
     )
 
@@ -1800,6 +1813,12 @@ def _strip_auto_continue_noise(content: Any) -> Any:
     """
     if not _is_auto_continue_noise(content):
         return content
+    # The TUI advisory note is an entire synthetic turn. Its suffix embeds the
+    # *prior* request, not a new user question; retaining that suffix would
+    # replay an already-attempted effect after a cross-surface resume. Legacy
+    # gateway notes may prefix a genuine new question and keep their old rule.
+    if str(content).startswith(_TUI_ADVISORY_CONTINUE_NOTE_PREFIX):
+        return ""
     text = str(content)
     while _is_auto_continue_noise(text):
         end = text.find("]")

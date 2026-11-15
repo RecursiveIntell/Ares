@@ -21,14 +21,19 @@ def governor(tmp_path):
     ("policy_budget", "window", "reserve", "expected"),
     [
         (128_000, 64_000, 4096, 59_904),
-        (128_000, 64_000, None, 64_000),
+        # CHANGED: reserve None now derives a real reservation (3200 at this
+        # window) instead of being treated as zero, so the input clamp tightens.
+        (128_000, 64_000, None, 60_800),
         (8000, 64_000, 4096, 8000),
         (128_000, 256, 128, 128),
-        (None, 64_000, 4096, 12_800),
+        # CHANGED: with no explicit token_budget the target comes from
+        # ContextBudget (0.45 x effective window) instead of a bare 20%.
+        (None, 64_000, 4096, 26_956),
         (None, 256, 128, 128),
         (128_000, 0, 4096, 128_000),
         (128_000, 1_050_000, 4096, 128_000),
-        (1_050_000, 1_050_000, None, 1_050_000),
+        # CHANGED: derived reservation (32768) is subtracted before the clamp.
+        (1_050_000, 1_050_000, None, 1_017_232),
         (1_050_000, 1_048_576, 4096, 1_044_480),
     ],
 )
@@ -56,7 +61,9 @@ def test_exhausted_input_budget_refuses_update_without_rebinding(governor, reser
 
 def test_handoff_forwards_and_clears_the_engine_response_reserve(governor):
     governor._policy["token_budget"] = 128_000
-    for reserve, target in [(4096, 59_904), (None, 64_000)]:
+    # CHANGED: a cleared reservation (None) is no longer treated as zero — the
+    # budget owner derives 3200 for this window, so the input clamp tightens.
+    for reserve, target in [(4096, 59_904), (None, 60_800)]:
         _update_compressor_model(
             governor,
             model="test-model",

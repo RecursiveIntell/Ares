@@ -27,7 +27,7 @@ def _bounded_child_wall_clock(monkeypatch):
     _get_child_timeout as the sanctioned bounding seam; without a bound the
     child refusal (delegated_expiry) rejects the probe before it starts.
     """
-    monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 600.0)
+    monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda *a, **k: 600.0)
 
 
 class TestCLISubagentInterrupt(unittest.TestCase):
@@ -132,6 +132,12 @@ class TestCLISubagentInterrupt(unittest.TestCase):
 
                     # Register child manually (normally done by _build_child_agent)
                     parent._active_children.append(mock_instance)
+                    # Every real child carries its spawn admission (set by
+                    # _build_child_agent); a store-less parent yields the
+                    # config-default admission. assert_child_dispatch refuses
+                    # a child without one before the turn starts.
+                    from agent.orchestration_runtime import admit_worker
+                    mock_instance._orchestration_admission = admit_worker(parent)
 
                     result = _run_single_child(
                         task_index=0,

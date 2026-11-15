@@ -191,6 +191,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[all] [reason]", busy_policy="dispatch"),
     CommandDef("background", "Run a prompt in the background", "Session",
                aliases=("bg", "btw"), args_hint="<prompt>", busy_policy="dispatch"),
+    CommandDef("orchestration", "Control this session's workers and secondary route", "Session",
+               args_hint="[show|off|prefer|no-delegation|no-graphs|secondary provider model [effort]|inherit-secondary]",
+               busy_policy="dispatch"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",), busy_policy="dispatch"),
     CommandDef("journey", "Open the learning journey timeline",
@@ -1370,7 +1373,11 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "llm-pipeline", "llm_pipeline"})
+#   - orchestration: per-session worker/route control — an operator surface
+#     reached via /hermes orchestration on Slack so its native slot doesn't
+#     displace an existing native slash at the 50-command cap (adding it
+#     without a demotion clamped /insights off and broke Telegram parity).
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "llm-pipeline", "llm_pipeline", "orchestration"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

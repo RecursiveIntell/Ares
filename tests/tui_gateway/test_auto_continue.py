@@ -1,19 +1,10 @@
-"""Crash-interrupted turns auto-continue on the next session.resume.
+"""Best-effort turn markers on Desktop/TUI resume, never effect authority.
 
-A turn's durable marker (tui_gateway/turn_marker.py) is written when the turn
-starts running and cleared when it concludes — success, handled error, or
-interrupt. Only a process death leaves it behind, so a marker found at resume
-time is positive proof the turn never finished. Contract pinned here:
-
-* the marker module round-trips, prunes stale entries, and tolerates a
-  corrupt sidecar;
-* ``_run_prompt_submit`` writes the marker before the turn and clears it in
-  the ``finally`` on both the success and exception paths (a handled failure
-  is a concluded turn — its terminal frame + retained snapshot own recovery);
-* ``_maybe_schedule_auto_continue`` re-submits a fresh interrupted prompt as
-  a continuation note (display_kind ``auto_continue``), refuses stale /
-  disabled / crash-looping / already-running cases, and bounds attempts via
-  the marker's attempt counter.
+The sidecar prompt can survive a process death, but failed clears or same-UID
+writes mean its presence is not proof of death, noncompletion, or safe replay.
+Tests cover marker I/O, normal turn retirement, explicitly opted-in automatic
+continuation, and the disabled route's non-executing UI projection. The marker
+is not an authenticated task, provider outcome, or model-history entry.
 """
 
 from __future__ import annotations
@@ -228,6 +219,18 @@ def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home
     assert stamped == [("session-key", "auto_continue")]
 
 
+def test_auto_continue_note_does_not_assert_unproven_process_death():
+    note = server._auto_continue_note("the original prompt")
+    assert note.startswith("[System note: A previous turn may have been interrupted")
+    assert "outcome is unknown" in note.lower()
+    assert "Your previous turn was interrupted mid-run" not in note
+    assert "stopped before the turn could finish" not in note
+    assert "the original prompt" in note
+    assert server._legacy_display_kind("user", note) == "auto_continue"
+    legacy = "[System note: Your previous turn was interrupted mid-run — old note]"
+    assert server._legacy_display_kind("user", legacy) == "auto_continue"
+
+
 # ── Scheduling decision ────────────────────────────────────────────────
 
 
@@ -264,10 +267,69 @@ def test_fresh_marker_schedules_continuation(
     assert session["running"] is True
     assert session["_auto_continue_attempt"] == 1
     (text, kwargs), = schedule_env
-    assert text.startswith("[System note: Your previous turn was interrupted")
+    assert text.startswith("[System note: A previous turn may have been interrupted")
     assert "fix the flaky test" in text
     assert kwargs["display_kind"] == "auto_continue"
     assert ("message.start", "sid", None) in [(e, s, p) for e, s, p in emits]
+
+
+def test_disabled_auto_continue_preserves_interrupted_prompt_for_review(
+    marker_home, monkeypatch
+):
+    """Cold resume must show an interrupted prompt without rerunning it."""
+    monkeypatch.setattr(
+        server, "_load_cfg",
+        lambda: {"desktop": {"auto_continue": {"enabled": False}}},
+    )
+    record_turn_start(marker_home, "session-key", "inspect before retry")
+    session = _session()
+    assert server._maybe_schedule_auto_continue("sid", session, "session-key") is None
+    assert read_turn_marker(marker_home, "session-key") is not None
+    snapshot = server._cold_interrupted_turn_projection(session, "session-key")
+    assert snapshot["user"] == "inspect before retry"
+    assert snapshot["status"] == "error"
+    assert snapshot["error"].startswith("Possible interrupted turn;")
+    assert snapshot["streaming"] is False
+    assert snapshot["error_surface"]["retryable"] is False
+
+
+def test_deferred_desktop_resume_projects_disabled_interrupted_prompt(tmp_path, monkeypatch):
+    """Desktop's defer_history+omit_messages path must not hide a crash marker."""
+    class _DB:
+        def get_session(self, session_id):
+            return {"id": session_id, "message_count": 0}
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_schedule_resume_hydration", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(
+        server, "_load_cfg",
+        lambda: {"desktop": {"auto_continue": {"enabled": False}}},
+    )
+    record_turn_start(tmp_path, "cold-stored", "review this before retry")
+    response = server.handle_request({
+        "id": "resume", "method": "session.resume",
+        "params": {"session_id": "cold-stored", "defer_history": True,
+                   "omit_messages": True, "source": "desktop"},
+    })
+    try:
+        assert "error" not in response, response
+        result = response["result"]
+        assert result["hydrating"] is True
+        assert result["messages"] == []
+        assert result["inflight"]["user"] == "review this before retry"
+        assert result["inflight"]["error_surface"]["retryable"] is False
+        assert "auto_continue" not in result
+        assert server._sessions[result["session_id"]]["history"] == []
+        assert read_turn_marker(tmp_path, "cold-stored") is not None
+    finally:
+        if "result" in response:
+            server._sessions.pop(response["result"]["session_id"], None)
 
 
 def test_auto_continue_is_disabled_when_config_is_absent(
@@ -279,7 +341,8 @@ def test_auto_continue_is_disabled_when_config_is_absent(
 
     assert result is None
     assert not schedule_env
-    assert read_turn_marker(marker_home, "session-key") is None
+    # No automatic retry, but preserve the interrupted prompt for review.
+    assert read_turn_marker(marker_home, "session-key") is not None
 
 
 def test_stale_marker_is_cleared_not_continued(schedule_env, marker_home, monkeypatch):
