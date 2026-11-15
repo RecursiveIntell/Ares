@@ -358,6 +358,28 @@ def test_readback_failure_releases_lock_without_repair(running):
 
 def test_old_wal_snapshot_cannot_qualify_after_other_connection_reclaims(running):
     conn, task, _, _, _ = running
+    # The production owner legitimately uses DELETE instead of WAL on SQLite
+    # builds affected by the WAL-reset corruption advisory. A concurrent writer
+    # cannot advance while this DELETE reader holds a transaction, so testing a
+    # WAL-only race there causes an unbounded lock wait rather than exercising
+    # the currentness guard. Both journal modes must still refuse stale reads.
+    mode = conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
+    assert mode in {"wal", "delete"}
+    if mode == "delete":
+        conn.execute("BEGIN")
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (task,)
+        ).fetchone()[0] == "running"
+        with pytest.raises(ContractError, match="MISSION_RUN_TRANSACTION_UNQUALIFIED"):
+            read(running)
+        assert conn.in_transaction
+        conn.rollback()
+        with kb.connect_closing(board="default") as other:
+            assert kb.reclaim_task(other, task, reason="invalidate stale snapshot")
+        with pytest.raises(ContractError, match="MISSION_RUN_NOT_CURRENT"):
+            read(running)
+        return
+
     conn.execute("BEGIN")
     assert (
         conn.execute("SELECT status FROM tasks WHERE id=?", (task,)).fetchone()[0]
