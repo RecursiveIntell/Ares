@@ -1,0 +1,76 @@
+{
+  "activation": "OFF",
+  "notes": [
+    "recursive-agent #37 is CONFLICTING/DIRTY and large (164 files) overlapping composition work; #36 is mergeable with checks passing (primitive). Reconciliation direction needed.",
+    "Libraries #95 and Ares #259 are open/mergeable at snapshot time; canonical checkouts remain dirty with unrelated work."
+  ],
+  "prs": {
+    "pr259": {
+      "baseRefName": "main",
+      "headRefName": "rsi/runtime-integration-dispatch-20261112",
+      "mergeStateStatus": "BEHIND",
+      "mergeable": "MERGEABLE",
+      "number": 259,
+      "state": "OPEN",
+      "title": "rsi: dispatch governor, kanban mission binding, and pagination helper",
+      "url": "https://github.com/RecursiveIntell/Ares/pull/259"
+    },
+    "pr36": {
+      "baseRefName": "main",
+      "headRefName": "rsi/r08-inference-budget-primitive-20261112",
+      "mergeStateStatus": "CLEAN",
+      "mergeable": "MERGEABLE",
+      "number": 36,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-11-14T20:32:39Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/RecursiveIntell/recursive-agent/actions/runs/43637683155/job/132578004821",
+          "name": "Paired root",
+          "startedAt": "2026-11-14T20:28:38Z",
+          "status": "COMPLETED",
+          "workflowName": "Recursive Agent paired-root CI"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-11-14T20:32:44Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/RecursiveIntell/recursive-agent/actions/runs/43637683155/job/132579106345",
+          "name": "All required checks pass",
+          "startedAt": "2026-11-14T20:32:41Z",
+          "status": "COMPLETED",
+          "workflowName": "Recursive Agent paired-root CI"
+        }
+      ],
+      "title": "rsi(r08): conservative inference budget owner primitive",
+      "url": "https://github.com/RecursiveIntell/recursive-agent/pull/36"
+    },
+    "pr37": {
+      "additions": 45540,
+      "baseRefName": "main",
+      "changedFiles": 164,
+      "deletions": 260,
+      "headRefName": "rsi/r08-campaign-composition-20261112",
+      "mergeStateStatus": "DIRTY",
+      "mergeable": "CONFLICTING",
+      "number": 37,
+      "state": "OPEN",
+      "title": "rsi(r08): governed model-call campaign composition and integration candidate",
+      "url": "https://github.com/RecursiveIntell/recursive-agent/pull/37"
+    },
+    "pr95": {
+      "baseRefName": "main",
+      "headRefName": "rsi/bounded-rsi-tranche-20261112",
+      "mergeStateStatus": "UNSTABLE",
+      "mergeable": "MERGEABLE",
+      "number": 95,
+      "state": "OPEN",
+      "title": "rsi: bounded tranche fixes (admission, policy, evidence, oracle, python adapter)",
+      "url": "https://github.com/RecursiveIntell/Libraries/pull/95"
+    }
+  },
+  "recorded_at": "2026-11-14T14:56:13-06:00",
+  "schema": "RSIPRStatusSnapshotV1"
+}
