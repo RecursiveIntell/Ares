@@ -60,7 +60,6 @@ ORPHAN_LEDGER: dict[str, tuple[str, str, str]] = {
     "MaterializationReceiptStore": ("unexport", "2.3", "internal receipt store"),
     "MaterializedContextV1": ("unexport", "2.2", "internal artifact"),
     "MemoryResolutionState": ("unexport", "2.2", "internal state enum"),
-    "MissionContractV1": ("unexport", "1.3", "internal contract artifact"),
     "PermitBridgeOutcome": ("unexport", "1.3", "internal permit enum"),
     "PermitBridgeState": ("unexport", "1.3", "internal permit enum"),
     "PersistedManagedMaterialization": ("unexport", "2.3", "internal persisted record"),
