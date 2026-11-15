@@ -87,6 +87,17 @@ def test_real_attachment_event_and_reopen_exact_readback(owner):
     assert not any("mission" in name or "campaign" in name for name in tables)
 
 
+def test_mission_attachment_is_private_under_group_writable_umask(owner):
+    previous = os.umask(0o002)
+    try:
+        conn, task, artifact, attachment = attach(owner)
+    finally:
+        os.umask(previous)
+    path = attachment_path(conn, attachment)
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert read(conn, task, artifact, attachment) == artifact
+
+
 def test_readback_selects_exact_attachment_never_latest(owner):
     conn, task, original, first = attach(owner)
     successor = mission(task, "different objective")
