@@ -4152,13 +4152,16 @@ def store_attachment_bytes(
     dest_dir = task_attachments_dir(task_id, board=board)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
+    private_identity = None
     try:
         if content_type == "application/vnd.recursiveintell.mission-contract+json;version=1":
-            # Mission readback rejects group/other write bits. Create private
-            # from the first byte: chmod after a public write is a race, and
-            # the caller's umask must not change this admission boundary.
+            # Secure from first byte; never chmod publicly written evidence.
+            # O_EXCL refuses collisions instead of overwriting another owner.
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-            with os.fdopen(os.open(dest_path, flags, 0o600), "wb") as stream:
+            fd = os.open(dest_path, flags, 0o600)
+            private_stat = os.fstat(fd)
+            private_identity = (private_stat.st_dev, private_stat.st_ino)
+            with os.fdopen(fd, "wb") as stream:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -4174,10 +4177,15 @@ def store_attachment_bytes(
             uploaded_by=uploaded_by,
         )
     except Exception:
-        # Don't leave an orphan blob if the metadata insert fails (most
-        # commonly: the task id doesn't exist).
+        # Never delete an existing/raced-in mission file if O_EXCL refused it.
+        # An owned orphan can be removed only while its inode still matches.
         try:
-            dest_path.unlink(missing_ok=True)
+            if content_type == "application/vnd.recursiveintell.mission-contract+json;version=1":
+                current = dest_path.stat(follow_symlinks=False)
+                if private_identity == (current.st_dev, current.st_ino):
+                    dest_path.unlink(missing_ok=True)
+            else:
+                dest_path.unlink(missing_ok=True)
         except OSError:
             pass
         raise
