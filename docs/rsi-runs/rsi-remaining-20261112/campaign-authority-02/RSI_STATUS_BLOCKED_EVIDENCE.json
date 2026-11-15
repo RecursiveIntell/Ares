@@ -1,0 +1,17 @@
+{
+  "schema": "RSIStatusBlockedEvidenceV1",
+  "recorded_at": "2026-11-14T14:56:31-06:00",
+  "activation": "OFF",
+  "artifacts": [
+    {
+      "path": "/home/sikmindz/.ares/runs/rsi-remaining-20261112/RSI_REMAINING_STATUS_BLOCKED.md",
+      "sha256": "149c3ee55f5a89a972931c95d6ef4893c0e8e43ccaa01429024191b0cc07db37",
+      "bytes": 6148
+    },
+    {
+      "path": "/home/sikmindz/.ares/runs/rsi-remaining-20261112/campaign-authority-02/RSI_PR_STATUS_SNAPSHOT.json",
+      "sha256": "fe3760771ca842e24a7b86564b6b3933e8523735e6580458b0258eb9c37b5c2f",
+      "bytes": 2980
+    }
+  ]
+}
