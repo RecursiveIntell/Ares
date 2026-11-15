@@ -4152,8 +4152,18 @@ def store_attachment_bytes(
     dest_dir = task_attachments_dir(task_id, board=board)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
-    dest_path.write_bytes(data)
     try:
+        if content_type == "application/vnd.recursiveintell.mission-contract+json;version=1":
+            # Mission readback rejects group/other write bits. Create private
+            # from the first byte: chmod after a public write is a race, and
+            # the caller's umask must not change this admission boundary.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+            with os.fdopen(os.open(dest_path, flags, 0o600), "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        else:
+            dest_path.write_bytes(data)
         return add_attachment(
             conn,
             task_id,
