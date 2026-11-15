@@ -4255,6 +4255,9 @@ def read_task_mission_contract(
     path = Path(attachment.stored_path)
     if not path.is_absolute() or path.parent != root or path.name in {".", ".."}:
         raise ContractError("MISSION_ATTACHMENT_PATH_UNQUALIFIED")
+    owner_uid = getattr(os, "getuid", None)
+    if not callable(owner_uid):
+        raise ContractError("MISSION_ATTACHMENT_HOST_UNQUALIFIED")
     directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
@@ -4262,7 +4265,7 @@ def read_task_mission_contract(
         with os.fdopen(fd, "rb") as stream:
             before = os.fstat(stream.fileno())
             if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
-                    or before.st_uid != os.getuid() or before.st_mode & 0o022
+                    or before.st_uid != owner_uid() or before.st_mode & 0o022
                     or before.st_size != attachment.size):
                 raise ContractError("MISSION_ATTACHMENT_FILE_UNQUALIFIED")
             raw = stream.read(1048577)
