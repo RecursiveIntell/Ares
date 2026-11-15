@@ -6185,6 +6185,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # Mandatory session admission lives outside optional observer hooks.
+        # This exact remote identity is retained when tool_call unwraps or
+        # execute_code invokes the registry handler directly.
+        from agent.orchestration_graph import guard_graph_mcp
+        from agent.orchestration_policy import OrchestrationError
+        from agent.orchestration_runtime import denial_result
+        try:
+            guard_graph_mcp(server_name, tool_name, args)
+        except OrchestrationError as error:
+            return denial_result(error)
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy

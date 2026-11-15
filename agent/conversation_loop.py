@@ -3076,6 +3076,7 @@ def run_conversation(
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
         api_start_time = time.time()
+        _api_window_start = time.monotonic()
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
@@ -4692,6 +4693,17 @@ def run_conversation(
                     outcome="success",
                 )
                 agent._touch_activity(f"API call #{api_call_count} completed")
+                # This is the logical API window (including retry/backoff and
+                # middleware), not a claim about provider-only model compute.
+                # Failed or interrupted windows are not reported as samples.
+                try:
+                    _depth = getattr(agent, "_delegate_depth", 0)
+                    _progress = getattr(agent, "tool_progress_callback", None)
+                    if type(_depth) is int and _depth > 0 and callable(_progress):
+                        _progress("subagent.api_timing", duration_seconds=max(
+                            0.0, time.monotonic() - _api_window_start))
+                except Exception:
+                    logger.debug("Delegated API timing callback failed", exc_info=True)
                 break  # Success, exit retry loop
 
             except InterruptedError:
@@ -7851,6 +7863,17 @@ def run_conversation(
                     final_response = ""
                     failed = True
                     break
+
+                # Timeout salvage is a bounded projection of an accepted,
+                # durably persisted tool turn, never an unsettled provider
+                # stream. Persistence-disabled agents must not publish it here.
+                if _tool_turn_persisted is True and current_interim_visible:
+                    _accepted_text_cb = getattr(agent, "_delegation_accepted_text_callback", None)
+                    if callable(_accepted_text_cb):
+                        try:
+                            _accepted_text_cb(current_interim_visible)
+                        except Exception:
+                            logger.debug("Delegation accepted-text capture failed", exc_info=True)
 
                 # A UI must never observe an assistant/tool-call row that is
                 # still only an ephemeral in-memory projection. Emit interim
