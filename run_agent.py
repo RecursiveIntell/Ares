@@ -8540,7 +8540,8 @@ class AIAgent:
             from agent.orchestration_policy import OrchestrationError
             from agent.orchestration_runtime import admit_worker, denial_result
             try:
-                admission = admit_worker(self)
+                admission = admit_worker(
+                    self, effect="graph" if function_args.get("graph_id") is not None else "delegation")
             except OrchestrationError as exc:
                 return denial_result(exc)
         return _delegate_task(
@@ -8550,6 +8551,11 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=(not _is_subagent),
+            graph_id=function_args.get("graph_id"),
+            graph_version=function_args.get("graph_version"),
+            graph_input=function_args.get("graph_input"),
+            graph_budgets=function_args.get("graph_budgets"),
+            graph_operation_id=function_args.get("graph_operation_id"),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),

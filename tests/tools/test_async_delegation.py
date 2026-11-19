@@ -827,9 +827,53 @@ def test_batch_truncation_banner_marks_only_truncated_task():
 
 
 
-# --- DELIVERY card (P1): origin-bound graph alias + backend generation ---
-# LOCK contract-v1 §2/§3. F2 fixture: persist origin A + result R, interrupt
-# after terminal store before delivery, restart, offer R twice, focus B.
+def test_graph_operation_key_reattaches_same_origin_and_conflicts_on_changed_digest(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    ran = []
+    kwargs = dict(
+        goal="graph route F1", context=None, toolsets=None, role="graph", model="gpt-6-luna",
+        session_key="origin-A", parent_session_id="parent-A",
+        runner=lambda: (ran.append("run") or {"status":"completed","summary":"R"}),
+        graph_alias="research-v1", backend_generation="sha256:"+"a"*64,
+        request_digest="sha256:"+"b"*64, operation_key="origin-A:op-1",
+    )
+    first = ad.dispatch_async_delegation(**kwargs)
+    assert first["status"] == "dispatched"
+    did = first["delegation_id"]
+    deadline = time.monotonic()+5
+    while ad.active_count() and time.monotonic()<deadline: time.sleep(.02)
+    again = ad.dispatch_async_delegation(**kwargs)
+    assert again["status"] == "reattached"
+    assert again["delegation_id"] == did
+    assert len(ran) == 1
+    changed = {**kwargs, "request_digest":"sha256:"+"c"*64}
+    conflict = ad.dispatch_async_delegation(**changed)
+    assert conflict["status"] == "rejected"
+    assert conflict["error_code"] == "idempotency_conflict"
+    assert len(ran) == 1
+    row = ad.get_durable_delegation(did)
+    assert row["operation_key"] == "origin-A:op-1"
+    assert row["request_digest"] == "sha256:"+"b"*64
+
+
+def test_graph_backend_binding_records_run_id_and_conflicts_on_repin(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    h=ad.dispatch_async_delegation(
+        goal="graph",context=None,toolsets=None,role="graph",model="m",session_key="A",
+        runner=lambda:{"status":"completed","summary":"R"},
+        graph_alias="research-v1",backend_generation="v1",request_digest="sha256:"+"b"*64,
+        operation_key="A:op-2")
+    did=h["delegation_id"]
+    assert ad.bind_graph_backend(did,graph_alias="research-v1",backend_generation="v1",
+        request_digest="sha256:"+"b"*64,graph_run_id="run-1")["ok"] is True
+    assert ad.get_durable_delegation(did)["graph_run_id"]=="run-1"
+    conflict=ad.bind_graph_backend(did,graph_alias="research-v1",backend_generation="v1",
+        request_digest="sha256:"+"b"*64,graph_run_id="run-2")
+    assert conflict=={"ok":False,"code":"graph_backend_binding_conflict"}
+    assert ad.get_durable_delegation(did)["graph_run_id"]=="run-1"
+
 
 def test_graph_alias_and_backend_generation_bind_to_original_record(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

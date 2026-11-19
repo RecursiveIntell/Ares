@@ -6177,6 +6177,36 @@ def _ensure_healthy_or_recycle(server: Any, server_name: str) -> None:
         _signal_reconnect(server)
 
 
+def _has_managed_graph_admission(result: Any) -> bool:
+    """Return true only for the exact daemon protocol that consumes Ares
+    owner claims at launch and before provider invocations. Old daemons are
+    never silently used for managed graph work.
+    """
+    content = getattr(result, "structured_content", None)
+    if content is None:
+        content = getattr(result, "structuredContent", None)
+    if content is None:
+        for block in getattr(result, "content", []) or []:
+            text = getattr(block, "text", None)
+            if isinstance(text, str):
+                try:
+                    content = json.loads(text)
+                    break
+                except json.JSONDecodeError:
+                    continue
+    if not isinstance(content, dict):
+        return False
+    data = content.get("data", content)
+    caps = data.get("capabilities") if isinstance(data, dict) else None
+    admission = caps.get("host_admission") if isinstance(caps, dict) else None
+    return (
+        isinstance(admission, dict)
+        and admission.get("protocol") == "ares.graph-admission/v1"
+        and admission.get("launch_owner_claim") is True
+        and admission.get("provider_owner_claim") is True
+    )
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -6192,15 +6222,29 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         from agent.orchestration_policy import OrchestrationError
         from agent.orchestration_runtime import denial_result
         try:
-            guard_graph_mcp(server_name, tool_name, args)
+            host_grant = guard_graph_mcp(server_name, tool_name, args)
+            if host_grant is not None:
+                # Host owner overwrites any caller-supplied grant. The model
+                # cannot select a reference or authority endpoint.
+                args = dict(args)
+                args["host_grant"] = host_grant
         except OrchestrationError as error:
             return denial_result(error)
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
         # first-use spawn below. A denied call never touches the server.
+        def _retire_pending_host_grant():
+            if host_grant is not None:
+                try:
+                    from agent.orchestration_graph import retire_graph_host_grant
+                    retire_graph_host_grant(host_grant)
+                except Exception:
+                    pass
+
         gate_error = _trust_gate_check(server_name, tool_name)
         if gate_error is not None:
+            _retire_pending_host_grant()
             return gate_error
 
         # Circuit breaker: if this server has failed too many times
@@ -6217,6 +6261,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             opened_at = _server_breaker_opened_at.get(server_name, 0.0)
             age = time.monotonic() - opened_at
             if age < _CIRCUIT_BREAKER_COOLDOWN_SEC:
+                _retire_pending_host_grant()
                 remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
                 return tool_error(
                     f"MCP server '{server_name}' is unreachable after "
@@ -6229,6 +6274,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         server = _get_connected_server_for_call(server_name)
         if not server:
+            _retire_pending_host_grant()
             _bump_server_error(server_name)
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -6245,7 +6291,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             else:
                 # Still down — the server task is reconnecting, or it has
                 # exhausted its retry budget and parked (e.g. a dead stdio
-                # subprocess). Probing here would write into a dead/absent
+                # subprocess). Retire the unconsumed owner reference before
+                # asking for a reconnect; never leave a launch ticket live.
+                _retire_pending_host_grant()
                 # transport and re-arm the breaker forever (#16788). Instead,
                 # ask the (always-present) server task to rebuild the
                 # transport — which respawns a dead stdio subprocess — and
@@ -6261,6 +6309,31 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         f"immediately — give it a few seconds to come back."
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
+
+        if host_grant is not None:
+            async def _host_admission_preflight():
+                session = server.session
+                if session is None:
+                    return False
+                async with server._rpc_lock:
+                    status = await session.call_tool("graph_status", arguments={})
+                return _has_managed_graph_admission(status)
+
+            try:
+                qualified_peer = _run_on_mcp_loop(
+                    _host_admission_preflight,
+                    timeout=min(10.0, float(tool_timeout or 10.0)),
+                )
+            except Exception:
+                qualified_peer = False
+            if not qualified_peer:
+                _retire_pending_host_grant()
+                return json.dumps({
+                    "status": "blocked",
+                    "code": "graph_peer_unqualified",
+                    "provider_calls": 0,
+                    "note": "Managed graph launch requires the Ares host-admission protocol at launch and provider invocation. No legacy fallback was used.",
+                }, ensure_ascii=False)
 
         async def _call():
             _mark_server_call_started(server)

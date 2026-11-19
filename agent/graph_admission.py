@@ -141,6 +141,13 @@ class GraphAdmissionService:
             if entry is not None and entry.scope is scope:
                 del self._entries[scope.reference]
 
+    def retire_reference(self, reference):
+        """Revoke a pending host-issued reference after preflight refusal."""
+        if not _identifier(reference):
+            return False
+        with self._lock:
+            return self._entries.pop(reference, None) is not None
+
     def authorize(self, request):
         """Every accepted callback commits a fresh, non-replayable owner claim.
 
