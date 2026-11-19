@@ -254,8 +254,13 @@ def _recovery_markers() -> Iterator[dict[pathlib.Path, bytes]]:
         REPO_ROOT / ".lazy-refresh-incomplete": b"synthetic P04 lazy marker\n",
     }
     assert all(not path.exists() and not path.is_symlink() for path in marker_contents)
+    # Ensure parent directory exists and is writable
+    REPO_ROOT.mkdir(parents=True, exist_ok=True)
     for path, raw in marker_contents.items():
         path.write_bytes(raw)
+        # Verify write succeeded
+        assert path.exists(), f"Failed to create marker: {path}"
+        assert path.read_bytes() == raw, f"Marker content mismatch: {path}"
     try:
         yield marker_contents
     finally:

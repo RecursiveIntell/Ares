@@ -1,0 +1,10 @@
+RSI-REMAINING PRESERVATION MANIFEST 2026-11-14T14:27:49-06:00
+pwd=/home/sikmindz/.ares/runs/rsi-remaining-20261112
+receipts=519
+zips=20
+top-level-size=26G	.
+---branches---
+Libraries c5b146aa rsi/bounded-rsi-tranche-20261112 pushed
+Ares 2e46802e1d rsi/runtime-integration-dispatch-20261112 pushed
+native-r08 b17d559 rsi/r08-inference-budget-primitive-20261112 pushed
+native-composition 8fa6704 rsi/r08-campaign-composition-20261112 pushed

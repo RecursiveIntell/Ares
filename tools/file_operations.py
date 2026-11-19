@@ -2936,7 +2936,10 @@ class ShellFileOperations(FileOperations):
         merged = SearchResult()
         for p in existing:
             if target == "files":
-                sub = self._search_files(pattern, p, limit, offset)
+                # Preserve requested root order and each backend's ordering.
+                # Fetch a prefix plus one lookahead, then paginate the combined
+                # sequence once; per-root offsets would discard valid results.
+                sub = self._search_files(pattern, p, offset + limit + 1, 0)
             else:
                 sub = self._search_content(pattern, p, file_glob, limit, offset,
                                            output_mode, context)
@@ -2949,7 +2952,11 @@ class ShellFileOperations(FileOperations):
             merged.truncated = merged.truncated or sub.truncated
         # Respect the caller's limit across the merged set.
         merged.matches = merged.matches[:limit]
-        merged.files = merged.files[:limit]
+        if target == "files":
+            merged.truncated = merged.truncated or len(merged.files) > offset + limit
+            merged.files = merged.files[offset:offset + limit]
+        else:
+            merged.files = merged.files[:limit]
         note = f"path contained {len(parts)} entries; searched {len(existing)} that exist"
         if missing:
             note += "; skipped missing: " + ", ".join(missing[:3])

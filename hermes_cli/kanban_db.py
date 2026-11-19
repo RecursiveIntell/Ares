@@ -4152,8 +4152,21 @@ def store_attachment_bytes(
     dest_dir = task_attachments_dir(task_id, board=board)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
-    dest_path.write_bytes(data)
+    private_identity = None
     try:
+        if content_type == "application/vnd.recursiveintell.mission-contract+json;version=1":
+            # Secure from first byte; never chmod publicly written evidence.
+            # O_EXCL refuses collisions instead of overwriting another owner.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+            fd = os.open(dest_path, flags, 0o600)
+            private_stat = os.fstat(fd)
+            private_identity = (private_stat.st_dev, private_stat.st_ino)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        else:
+            dest_path.write_bytes(data)
         return add_attachment(
             conn,
             task_id,
@@ -4164,13 +4177,210 @@ def store_attachment_bytes(
             uploaded_by=uploaded_by,
         )
     except Exception:
-        # Don't leave an orphan blob if the metadata insert fails (most
-        # commonly: the task id doesn't exist).
+        # Never delete an existing/raced-in mission file if O_EXCL refused it.
+        # An owned orphan can be removed only while its inode still matches.
         try:
-            dest_path.unlink(missing_ok=True)
+            if content_type == "application/vnd.recursiveintell.mission-contract+json;version=1":
+                current = dest_path.stat(follow_symlinks=False)
+                if private_identity == (current.st_dev, current.st_ino):
+                    dest_path.unlink(missing_ok=True)
+            else:
+                dest_path.unlink(missing_ok=True)
         except OSError:
             pass
         raise
+
+
+def _mission_attachment_owner(conn: sqlite3.Connection, task_id: str, board: str) -> Path:
+    """Resolve the existing tracked board/task owner; never initialize it."""
+    from ares_runtime.collaboration import ContractError
+    from hermes_cli.sqlite_safe_read import connection_file_identity
+
+    if (os.name != "posix" or type(board) is not str or not board
+            or _normalize_board_slug(board) != board
+            or type(task_id) is not str
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task_id) is None):
+        raise ContractError("MISSION_OWNER_UNQUALIFIED")
+    identity = connection_file_identity(conn)
+    expected = kanban_db_path(board=board).stat(follow_symlinks=False)
+    if identity != (expected.st_dev, expected.st_ino) or get_task(conn, task_id) is None:
+        raise ContractError("MISSION_OWNER_MISMATCH")
+    root = task_attachments_dir(task_id, board=board).absolute()
+    if root != root.resolve():
+        raise ContractError("MISSION_ATTACHMENT_PATH_UNQUALIFIED")
+    return root
+
+
+def attach_task_mission_contract(
+    conn: sqlite3.Connection, task_id: str, contract: Any, *, board: str,
+) -> int:
+    """Attach exact intent through the existing artifact/event owner.
+
+    Returns a specific attachment ID, NOT an active mission or execution grant.
+    No newest-artifact selection, goal binding or funding authority is implied.
+    """
+    from ares_runtime.collaboration import ContractError, MissionContractV1, contract_ref
+
+    if not isinstance(contract, MissionContractV1):
+        raise ContractError("INVALID_MISSION_CONTRACT")
+    checked = MissionContractV1.parse(contract.to_dict())
+    _mission_attachment_owner(conn, task_id, board)
+    if checked.to_dict()["kanban_root_task_ref"] != "task:" + task_id:
+        raise ContractError("MISSION_TASK_MISMATCH")
+    raw = checked.canonical_bytes()
+    if len(raw) > 1048576:
+        raise ContractError("MISSION_ARTIFACT_TOO_LARGE")
+    attachment_id = store_attachment_bytes(
+        conn, task_id,
+        "mission-contract-" + checked.artifact_digest.removeprefix("sha256:") + ".json",
+        raw, board=board, max_bytes=1048576,
+        content_type="application/vnd.recursiveintell.mission-contract+json;version=1",
+    )
+    # A metadata insert alone is not successful artifact attachment. Keep any
+    # failed partial output for diagnosis rather than replacing or repairing it.
+    read_task_mission_contract(
+        conn, task_id, attachment_id, expected_contract_ref=contract_ref(checked), board=board,
+    )
+    return attachment_id
+
+
+def read_task_mission_contract(
+    conn: sqlite3.Connection, task_id: str, attachment_id: int, *,
+    expected_contract_ref: str, board: str,
+):
+    """Read one exact immutable intent artifact, never renewed authority.
+
+    This local POSIX read checks tracked DB identity, metadata, bounded canonical
+    bytes and the existing MissionContract schema/digest. It does not certify
+    external goal/session refs, funding, current policy or provider admission.
+    """
+    import stat
+    from ares_runtime.collaboration import ContractError, MissionContractV1, contract_ref
+    from ares_runtime.contracts import _strict_object
+    from ares_runtime.errors import AresRuntimeError
+
+    if (type(attachment_id) is not int or attachment_id <= 0
+            or type(expected_contract_ref) is not str
+            or re.fullmatch(r"contract:[0-9a-f]{64}", expected_contract_ref) is None):
+        raise ContractError("MISSION_ATTACHMENT_REFERENCE_INVALID")
+    root = _mission_attachment_owner(conn, task_id, board)
+    attachment = get_attachment(conn, attachment_id)
+    if (attachment is None or attachment.task_id != task_id
+            or attachment.content_type != "application/vnd.recursiveintell.mission-contract+json;version=1"
+            or type(attachment.size) is not int or not 0 < attachment.size <= 1048576
+            or type(attachment.stored_path) is not str):
+        raise ContractError("MISSION_ATTACHMENT_UNAVAILABLE")
+    path = Path(attachment.stored_path)
+    if not path.is_absolute() or path.parent != root or path.name in {".", ".."}:
+        raise ContractError("MISSION_ATTACHMENT_PATH_UNQUALIFIED")
+    owner_uid = getattr(os, "getuid", None)
+    if not callable(owner_uid):
+        raise ContractError("MISSION_ATTACHMENT_HOST_UNQUALIFIED")
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                     dir_fd=directory)
+        with os.fdopen(fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                    or before.st_uid != owner_uid() or before.st_mode & 0o022
+                    or before.st_size != attachment.size):
+                raise ContractError("MISSION_ATTACHMENT_FILE_UNQUALIFIED")
+            raw = stream.read(1048577)
+            after = os.fstat(stream.fileno())
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                    after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ContractError("MISSION_ATTACHMENT_CHANGED")
+        if len(raw) != attachment.size:
+            raise ContractError("MISSION_ATTACHMENT_SIZE_MISMATCH")
+        # Reuse canonical contract ingress rather than a second JSON/digest rule.
+        try:
+            checked = MissionContractV1.parse(_strict_object(raw))
+        except AresRuntimeError as error:
+            raise ContractError("MISSION_ARTIFACT_INVALID", error.code) from error
+        if (checked.canonical_bytes() != raw or contract_ref(checked) != expected_contract_ref
+                or checked.to_dict()["kanban_root_task_ref"] != "task:" + task_id):
+            raise ContractError("MISSION_ATTACHMENT_MISMATCH")
+        current = root.stat(follow_symlinks=False)
+        pinned = os.fstat(directory)
+        if ((current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino)
+                or _mission_attachment_owner(conn, task_id, board) != root
+                or get_attachment(conn, attachment_id) != attachment):
+            raise ContractError("MISSION_OWNER_CHANGED")
+        return checked
+    finally:
+        os.close(directory)
+
+
+def read_running_task_mission_contract(
+    conn: sqlite3.Connection, task_id: str, attachment_id: int, *,
+    expected_contract_ref: str, board: str, expected_run_id: int,
+    expected_claim_lock: str,
+):
+    """Check exact root intent against the current claimed Kanban attempt.
+
+    This point-in-time owner check returns an intent artifact, NOT a capability
+    or funding approval. No lease is renewed. Native admission must separately
+    check its current policy/permits/money at consumption. Dependency links are
+    not campaign membership and are deliberately not traversed.
+
+    BEGIN IMMEDIATE excludes other Kanban writers while checking the raw owner
+    rows and attachment. Existing transactions are refused: a stale WAL snapshot
+    or caller's pending writes must never qualify as current durable state.
+    """
+    import math
+    from ares_runtime.collaboration import ContractError
+
+    if (type(expected_run_id) is not int or not 0 < expected_run_id <= (1 << 63) - 1
+            or type(expected_claim_lock) is not str
+            or not 0 < len(expected_claim_lock) <= 512
+            or expected_claim_lock.strip() != expected_claim_lock
+            or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in expected_claim_lock)):
+        raise ContractError("MISSION_RUN_REFERENCE_INVALID")
+    if conn.in_transaction:
+        raise ContractError("MISSION_RUN_TRANSACTION_UNQUALIFIED")
+
+    def check(at):
+        if type(at) not in (int, float) or not math.isfinite(at) or at <= 0:
+            raise ContractError("MISSION_RUN_CLOCK_UNQUALIFIED")
+        task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        run = conn.execute("SELECT * FROM task_runs WHERE id=?", (expected_run_id,)).fetchone()
+        if (task is None or run is None
+                or task["status"] != "running" or run["status"] != "running"
+                or type(task["current_run_id"]) is not int
+                or task["current_run_id"] != expected_run_id or run["task_id"] != task_id
+                or task["claim_lock"] != expected_claim_lock
+                or run["claim_lock"] != expected_claim_lock
+                or task["completed_at"] is not None
+                or run["ended_at"] is not None or run["outcome"] is not None
+                or type(task["claim_expires"]) is not int
+                or type(run["claim_expires"]) is not int
+                or task["claim_expires"] != run["claim_expires"]
+                or not at < task["claim_expires"]
+                or type(run["started_at"]) is not int
+                or not 0 < run["started_at"] <= at):
+            raise ContractError("MISSION_RUN_NOT_CURRENT")
+        cap = run["max_runtime_seconds"]
+        if (task["max_runtime_seconds"] != cap
+                or (cap is not None and (type(cap) is not int or cap <= 0
+                                         or at - run["started_at"] >= cap))):
+            raise ContractError("MISSION_RUN_NOT_CURRENT")
+
+    # Existing owner transaction discipline, including delegated-child refusal.
+    # No INSERT/UPDATE/DELETE is performed by this function or its readback.
+    with write_txn(conn):
+        _mission_attachment_owner(conn, task_id, board)
+        before = time.time()
+        check(before)
+        checked = read_task_mission_contract(
+            conn, task_id, attachment_id,
+            expected_contract_ref=expected_contract_ref, board=board,
+        )
+        after = time.time()
+        check(after)
+        if after < before:
+            raise ContractError("MISSION_RUN_CLOCK_UNQUALIFIED")
+    return checked
 
 
 def add_attachment(
