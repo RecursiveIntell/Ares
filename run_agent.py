@@ -8556,6 +8556,7 @@ class AIAgent:
             graph_input=function_args.get("graph_input"),
             graph_budgets=function_args.get("graph_budgets"),
             graph_operation_id=function_args.get("graph_operation_id"),
+            workload_shape=function_args.get("workload_shape"),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),

@@ -4001,6 +4001,7 @@ def delegate_task(
     graph_input: Optional[Dict[str, Any]] = None,
     graph_budgets: Optional[Dict[str, Any]] = None,
     graph_operation_id: Optional[str] = None,
+    workload_shape: Optional[str] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
@@ -4117,6 +4118,20 @@ def delegate_task(
     except OrchestrationError as exc:
         return denial_result(exc)
 
+    # Workload-fit routing (Phase 4, additive/default-off): a declared shape
+    # resolves to an operator-qualified graph before the explicit-graph gate.
+    _shape_resolution = resolve_workload_shape(
+        workload_shape=workload_shape, graph_id=graph_id, cfg=_load_config())
+    if _shape_resolution.get("blocked"):
+        return json.dumps({"status":"blocked", "code":_shape_resolution["blocked"],
+                           "provider_calls":0, "legacy_fallback":False})
+    _shape_rule_id = None
+    if _shape_resolution.get("resolved"):
+        graph_id = _shape_resolution["graph_id"]
+        graph_version = _shape_resolution["graph_version"]
+        graph_budgets = _shape_resolution["graph_budgets"]
+        _shape_rule_id = _shape_resolution["rule_id"]
+
     if graph_id is not None:
         decision = graph_route_decision(
             parent_agent=parent_agent, background=bool(background), graph_id=graph_id)
@@ -4141,6 +4156,14 @@ def delegate_task(
         if explicit_credentials_override:
             return json.dumps({"status":"blocked", "code":"graph_route_override_unqualified",
                                "provider_calls":0, "legacy_fallback":False})
+        if _shape_rule_id is not None:
+            # Shape-resolved calls carry no caller graph fields; derive a stable
+            # operation identity and freeze the task as the graph input.
+            if not graph_operation_id:
+                import uuid as _uuid
+                graph_operation_id = f"shape-{_shape_rule_id}-{_uuid.uuid4().hex[:16]}"
+            if graph_input is None:
+                graph_input = {"goal": graph_goal, "context": graph_context}
         return _dispatch_graph_background(
             parent_agent=parent_agent, admission=admission,
             graph_id=graph_id, graph_version=graph_version or "",
@@ -5411,6 +5434,10 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "description": "Stable idempotency key for the graph operation. Same key+payload reattaches; changed payload conflicts.",
             },
+            "workload_shape": {
+                "type": "string",
+                "description": "Optional declared workload shape (e.g. 'wide_independent_fanout'). When the operator has enabled workload-fit routing with a qualified rule for this shape, the task is routed to the rule's pinned, allowlisted AgentGraph workflow. Without a matching enabled rule the call keeps its normal behavior. Cannot be combined with graph_id.",
+            },
             # NOTE: the handler also accepts `background` (bool) — DEPRECATED,
             # ignored: top-level delegations always run in the background.
             # Deliberately unadvertised (old transcripts/callers only); do not
@@ -5455,6 +5482,57 @@ DELEGATE_TASK_SCHEMA = {
 # legacy behavior is byte-identical. Enabled-in-test routes new eligible work
 # to the graph scheduler exactly once; old handles stay on their pinned
 # backend. No recursive re-entry: nested workers are never graph-eligible.
+
+def resolve_workload_shape(
+    *, workload_shape: Optional[str], graph_id: Optional[str], cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Workload-fit routing (Phase 4): map a declared workload shape to ONE
+    qualified, allowlisted graph via operator-owned routing rules.
+
+    Additive and default-off: with no workload_shape, or no matching enabled
+    rule, the caller keeps its exact prior behavior (explicit graph_id path or
+    byte-identical legacy). A shape label is a routing request, never authority:
+    the resolved graph must still pass graph_route_enabled + allowlist, and the
+    rule's pinned version/budgets are operator-owned, not caller-supplied.
+    """
+    if workload_shape is None:
+        return {"resolved": False}
+    if not isinstance(workload_shape, str) or not workload_shape.strip():
+        return {"resolved": False, "blocked": "workload_shape_invalid"}
+    if graph_id is not None:
+        return {"resolved": False, "blocked": "workload_shape_conflicts_with_graph_id"}
+    agent_graph = cfg.get("agent_graph") or {}
+    if not isinstance(agent_graph, dict) or agent_graph.get("enabled") is not True:
+        return {"resolved": False}
+    routing = agent_graph.get("routing") or {}
+    if not isinstance(routing, dict) or routing.get("mode") != "workload_fit":
+        return {"resolved": False}
+    rules = routing.get("rules") or []
+    if not isinstance(rules, list):
+        return {"resolved": False, "blocked": "workload_fit_rules_invalid"}
+    matches = [r for r in rules if isinstance(r, dict)
+               and r.get("workload_shape") == workload_shape
+               and r.get("enabled", True) is True]
+    if not matches:
+        return {"resolved": False}  # unqualified shape -> default (legacy) path
+    if len(matches) != 1:
+        return {"resolved": False, "blocked": "workload_fit_rule_ambiguous"}
+    rule = matches[0]
+    rid = rule.get("graph_id")
+    version = rule.get("graph_version")
+    budgets = rule.get("graph_budgets")
+    if (not isinstance(rid, str) or not rid
+            or not isinstance(version, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", version)
+            or not isinstance(budgets, dict)
+            or type(budgets.get("max_llm_calls")) is not int
+            or budgets.get("max_llm_calls", 0) <= 0
+            or type(budgets.get("max_wall_clock_ms")) is not int
+            or budgets.get("max_wall_clock_ms", 0) <= 0):
+        return {"resolved": False, "blocked": "workload_fit_rule_unqualified"}
+    return {"resolved": True, "graph_id": rid, "graph_version": version,
+            "graph_budgets": dict(budgets), "rule_id": rule.get("id") or workload_shape}
+
 
 def graph_route_decision(
     *, parent_agent: Any, background: bool, graph_id: Optional[str] = None,

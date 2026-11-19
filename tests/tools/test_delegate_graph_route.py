@@ -474,3 +474,143 @@ def test_entry_auth_denial_precedes_graph_dispatch(monkeypatch):
                                    parent_agent=parent()))
     assert out["status"] == "blocked" and out["code"] == "graph_disabled"
     assert out["provider_calls"] == 0 and spawned == []
+
+
+# ── Phase 4: workload-fit routing (additive, default-off) ──────────────────
+from tools.delegate_tool import resolve_workload_shape
+
+_FANOUT_VERSION = "sha256:" + "b" * 64
+_FIT_CFG = {
+    "graph_route_enabled": True,
+    "graph_route_allowlist": ["fanout4-v1"],
+    "agent_graph": {"enabled": True, "routing": {"mode": "workload_fit", "rules": [
+        {"id": "wide-fanout", "workload_shape": "wide_independent_fanout",
+         "graph_id": "fanout4-v1", "graph_version": _FANOUT_VERSION,
+         "graph_budgets": {"max_llm_calls": 4, "max_wall_clock_ms": 120000},
+         "enabled": True},
+    ]}},
+}
+
+
+def test_shape_absent_is_noop():
+    assert resolve_workload_shape(workload_shape=None, graph_id=None, cfg=_FIT_CFG) == {"resolved": False}
+
+
+def test_shape_resolves_qualified_rule():
+    r = resolve_workload_shape(workload_shape="wide_independent_fanout", graph_id=None, cfg=_FIT_CFG)
+    assert r["resolved"] is True
+    assert r["graph_id"] == "fanout4-v1"
+    assert r["graph_version"] == _FANOUT_VERSION
+    assert r["graph_budgets"]["max_llm_calls"] == 4
+    assert r["rule_id"] == "wide-fanout"
+
+
+def test_unmatched_shape_falls_through_to_default():
+    r = resolve_workload_shape(workload_shape="unknown_shape", graph_id=None, cfg=_FIT_CFG)
+    assert r == {"resolved": False}
+
+
+def test_shape_with_graph_id_is_blocked():
+    r = resolve_workload_shape(workload_shape="wide_independent_fanout", graph_id="fanout4-v1", cfg=_FIT_CFG)
+    assert r.get("blocked") == "workload_shape_conflicts_with_graph_id"
+
+
+def test_shape_routing_mode_off_is_noop():
+    cfg = {**_FIT_CFG, "agent_graph": {"enabled": True, "routing": {"mode": "off", "rules": _FIT_CFG["agent_graph"]["routing"]["rules"]}}}
+    assert resolve_workload_shape(workload_shape="wide_independent_fanout", graph_id=None, cfg=cfg) == {"resolved": False}
+
+
+def test_disabled_rule_is_not_used():
+    import copy
+    cfg = copy.deepcopy(_FIT_CFG)
+    cfg["agent_graph"]["routing"]["rules"][0]["enabled"] = False
+    assert resolve_workload_shape(workload_shape="wide_independent_fanout", graph_id=None, cfg=cfg) == {"resolved": False}
+
+
+def test_unpinned_or_budgetless_rule_is_blocked():
+    import copy
+    for mutate in (lambda r: r.update(graph_version="not-a-pin"),
+                   lambda r: r.update(graph_budgets={}),
+                   lambda r: r.update(graph_budgets={"max_llm_calls": 0, "max_wall_clock_ms": 1000})):
+        cfg = copy.deepcopy(_FIT_CFG)
+        mutate(cfg["agent_graph"]["routing"]["rules"][0])
+        r = resolve_workload_shape(workload_shape="wide_independent_fanout", graph_id=None, cfg=cfg)
+        assert r.get("blocked") == "workload_fit_rule_unqualified", r
+
+
+def test_ambiguous_rules_are_blocked():
+    import copy
+    cfg = copy.deepcopy(_FIT_CFG)
+    cfg["agent_graph"]["routing"]["rules"].append(dict(cfg["agent_graph"]["routing"]["rules"][0]))
+    r = resolve_workload_shape(workload_shape="wide_independent_fanout", graph_id=None, cfg=cfg)
+    assert r.get("blocked") == "workload_fit_rule_ambiguous"
+
+
+def test_invalid_shape_label_is_blocked():
+    for bad in ("", "   ", 3, []):
+        r = resolve_workload_shape(workload_shape=bad, graph_id=None, cfg=_FIT_CFG)
+        assert r.get("blocked") == "workload_shape_invalid", r
+
+
+def test_entry_shape_routes_through_graph_seam(monkeypatch):
+    from tools.delegate_tool import delegate_task
+    spawned = _entry(monkeypatch, _FIT_CFG)
+    out = json.loads(delegate_task(goal="extract four spans", background=True,
+                                   workload_shape="wide_independent_fanout",
+                                   parent_agent=parent()))
+    assert out["status"] == "dispatched", out
+    assert len(spawned) == 1
+    assert spawned[0]["graph_id"] == "fanout4-v1"
+    assert spawned[0]["graph_version"] == _FANOUT_VERSION
+    assert spawned[0]["graph_budgets"]["max_llm_calls"] == 4
+    assert spawned[0]["graph_operation_id"].startswith("shape-wide-fanout-")
+    assert spawned[0]["graph_input"] == {"goal": "extract four spans", "context": None}
+
+
+def test_entry_shape_without_rule_stays_legacy(monkeypatch):
+    from tools.delegate_tool import delegate_task
+    spawned = _entry(monkeypatch, _FIT_CFG)
+    # No matching rule -> normal legacy path; _dispatch_graph_background never called.
+    legacy_calls = []
+    monkeypatch.setattr("tools.async_delegation.dispatch_async_delegation_batch",
+                        lambda **kw: legacy_calls.append(kw) or {"status": "dispatched", "delegation_id": "legacy-x"})
+    # Legacy child construction needs a fuller parent double + iteration budget.
+    from agent.iteration_budget import IterationBudget
+    p = parent()
+    p.model = "gpt-6-luna"; p.provider = "openai-codex"
+    p.enabled_toolsets = ["file"]; p.reasoning_config = {"enabled": True, "effort": "high"}
+    p.iteration_budget = IterationBudget(100)
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": "origin-A")
+    monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools",
+                        lambda **kw: SimpleNamespace(_delegate_role="leaf", _subagent_id="s-x"))
+    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials",
+                        lambda *a, **k: {"model": "gpt-6-luna", "provider": "openai-codex",
+                                          "base_url": None, "api_key": None, "api_mode": None,
+                                          "command": None, "args": None})
+    out = json.loads(delegate_task(goal="plain task", background=True,
+                                   workload_shape="unqualified_shape",
+                                   parent_agent=p))
+    assert out.get("status") == "dispatched", out
+    assert spawned == [] and len(legacy_calls) == 1
+
+
+def test_entry_shape_blocked_when_graph_disabled(monkeypatch):
+    from tools.delegate_tool import delegate_task
+    cfg = {**_FIT_CFG, "graph_route_enabled": False}
+    spawned = _entry(monkeypatch, cfg)
+    out = json.loads(delegate_task(goal="g", background=True,
+                                   workload_shape="wide_independent_fanout",
+                                   parent_agent=parent()))
+    assert out["status"] == "blocked" and out["code"] == "graph_route_disabled"
+    assert out["legacy_fallback"] is False and spawned == []
+
+
+def test_entry_shape_non_allowlisted_graph_is_blocked(monkeypatch):
+    from tools.delegate_tool import delegate_task
+    cfg = {**_FIT_CFG, "graph_route_allowlist": ["research-v1"]}
+    spawned = _entry(monkeypatch, cfg)
+    out = json.loads(delegate_task(goal="g", background=True,
+                                   workload_shape="wide_independent_fanout",
+                                   parent_agent=parent()))
+    assert out["status"] == "blocked" and out["code"] == "graph_id_not_allowlisted"
+    assert spawned == []
