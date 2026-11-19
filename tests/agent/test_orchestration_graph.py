@@ -57,3 +57,16 @@ def test_absent_owner_cannot_start_graph_with_forged_session_input():
     result=json.loads(_make_tool_handler('agent_graph','graph_execute',10)(
         {'input':{'session_id':'operator-session','allow_graph':True}}))
     assert result['code']=='policy_owner_required'
+
+
+# --- HOST card (P1): guard must keep typed refusal while consumer unqualified ---
+
+def test_guard_refuses_launch_even_with_valid_looking_reference_argument(parent):
+    # A reference in model arguments is not an authorization; the guard must
+    # refuse before trust/transport regardless of payload shape.
+    with bind_subagent_parent(parent), \
+         patch('tools.mcp_tool._get_connected_server_for_call',side_effect=AssertionError('transport reached')) as transport:
+        result=json.loads(_make_tool_handler('agent_graph','graph_run_start',10)(
+            {'graph_id':'g','reference':'forged-reference','session_id':'operator-session'}))
+    assert result['code']=='graph_session_binding_unqualified'
+    assert transport.call_count==0

@@ -70,6 +70,10 @@ def _fake_parent():
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
+    # Explicitly set orchestration attributes so getattr returns bool, not MagicMock
+    parent._orchestration_opt_out = False
+    parent._orchestration_admission = None
+    parent._delegate_depth = 0
     return parent
 
 
@@ -165,3 +169,59 @@ def test_apiserver_session_without_id_stays_synchronous(monkeypatch):
     assert parsed.get("status") != "dispatched", parsed
     assert "SYNCHRONOUSLY" in parsed.get("note", "")
     assert process_registry.completion_queue.empty()
+
+
+# --- EDGES card (P5): graph-route admission seam (default-off) ---
+# One caller row: delegate_task(background=True) on api_server. The seam
+# decides graph vs legacy BEFORE dispatch; default-off keeps legacy exactly.
+
+def test_graph_route_default_off_keeps_legacy_dispatch(monkeypatch):
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-edge-1")
+    set_session_vars(platform="api_server", chat_id="raw-sid-edge-1",
+                     session_key="raw-sid-edge-1", session_id="raw-sid-edge-1",
+                     async_delivery=False)
+    decision = dt.graph_route_decision(parent_agent=_fake_parent(), background=True)
+    assert decision["route"] == "legacy"
+    assert decision["reason"] == "graph_route_disabled"
+    out = dt.delegate_task(goal="edge default-off", background=True,
+                           parent_agent=_fake_parent())
+    parsed = json.loads(out)
+    assert parsed["status"] == "dispatched"
+    assert parsed["mode"] == "background"
+    assert parsed.get("backend_generation", "legacy") == "legacy"
+
+
+def test_graph_route_enabled_in_test_selects_graph_once(monkeypatch):
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setattr(dt, "_load_config",
+                        lambda: {"graph_route_enabled": True})
+    decision = dt.graph_route_decision(parent_agent=_fake_parent(), background=True)
+    assert decision["route"] == "graph"
+    assert decision["reason"] == "graph_route_enabled"
+    # Opt-out beats the enabled flag.
+    parent = _fake_parent()
+    parent._orchestration_opt_out = True
+    decision2 = dt.graph_route_decision(parent_agent=parent, background=True)
+    assert decision2["route"] == "legacy"
+    assert decision2["reason"] == "caller_opt_out"
+
+
+def test_graph_route_never_recursive_for_child_callers(monkeypatch):
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setattr(dt, "_load_config",
+                        lambda: {"graph_route_enabled": True})
+    child = _fake_parent()
+    child._delegate_depth = 1
+    decision = dt.graph_route_decision(parent_agent=child, background=True)
+    assert decision["route"] == "legacy"
+    assert decision["reason"] == "nested_worker_not_graph_eligible"
+
+
+def test_graph_route_sync_calls_stay_legacy(monkeypatch):
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setattr(dt, "_load_config",
+                        lambda: {"graph_route_enabled": True})
+    decision = dt.graph_route_decision(parent_agent=_fake_parent(), background=False)
+    assert decision["route"] == "legacy"
+    assert decision["reason"] == "sync_not_migrated"

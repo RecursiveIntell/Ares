@@ -255,3 +255,85 @@ def test_runner_executes_only_the_eligible_explicit_profile_and_records_terminal
     assert calls == ["explorer"]
     assert receipt["terminal_state"] == "released"
     assert receipt["profiles"] == [{"profile_id": "explorer", "outcome": "returned", "exit_code": 0}]
+
+
+# --- DESKTOP card (P3): graph operation → explicit Desktop request parity ---
+# LOCK contract-v1: one graph operation maps to ONE existing explicit request;
+# digest bindings derive under the same canonicalization; Electron remains the
+# capacity/process authority; headless callers cannot impersonate Desktop.
+
+def test_graph_operation_maps_to_one_valid_explicit_request(tmp_path: Path):
+    from ares_runtime.specialist_dispatch import graph_operation_to_dispatch_request
+
+    request = graph_operation_to_dispatch_request(
+        operation_id="op-graph-0001",
+        graph_id="research-v1",
+        graph_version="sha256:" + "b" * 64,
+        profile_id="explorer",
+        capability="competing_design",
+        workspace=tmp_path,
+        brief="Review the frozen F1 packet.",
+    )
+    parsed = parse_dispatch_request(json.dumps(request).encode("utf-8"))
+    assert parsed.profile_ids == ("explorer",)
+    assert parsed.requested_capabilities == {"explorer": "competing_design"}
+    assert parsed.workspace == tmp_path
+    # run_id is derived deterministically from the stable operation identity.
+    again = graph_operation_to_dispatch_request(
+        operation_id="op-graph-0001",
+        graph_id="research-v1",
+        graph_version="sha256:" + "b" * 64,
+        profile_id="explorer",
+        capability="competing_design",
+        workspace=tmp_path,
+        brief="Review the frozen F1 packet.",
+    )
+    assert again["run_id"] == request["run_id"]
+    assert again["request_digest"] == request["request_digest"]
+
+
+def test_changed_graph_version_under_same_operation_is_a_different_binding(tmp_path: Path):
+    from ares_runtime.specialist_dispatch import graph_operation_to_dispatch_request
+
+    a = graph_operation_to_dispatch_request(
+        operation_id="op-graph-0002", graph_id="g", graph_version="sha256:" + "a" * 64,
+        profile_id="explorer", capability="competing_design",
+        workspace=tmp_path, brief="x",
+    )
+    b = graph_operation_to_dispatch_request(
+        operation_id="op-graph-0002", graph_id="g", graph_version="sha256:" + "c" * 64,
+        profile_id="explorer", capability="competing_design",
+        workspace=tmp_path, brief="x",
+    )
+    assert a["request_digest"] != b["request_digest"]
+
+
+def test_graph_mapping_decision_keeps_electron_capacity_authority(tmp_path: Path):
+    from ares_runtime.specialist_dispatch import graph_operation_to_dispatch_request
+
+    request = parse_dispatch_request(json.dumps(graph_operation_to_dispatch_request(
+        operation_id="op-graph-0003", graph_id="g", graph_version="sha256:" + "b" * 64,
+        profile_id="explorer", capability="competing_design",
+        workspace=tmp_path, brief="x",
+    )).encode("utf-8"))
+    candidate = descriptor()
+    decision = explicit_dispatch_decision(
+        request=request,
+        candidates={"explorer": candidate},
+        profile_binding_refs={"explorer": specialist_descriptor_ref(candidate)},
+    )
+    assert decision["outcome"] == "eligible"
+    assert decision["capacity_authority"] == "electron_required"
+    assert decision["automatic_selection"] is False
+    assert decision["generic_fallback"] == "forbidden"
+
+
+def test_graph_mapping_refuses_multi_profile_fanout(tmp_path: Path):
+    from ares_runtime.specialist_dispatch import graph_operation_to_dispatch_request
+
+    with pytest.raises(DispatchError, match="ONE_PROFILE_PER_OPERATION"):
+        graph_operation_to_dispatch_request(
+            operation_id="op-graph-0004", graph_id="g", graph_version="sha256:" + "b" * 64,
+            profile_id=["explorer", "statistician"], capability="competing_design",
+            workspace=tmp_path, brief="x",
+        )

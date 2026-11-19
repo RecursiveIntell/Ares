@@ -163,7 +163,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            graph_alias TEXT NOT NULL DEFAULT '',
+            backend_generation TEXT NOT NULL DEFAULT '',
+            request_digest TEXT NOT NULL DEFAULT ''
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -178,6 +181,11 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
         ("origin_session_id", "TEXT"),
+        # LOCK contract-v1 §2: graph alias + backend generation bound to the
+        # ORIGINAL dispatch record. Additive; legacy rows read back as ''.
+        ("graph_alias", "TEXT"),
+        ("backend_generation", "TEXT"),
+        ("request_digest", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -254,6 +262,9 @@ def _persist_dispatch(record: Dict[str, Any]) -> Dict[str, Any]:
         )
         if key in record
     }
+    graph_alias = str(record.get("graph_alias") or "")
+    backend_generation = str(record.get("backend_generation") or "")
+    request_digest = str(record.get("request_digest") or "")
     with _DB_LOCK, _transaction() as conn:
         # Serialize the count and insert across processes using the existing
         # ledger. Every pending row occupies a slot, including active/claimed.
@@ -268,13 +279,15 @@ def _persist_dispatch(record: Dict[str, Any]) -> Dict[str, Any]:
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_started_at, task_json, origin_session_id,
+                graph_alias, backend_generation, request_digest)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, owner_pid,
              owner_started_at, json.dumps(task_payload),
-             record.get("origin_session_id", "")),
+             record.get("origin_session_id", ""),
+             graph_alias, backend_generation, request_digest),
         )
     reservation = {
         "delegation_id": record["delegation_id"], "owner_pid": owner_pid,
@@ -472,6 +485,10 @@ def restore_undelivered_completions(target_queue) -> int:
             evt = json.loads(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
+                # Additive defaults keep legacy events readable.
+                evt.setdefault("graph_alias", "")
+                evt.setdefault("backend_generation", "")
+                evt.setdefault("request_digest", "")
             target_queue.put(evt)
             restored += 1
     return restored
@@ -608,7 +625,8 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
-                      origin_session_id
+                      origin_session_id, graph_alias, backend_generation,
+                      request_digest
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -619,7 +637,44 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
         "origin_session_id": row[7] or "",
+        "graph_alias": row[8] or "",
+        "backend_generation": row[9] or "",
+        "request_digest": row[10] or "",
     }
+
+
+def bind_graph_backend(
+    delegation_id: str, *, graph_alias: str, backend_generation: str,
+    request_digest: str = "",
+) -> Dict[str, Any]:
+    """Bind graph alias/backend generation to the ORIGINAL dispatch record.
+
+    LOCK contract-v1 §3: same binding is idempotent; a changed alias or
+    generation under the same delegation is a typed conflict, never a
+    silent re-pin. Legacy rows (empty binding) accept the first bind.
+    """
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT graph_alias, backend_generation, request_digest
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+        if row is None:
+            return {"ok": False, "code": "delegation_not_found"}
+        existing_alias, existing_gen, existing_digest = (row[0] or "", row[1] or "", row[2] or "")
+        if existing_alias and (
+            existing_alias != graph_alias or existing_gen != backend_generation
+            or (existing_digest and request_digest and existing_digest != request_digest)
+        ):
+            return {"ok": False, "code": "graph_backend_binding_conflict"}
+        conn.execute(
+            """UPDATE async_delegations SET graph_alias=?, backend_generation=?,
+                      request_digest=?, updated_at=? WHERE delegation_id=?""",
+            (graph_alias, backend_generation, request_digest or existing_digest,
+             now, delegation_id),
+        )
+    return {"ok": True, "delegation_id": delegation_id}
 
 
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
@@ -798,6 +853,9 @@ def dispatch_async_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    graph_alias: str = "",
+    backend_generation: str = "",
+    request_digest: str = "",
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -854,6 +912,9 @@ def dispatch_async_delegation(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
+        "graph_alias": graph_alias,
+        "backend_generation": backend_generation,
+        "request_digest": request_digest,
         **_capture_routing_origin(),
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -1061,6 +1122,11 @@ def _push_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
+        # LOCK contract-v1: graph alias + backend generation travel with the
+        # completion so the origin consumer can bind the result to its run.
+        "graph_alias": record.get("graph_alias", ""),
+        "backend_generation": record.get("backend_generation", ""),
+        "request_digest": record.get("request_digest", ""),
     }
     # Routing origin captured at dispatch (see _capture_routing_origin):
     # additive, lets the gateway reconstruct a full SessionSource (incl.

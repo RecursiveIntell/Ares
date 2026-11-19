@@ -825,3 +825,118 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     # The header banner for task 2 appears after task 1's summary.
     assert banner_pos > clean_pos
 
+
+
+# --- DELIVERY card (P1): origin-bound graph alias + backend generation ---
+# LOCK contract-v1 §2/§3. F2 fixture: persist origin A + result R, interrupt
+# after terminal store before delivery, restart, offer R twice, focus B.
+
+def test_graph_alias_and_backend_generation_bind_to_original_record(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    handle = ad.dispatch_async_delegation(
+        goal="F2 research", context=None, toolsets=None, role="leaf", model="m",
+        session_key="session-A-fixture", parent_session_id="parent-A",
+        runner=lambda: {"status": "completed", "summary": "R-f2-0001"},
+        graph_alias="research-v1", backend_generation="graph-gen-1",
+        request_digest="sha256:" + "b" * 64,
+    )
+    assert handle["status"] == "dispatched"
+    did = handle["delegation_id"]
+    deadline = time.monotonic() + 5
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    row = ad.get_durable_delegation(did)
+    assert row["graph_alias"] == "research-v1"
+    assert row["backend_generation"] == "graph-gen-1"
+    assert row["request_digest"] == "sha256:" + "b" * 64
+    assert row["origin_session"] == "session-A-fixture"
+
+
+def test_f2_crash_window_restart_delivers_R_once_to_A_never_B(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    handle = ad.dispatch_async_delegation(
+        goal="F2", context=None, toolsets=None, role="leaf", model="m",
+        session_key="session-A-fixture", parent_session_id="parent-A",
+        runner=lambda: {"status": "completed", "summary": "R-f2-0001"},
+        graph_alias="research-v1", backend_generation="graph-gen-1",
+    )
+    did = handle["delegation_id"]
+    deadline = time.monotonic() + 5
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    # Simulate interrupt AFTER terminal store BEFORE delivery: the durable row
+    # holds result R with delivery_state='pending'. A fresh process restores.
+    row = ad.get_durable_delegation(did)
+    assert row["state"] == "completed" and row["delivery_state"] == "pending"
+    q = queue.Queue()
+    restored = ad.restore_undelivered_completions(q)
+    assert restored == 1
+    evt = q.get_nowait()
+    assert evt["delegation_id"] == did
+    assert evt["session_key"] == "session-A-fixture"  # origin A, not focused B
+    assert evt["graph_alias"] == "research-v1"
+    assert evt["backend_generation"] == "graph-gen-1"
+    assert evt["restored"] is True
+    # Offer R a second time (duplicate restore): claim semantics dedupe.
+    q2 = queue.Queue()
+    ad.restore_undelivered_completions(q2)
+    evt2 = q2.get_nowait()
+    claim = "claim-A-1"
+    assert ad.claim_completion_delivery(did, claim) is True
+    # A competing consumer (session B) cannot claim the same completion.
+    assert ad.claim_completion_delivery(did, "claim-B-1") is False
+    # Only the claim holder acknowledges; wrong claim is a typed refusal.
+    assert ad.complete_completion_delivery(did, "claim-B-1") is False
+    assert ad.complete_completion_delivery(did, claim) is True
+    # After ack, no further restore offers R.
+    q3 = queue.Queue()
+    assert ad.restore_undelivered_completions(q3) == 0
+    final = ad.get_durable_delegation(did)
+    assert final["delivery_state"] == "delivered"
+
+
+def test_changed_graph_alias_under_same_delegation_is_conflict(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    handle = ad.dispatch_async_delegation(
+        goal="F2", context=None, toolsets=None, role="leaf", model="m",
+        session_key="session-A-fixture",
+        runner=lambda: {"status": "completed", "summary": "R"},
+        graph_alias="research-v1", backend_generation="graph-gen-1",
+    )
+    did = handle["delegation_id"]
+    deadline = time.monotonic() + 5
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    result = ad.bind_graph_backend(
+        did, graph_alias="other-graph", backend_generation="graph-gen-1",
+        request_digest="sha256:" + "b" * 64,
+    )
+    assert result["ok"] is False
+    assert result["code"] == "graph_backend_binding_conflict"
+    row = ad.get_durable_delegation(did)
+    assert row["graph_alias"] == "research-v1"
+
+
+def test_legacy_records_without_graph_fields_remain_readable(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    handle = ad.dispatch_async_delegation(
+        goal="legacy", context=None, toolsets=None, role="leaf", model="m",
+        session_key="legacy-session",
+        runner=lambda: {"status": "completed", "summary": "old result"},
+    )
+    did = handle["delegation_id"]
+    deadline = time.monotonic() + 5
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    row = ad.get_durable_delegation(did)
+    assert row["graph_alias"] == ""
+    assert row["backend_generation"] == ""
+    assert row["result"]["summary"] == "old result"
+    q = queue.Queue()
+    assert ad.restore_undelivered_completions(q) == 1
+    evt = q.get_nowait()
+    assert evt["session_key"] == "legacy-session"

@@ -166,6 +166,54 @@ def parse_dispatch_request(raw: bytes) -> ExplicitDispatchRequest:
     return ExplicitDispatchRequest(dict(value))
 
 
+def graph_operation_to_dispatch_request(
+    *,
+    operation_id: str,
+    graph_id: str,
+    graph_version: str,
+    profile_id: str | Sequence[str],
+    capability: str,
+    workspace: Path | str,
+    brief: str,
+) -> dict[str, object]:
+    """Map ONE graph operation to ONE existing explicit Desktop request.
+
+    LOCK contract-v1: the stable operation identity derives a deterministic
+    run_id; the request digest binds graph version + operation under the same
+    canonicalization as every other explicit request. Electron alone reserves
+    capacity and owns the process — this mapping never spawns or reserves.
+    One profile per operation: fan-out is the graph's job, not a smuggled
+    multi-profile Desktop request.
+    """
+    if not isinstance(profile_id, str):
+        raise DispatchError("ONE_PROFILE_PER_OPERATION")
+    if not isinstance(operation_id, str) or not operation_id.strip():
+        raise DispatchError("INVALID_OPERATION_ID")
+    if not isinstance(graph_version, str) or not SHA256_RE.fullmatch(graph_version):
+        raise DispatchError("INVALID_GRAPH_VERSION")
+    workspace_path = Path(workspace)
+    if not workspace_path.is_absolute() or not workspace_path.is_dir():
+        raise DispatchError("INVALID_WORKSPACE")
+    # Deterministic run_id from the stable operation identity + graph binding
+    # (retry-stable; changed graph version under the same operation yields a
+    # different binding, never a silent re-pin).
+    run_suffix = digest({
+        "operation_id": operation_id,
+        "graph_id": graph_id,
+        "graph_version": graph_version,
+    }).removeprefix("sha256:")[:32]
+    body: dict[str, object] = {
+        "schema": REQUEST_SCHEMA,
+        "run_id": f"specialist-run-{run_suffix}",
+        "profile_ids": [profile_id],
+        "requested_capabilities": {profile_id: capability},
+        "workspace": str(workspace_path),
+        "brief": brief,
+    }
+    body["request_digest"] = digest(body)
+    return body
+
+
 def explicit_dispatch_decision(
     *,
     request: ExplicitDispatchRequest,
