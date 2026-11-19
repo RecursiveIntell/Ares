@@ -5976,7 +5976,7 @@ def _process_group_has_live_members(group_id: int) -> bool:
             if not proc_entry.name.isdigit():
                 continue
             try:
-                stat = (proc_entry / "stat").read_text()
+                stat = (proc_entry / "stat").read_text(encoding="utf-8")
                 close = stat.rfind(")")
                 fields = stat[close + 2:].split()
                 if len(fields) >= 3 and int(fields[2]) == group_id and fields[0] != "Z":
@@ -5985,8 +5985,11 @@ def _process_group_has_live_members(group_id: int) -> bool:
                 continue
         return False
 
+    killpg = getattr(os, "killpg", None)
+    if not callable(killpg):
+        return True
     try:
-        os.killpg(group_id, 0)
+        killpg(group_id, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -5996,9 +5999,11 @@ def _process_group_has_live_members(group_id: int) -> bool:
 
 def _kill_graph_test_process_group(proc: Any) -> tuple[str, bool]:
     """Kill and reap an owned suite process group; never overclaim closure."""
-    if os.name == "posix":
+    killpg = getattr(os, "killpg", None)
+    if os.name == "posix" and callable(killpg):
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+            killpg(proc.pid, kill_signal)
         except ProcessLookupError:
             pass
         except OSError:
