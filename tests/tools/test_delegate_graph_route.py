@@ -9,6 +9,18 @@ from unittest.mock import patch
 from tools.delegate_tool import graph_route_decision, _dispatch_graph_background
 
 
+def test_graph_handler_prefers_mcp_structured_content_when_text_is_also_present():
+    from tools.delegate_tool import _graph_handler_value
+
+    structured = {"ok": True, "data": {"run_id": "run-structured"}}
+    raw = json.dumps({
+        "result": "The workflow was accepted.",
+        "structuredContent": structured,
+    })
+
+    assert _graph_handler_value(raw) == structured
+
+
 def parent(depth=0, optout=False):
     return SimpleNamespace(session_id="route-owner", _delegate_depth=depth,
                            _orchestration_opt_out=optout,

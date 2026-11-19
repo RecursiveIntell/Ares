@@ -5581,7 +5581,9 @@ def _graph_handler_value(raw: str) -> Dict[str, Any]:
         outer = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
         return {"ok": False, "error_code": "graph_adapter_response_invalid"}
-    value = outer.get("structured") or outer.get("result")
+    value = outer.get("structuredContent")
+    if value is None:
+        value = outer.get("result")
     if isinstance(value, str):
         try:
             value = json.loads(value)
