@@ -95,6 +95,31 @@ def _install_mock_dispatch(monkeypatch, *, start_result=None, wait_results=None)
     return calls, runner_result
 
 
+def test_immediately_finished_graph_worker_does_not_leave_stale_control_handle(durable_home, monkeypatch):
+    import tools.delegate_tool as dt
+
+    kwargs = _route_kwargs(graph_operation_id="research-immediate-refusal-01")
+    monkeypatch.setattr(dt, "_graph_mcp_call", lambda *a, **k: {
+        "ok": False, "error_code": "GRAPH_PREFLIGHT_REFUSED",
+    })
+    workers = []
+
+    def finish_before_dispatch_returns(**dispatch_kwargs):
+        worker = threading.Thread(target=dispatch_kwargs["runner"])
+        workers.append(worker)
+        worker.start()
+        worker.join(timeout=3)
+        assert not worker.is_alive(), "immediate graph worker did not finish"
+        return {"status": "dispatched", "delegation_id": "immediate-fixture"}
+
+    monkeypatch.setattr("tools.async_delegation.dispatch_async_delegation",
+                        finish_before_dispatch_returns)
+    result = json.loads(_dispatch_graph_background(**kwargs))
+    assert result["status"] == "dispatched"
+    with dt._active_subagents_lock:
+        assert result["handle_id"] not in dt._active_subagents
+
+
 def test_allowlisted_graph_runs_once_and_never_calls_legacy(durable_home, monkeypatch):
     p=parent()
     cfg={"graph_route_enabled":True,"graph_route_allowlist":["research-v1"]}
@@ -318,6 +343,7 @@ def test_cancel_via_control_plane_routes_graph_run_cancel(durable_home, monkeypa
             break
         time.sleep(0.02)
     assert handle_id in _active_subagents
+    assert _active_subagents[handle_id]["agent"].operation_key == out["operation_key"]
     stop = json.loads(delegate_task(action="stop", subagent_id=handle_id, parent_agent=parent()))
     assert stop.get("status") == "interrupt_requested", stop
     _wait_idle()

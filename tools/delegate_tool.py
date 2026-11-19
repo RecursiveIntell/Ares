@@ -5740,12 +5740,33 @@ def _dispatch_graph_background(
                 "api_calls":0}
 
     handle_id = "graph-bg-" + operation_key.removeprefix("graphop-")[:16]
+    graph_handle = _GraphBackgroundHandle(operation_key, _cancel_graph)
+    control_record = {
+        "subagent_id": handle_id,
+        "parent_id": None,
+        "depth": 0,
+        "goal": goal or f"AgentGraph workflow {graph_id}",
+        "model": "graph-background",
+        "started_at": time.time(),
+        "status": "running",
+        "tool_count": 0,
+        "agent": graph_handle,
+        "accepting_steer": False,
+        "owner_agent_session_id": getattr(parent_agent, "session_id", None),
+        "_delegate_parent_ref": _try_parent_weakref(parent_agent),
+    }
+    # Install the control record before dispatch can start a worker. If the
+    # durable dispatcher reattaches instead, remove only this exact record.
+    with _active_subagents_lock:
+        control_registered = handle_id not in _active_subagents
+        if control_registered:
+            _active_subagents[handle_id] = control_record
 
     def _runner_with_cleanup():
         try:
             return _runner()
         finally:
-            _unregister_subagent(handle_id)
+            _unregister_subagent(handle_id, agent=graph_handle)
 
     dispatch = dispatch_async_delegation(
         goal=goal or f"AgentGraph workflow {graph_id}", context=context,
@@ -5757,24 +5778,13 @@ def _dispatch_graph_background(
         operation_key=operation_key,
     )
     if dispatch.get("status") not in {"dispatched", "reattached"}:
+        if control_registered:
+            _unregister_subagent(handle_id, agent=graph_handle)
         return json.dumps({**dispatch, "legacy_fallback":False},ensure_ascii=False)
-    if dispatch.get("status") == "dispatched":
-        # Register BEFORE returning the handle so the control plane can always
-        # reach a live operation; the worker unregisters at terminal state.
-        _register_subagent({
-            "subagent_id": handle_id,
-            "parent_id": None,
-            "depth": 0,
-            "goal": goal or f"AgentGraph workflow {graph_id}",
-            "model": "graph-background",
-            "started_at": time.time(),
-            "status": "running",
-            "tool_count": 0,
-            "agent": _GraphBackgroundHandle(operation_key, _cancel_graph),
-            "accepting_steer": False,
-            "owner_agent_session_id": getattr(parent_agent, "session_id", None),
-            "_delegate_parent_ref": _try_parent_weakref(parent_agent),
-        })
+    if dispatch.get("status") == "reattached" and control_registered:
+        # The durable owner did not submit this runner; no worker exists to
+        # perform terminal cleanup for a record installed before submission.
+        _unregister_subagent(handle_id, agent=graph_handle)
     return json.dumps({
         "status":"dispatched" if dispatch.get("status")=="dispatched" else "reattached",
         "mode":"graph_background", "operation_key":operation_key,
