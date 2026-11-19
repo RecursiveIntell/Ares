@@ -6,6 +6,8 @@ recover by querying the operation owner and comparing actual artifacts.
 """
 import hashlib
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -149,3 +151,57 @@ def test_missing_owner_refused(workdir):
     )
     assert result["status"] == "blocked"
     assert result["code"] == "policy_owner_required"
+
+
+def test_concurrent_same_operation_id_reserves_and_writes_once(workdir, monkeypatch):
+    target = workdir / "fixture.txt"
+    read_barrier = threading.Barrier(2)
+    counter_lock = threading.Lock()
+    target_reads = 0
+    target_writes = 0
+    original_read_bytes = Path.read_bytes
+    original_write_bytes = Path.write_bytes
+
+    def counted_read_bytes(path):
+        nonlocal target_reads
+        if path == target:
+            with counter_lock:
+                target_reads += 1
+                read_number = target_reads
+            if read_number <= 2:
+                try:
+                    read_barrier.wait(timeout=0.25)
+                except threading.BrokenBarrierError:
+                    pass
+        return original_read_bytes(path)
+
+    def counted_write_bytes(path, data):
+        nonlocal target_writes
+        if path == target:
+            with counter_lock:
+                target_writes += 1
+        return original_write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+    monkeypatch.setattr(Path, "write_bytes", counted_write_bytes)
+    start_barrier = threading.Barrier(2)
+    operation_id = f"op-edit-race-{workdir.name}"
+
+    def submit():
+        start_barrier.wait(timeout=2)
+        return run_graph_edit_operation(
+            operation_id=operation_id,
+            workspace=workdir,
+            path="fixture.txt",
+            expected_preimage_sha256=_preimage_sha(),
+            intended_postimage=_intended(),
+            parent_agent=_parent(),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: submit(), range(2)))
+
+    assert target_writes == 1
+    assert all(result["status"] == "completed" for result in results)
+    assert sum(result.get("reattached") is True for result in results) == 1
+    assert target.read_text() == _intended()

@@ -6082,50 +6082,79 @@ def run_graph_edit_operation(
     if parent_agent is None:
         return {"status": "blocked", "code": "policy_owner_required",
                 "operation_id": operation_id}
-    with _GRAPH_EDIT_LOCK:
-        prior = _GRAPH_EDIT_JOURNAL.get(operation_id)
-    if prior is not None:
+    while True:
+        with _GRAPH_EDIT_LOCK:
+            prior = _GRAPH_EDIT_JOURNAL.get(operation_id)
+            if prior is None:
+                reservation_event = threading.Event()
+                entry = {
+                    "operation_id": operation_id,
+                    "receipt_state": "reserved",
+                    "effect_count": 0,
+                    "quarantined": False,
+                    "_reservation_event": reservation_event,
+                }
+                _GRAPH_EDIT_JOURNAL[operation_id] = entry
+                owns_reservation = True
+            else:
+                reservation_event = prior.get("_reservation_event")
+                owns_reservation = False
+        if owns_reservation:
+            break
         if prior.get("quarantined"):
             return {"status": "blocked", "code": "edit_outcome_quarantined",
                     "operation_id": operation_id, "effect_count": prior.get("effect_count", 0)}
+        if reservation_event is not None and not reservation_event.is_set():
+            reservation_event.wait()
+            continue
         if prior.get("receipt_state") == "committed":
             return {**prior["result"], "reattached": True}
         # Interrupted before receipt: reconcile, do not re-apply.
         return query_graph_edit_operation(operation_id, workspace=workspace)
-    root, target = _edit_scope(workspace, path)
-    if root is None or target is None or not target.is_file():
-        return {"status": "blocked", "code": "edit_path_out_of_scope",
-                "operation_id": operation_id}
+
     try:
-        current = target.read_bytes()
-    except OSError:
-        return {"status": "blocked", "code": "edit_path_out_of_scope",
-                "operation_id": operation_id}
-    if hashlib.sha256(current).hexdigest() != expected_preimage_sha256:
-        return {"status": "blocked", "code": "edit_preimage_mismatch",
-                "operation_id": operation_id}
-    post_bytes = intended_postimage.encode("utf-8")
-    post_sha = hashlib.sha256(post_bytes).hexdigest()
-    # Journal the intent BEFORE the effect so a crash is reconcilable.
-    entry = {
-        "operation_id": operation_id, "target": str(target),
-        "expected_postimage_sha256": post_sha,
-        "receipt_state": "pending", "effect_count": 0, "quarantined": False,
-    }
-    with _GRAPH_EDIT_LOCK:
-        _GRAPH_EDIT_JOURNAL[operation_id] = entry
-    target.write_bytes(post_bytes)
-    entry["effect_count"] = 1
-    if crash_before_receipt:
-        return {"status": "unknown", "exit_state": "interrupted_before_receipt",
-                "operation_id": operation_id, "effect_count": 1}
-    result = {
-        "status": "completed", "operation_id": operation_id,
-        "effect_count": 1, "postimage_sha256": post_sha, "reattached": False,
-    }
-    entry["receipt_state"] = "committed"
-    entry["result"] = result
-    return result
+        root, target = _edit_scope(workspace, path)
+        if root is None or target is None or not target.is_file():
+            return {"status": "blocked", "code": "edit_path_out_of_scope",
+                    "operation_id": operation_id}
+        try:
+            current = target.read_bytes()
+        except OSError:
+            return {"status": "blocked", "code": "edit_path_out_of_scope",
+                    "operation_id": operation_id}
+        if hashlib.sha256(current).hexdigest() != expected_preimage_sha256:
+            return {"status": "blocked", "code": "edit_preimage_mismatch",
+                    "operation_id": operation_id}
+        post_bytes = intended_postimage.encode("utf-8")
+        post_sha = hashlib.sha256(post_bytes).hexdigest()
+        # Persist the reserved intent before the effect, so concurrent calls
+        # wait on this identity and interruption remains reconcilable.
+        with _GRAPH_EDIT_LOCK:
+            entry.update({
+                "target": str(target),
+                "expected_postimage_sha256": post_sha,
+                "receipt_state": "pending",
+            })
+        target.write_bytes(post_bytes)
+        with _GRAPH_EDIT_LOCK:
+            entry["effect_count"] = 1
+        if crash_before_receipt:
+            return {"status": "unknown", "exit_state": "interrupted_before_receipt",
+                    "operation_id": operation_id, "effect_count": 1}
+        result = {
+            "status": "completed", "operation_id": operation_id,
+            "effect_count": 1, "postimage_sha256": post_sha, "reattached": False,
+        }
+        with _GRAPH_EDIT_LOCK:
+            entry["receipt_state"] = "committed"
+            entry["result"] = result
+        return result
+    finally:
+        with _GRAPH_EDIT_LOCK:
+            if (entry.get("receipt_state") == "reserved"
+                    and _GRAPH_EDIT_JOURNAL.get(operation_id) is entry):
+                _GRAPH_EDIT_JOURNAL.pop(operation_id, None)
+            reservation_event.set()
 
 
 def query_graph_edit_operation(operation_id: str, *, workspace: Any = None) -> Dict[str, Any]:
