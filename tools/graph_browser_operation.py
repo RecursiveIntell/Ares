@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+from urllib.parse import unquote, urlsplit
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -33,6 +34,56 @@ def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def _http_origin(value: str):
+    """Return a normalized HTTP(S) origin tuple, or None for invalid input."""
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+        if parsed.username is not None or parsed.password is not None:
+            return None
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    effective_port = port if port is not None else (443 if scheme == "https" else 80)
+    return scheme, parsed.hostname.lower(), effective_port
+
+
+def _url_is_allowed(url: str, allowed_origins: List[str]) -> bool:
+    """Match web origins exactly and file URLs only beneath allowed paths."""
+    try:
+        target = urlsplit(url)
+        scheme = target.scheme.lower()
+    except (TypeError, ValueError):
+        return False
+
+    if scheme in {"http", "https"}:
+        target_origin = _http_origin(url)
+        return target_origin is not None and any(
+            _http_origin(origin) == target_origin for origin in allowed_origins
+        )
+
+    if scheme != "file" or target.netloc.lower() not in {"", "localhost"}:
+        return False
+    try:
+        target_path = Path(unquote(target.path)).resolve()
+        for origin in allowed_origins:
+            try:
+                allowed = urlsplit(origin)
+                if (allowed.scheme.lower() != "file"
+                        or allowed.netloc.lower() not in {"", "localhost"}):
+                    continue
+                allowed_path = Path(unquote(allowed.path) or "/").resolve()
+            except (TypeError, ValueError, OSError, RuntimeError):
+                continue
+            if target_path.is_relative_to(allowed_path):
+                return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return False
 
 
 class GraphBrowserOperation:
@@ -154,7 +205,7 @@ class GraphBrowserOperation:
                   parent_agent: Any, timeout_seconds: float = 30) -> Dict[str, Any]:
         if parent_agent is None:
             return {"status": "blocked", "code": "policy_owner_required"}
-        if not any(url.startswith(origin) for origin in ctx["allowed_origins"]):
+        if not _url_is_allowed(url, ctx["allowed_origins"]):
             return {"status": "blocked", "code": "browser_origin_not_allowed"}
         if timeout_seconds <= 0:
             return {"status": "blocked", "code": "browser_deadline_expired"}
