@@ -103,6 +103,22 @@ def test_guard_overwrites_model_grant_and_real_owner_accepts_launch_and_provider
     assert replay["ok"] is False and replay["code"] == "graph_admission_replay"
 
 
+def test_default_admission_socket_is_scoped_to_hermes_home(parent, tmp_path, monkeypatch):
+    p, _fixture_endpoint = parent
+    with tempfile.TemporaryDirectory(prefix="ph-") as profile_home_raw:
+        profile_home = Path(profile_home_raw)
+        monkeypatch.delenv("AGENT_GRAPH_ADMISSION_SOCKET", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        expected = profile_home / "run" / "graph-admission" / "authority.sock"
+
+        with bind_subagent_parent(p):
+            guard_graph_mcp("agent_graph", "graph_run_start", ARGS)
+
+        assert expected.exists()
+        assert expected.is_socket()
+        reset_graph_admission_for_tests()
+
+
 def test_missing_version_or_budget_is_refused_before_transport(parent):
     p, _ = parent
     with bind_subagent_parent(p), pytest.raises(Exception, match="graph_version_pin_required"):

@@ -94,10 +94,15 @@ def _issue_graph_host_grant(tool_name, arguments):
     with _graph_admission_lock:
         if _graph_admission_service is None:
             from agent.graph_admission import GraphAdmissionService, GraphAdmissionSocket
+            from hermes_constants import get_hermes_home
             service = GraphAdmissionService()
+            # Profile-aware default: two profile backends under one OS account
+            # must not collide on a single authority endpoint. The explicit
+            # AGENT_GRAPH_ADMISSION_SOCKET override still wins; the default
+            # profile's path is unchanged.
             endpoint = Path(os.getenv(
                 "AGENT_GRAPH_ADMISSION_SOCKET",
-                str(Path.home() / ".ares/run/graph-admission/authority.sock"),
+                str(get_hermes_home() / "run" / "graph-admission" / "authority.sock"),
             ))
             if endpoint.name != "authority.sock":
                 raise OrchestrationError("graph_admission_endpoint_unqualified")
