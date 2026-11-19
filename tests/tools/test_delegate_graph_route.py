@@ -120,6 +120,35 @@ def test_immediately_finished_graph_worker_does_not_leave_stale_control_handle(d
         assert result["handle_id"] not in dt._active_subagents
 
 
+def test_graph_background_refuses_when_async_delivery_has_no_wake_session(durable_home, monkeypatch):
+    dispatched = []
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: False)
+    monkeypatch.setattr("tools.async_delegation._current_origin_session_id", lambda: "")
+    monkeypatch.setattr("tools.async_delegation.dispatch_async_delegation",
+                        lambda **kw: dispatched.append(kw) or {"status": "dispatched"})
+
+    out = json.loads(_dispatch_graph_background(**_route_kwargs()))
+
+    assert out["status"] == "blocked"
+    assert out["code"] == "graph_async_delivery_unavailable"
+    assert out["provider_calls"] == 0
+    assert out["legacy_fallback"] is False
+    assert dispatched == []
+
+
+def test_graph_background_allows_api_server_wake_session_without_push_delivery(durable_home, monkeypatch):
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: False)
+    monkeypatch.setattr("gateway.session_context.get_session_env",
+                        lambda name, default="": "api_server" if name == "HERMES_SESSION_PLATFORM" else default)
+    monkeypatch.setattr("tools.async_delegation._current_origin_session_id", lambda: "api-session-17")
+    _install_mock_dispatch(monkeypatch)
+
+    out = json.loads(_dispatch_graph_background(**_route_kwargs()))
+
+    assert out["status"] == "dispatched"
+    assert out["origin_session_id"] == "api-session-17"
+
+
 def test_allowlisted_graph_runs_once_and_never_calls_legacy(durable_home, monkeypatch):
     p=parent()
     cfg={"graph_route_enabled":True,"graph_route_allowlist":["research-v1"]}

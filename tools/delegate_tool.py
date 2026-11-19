@@ -5669,6 +5669,22 @@ def _dispatch_graph_background(
     if not session_key and not origin_sid and not getattr(parent_agent, "session_id", None):
         return json.dumps({"status":"blocked", "code":"graph_origin_required",
                            "provider_calls":0, "legacy_fallback":False})
+    try:
+        from gateway.session_context import async_delivery_supported, get_session_env
+        _async_ok = async_delivery_supported()
+    except Exception:
+        _async_ok = True
+        get_session_env = None
+    if not _async_ok:
+        _api_server_wake = False
+        if origin_sid and get_session_env is not None:
+            try:
+                _api_server_wake = get_session_env("HERMES_SESSION_PLATFORM", "") == "api_server"
+            except Exception:
+                _api_server_wake = False
+        if not _api_server_wake:
+            return json.dumps({"status":"blocked", "code":"graph_async_delivery_unavailable",
+                               "provider_calls":0, "legacy_fallback":False})
 
     from tools.async_delegation import bind_graph_backend, dispatch_async_delegation
     import threading
