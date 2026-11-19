@@ -4081,6 +4081,21 @@ def delegate_task(
             f"multiplies API cost)."
         )
 
+    # Workload-fit routing (Phase 4, additive/default-off) resolves a declared
+    # shape before selecting the admission effect. This chooses the requested
+    # route only; graph_route_decision below still enforces enablement/allowlist.
+    _shape_resolution = resolve_workload_shape(
+        workload_shape=workload_shape, graph_id=graph_id, cfg=_load_config())
+    if _shape_resolution.get("blocked"):
+        return json.dumps({"status":"blocked", "code":_shape_resolution["blocked"],
+                           "provider_calls":0, "legacy_fallback":False})
+    _shape_rule_id = None
+    if _shape_resolution.get("resolved"):
+        graph_id = _shape_resolution["graph_id"]
+        graph_version = _shape_resolution["graph_version"]
+        graph_budgets = _shape_resolution["graph_budgets"]
+        _shape_rule_id = _shape_resolution["rule_id"]
+
     # Mandatory session admission is independent of optional tool observers.
     # It precedes credential resolution, child construction and queueing.
     from dataclasses import replace
@@ -4117,20 +4132,6 @@ def delegate_task(
             credentials_cfg = admission.routing_config
     except OrchestrationError as exc:
         return denial_result(exc)
-
-    # Workload-fit routing (Phase 4, additive/default-off): a declared shape
-    # resolves to an operator-qualified graph before the explicit-graph gate.
-    _shape_resolution = resolve_workload_shape(
-        workload_shape=workload_shape, graph_id=graph_id, cfg=_load_config())
-    if _shape_resolution.get("blocked"):
-        return json.dumps({"status":"blocked", "code":_shape_resolution["blocked"],
-                           "provider_calls":0, "legacy_fallback":False})
-    _shape_rule_id = None
-    if _shape_resolution.get("resolved"):
-        graph_id = _shape_resolution["graph_id"]
-        graph_version = _shape_resolution["graph_version"]
-        graph_budgets = _shape_resolution["graph_budgets"]
-        _shape_rule_id = _shape_resolution["rule_id"]
 
     if graph_id is not None:
         decision = graph_route_decision(

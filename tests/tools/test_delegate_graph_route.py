@@ -611,6 +611,98 @@ def test_entry_shape_routes_through_graph_seam(monkeypatch):
     assert spawned[1]["graph_operation_id"] == spawned[0]["graph_operation_id"]
 
 
+def _shape_policy_parent(tmp_path, *, allow_delegation=False, allow_graph=True, opt_out=False):
+    from agent.orchestration_policy import OrchestrationPolicy
+    from hermes_state import SessionDB
+
+    home = tmp_path / "shape-policy"
+    home.mkdir()
+    db = SessionDB(home / "state.db")
+    db.create_session("shape-policy-owner", "cli", model="main-model")
+    db.set_orchestration_policy(
+        "shape-policy-owner",
+        OrchestrationPolicy(
+            allow_delegation=allow_delegation,
+            allow_graph=allow_graph,
+        ).to_dict(),
+        expected_revision=0,
+        origin="operator-command",
+    )
+    owner = SimpleNamespace(
+        session_id="shape-policy-owner",
+        _session_db=db,
+        _delegate_depth=0,
+        _orchestration_opt_out=opt_out,
+    )
+    return owner, db
+
+
+def test_shape_resolved_direct_dispatch_uses_graph_admission_not_delegation(tmp_path, monkeypatch):
+    from tools import delegate_tool as dt
+
+    owner, db = _shape_policy_parent(tmp_path, allow_delegation=False, allow_graph=True)
+    spawned = []
+    monkeypatch.setattr(dt, "_load_config", lambda: _FIT_CFG)
+    monkeypatch.setattr(dt, "_dispatch_graph_background",
+                        lambda **kw: spawned.append(kw) or json.dumps({"status": "dispatched"}))
+    try:
+        out = json.loads(dt.delegate_task(
+            goal="extract four spans", background=True,
+            workload_shape="wide_independent_fanout", parent_agent=owner))
+        assert out["status"] == "dispatched", out
+        assert len(spawned) == 1
+        assert spawned[0]["graph_id"] == "fanout4-v1"
+    finally:
+        db.close()
+
+
+def test_shape_resolved_model_dispatch_uses_graph_admission_not_delegation(tmp_path, monkeypatch):
+    from run_agent import AIAgent
+    from tools import delegate_tool as dt
+
+    owner, db = _shape_policy_parent(tmp_path, allow_delegation=False, allow_graph=True)
+    spawned = []
+    monkeypatch.setattr(dt, "_load_config", lambda: _FIT_CFG)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: _FIT_CFG)
+    monkeypatch.setattr(dt, "_dispatch_graph_background",
+                        lambda **kw: spawned.append(kw) or json.dumps({"status": "dispatched"}))
+    try:
+        out = json.loads(AIAgent._dispatch_delegate_task(owner, {
+            "goal": "extract four spans",
+            "workload_shape": "wide_independent_fanout",
+        }))
+        assert out["status"] == "dispatched", out
+        assert len(spawned) == 1
+        assert spawned[0]["graph_id"] == "fanout4-v1"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("allow_graph", "opt_out", "expected_code"),
+    [(False, False, "graph_disabled"), (True, True, "caller_opt_out")],
+)
+def test_shape_route_never_overrides_graph_policy_or_optout(
+    tmp_path, monkeypatch, allow_graph, opt_out, expected_code,
+):
+    from tools import delegate_tool as dt
+
+    owner, db = _shape_policy_parent(
+        tmp_path, allow_delegation=False, allow_graph=allow_graph, opt_out=opt_out)
+    spawned = []
+    monkeypatch.setattr(dt, "_load_config", lambda: _FIT_CFG)
+    monkeypatch.setattr(dt, "_dispatch_graph_background",
+                        lambda **kw: spawned.append(kw) or json.dumps({"status": "dispatched"}))
+    try:
+        out = json.loads(dt.delegate_task(
+            goal="extract four spans", background=True,
+            workload_shape="wide_independent_fanout", parent_agent=owner))
+        assert out["status"] == "blocked" and out["code"] == expected_code, out
+        assert spawned == []
+    finally:
+        db.close()
+
+
 def test_entry_shape_without_rule_stays_legacy(monkeypatch):
     from tools.delegate_tool import delegate_task
     spawned = _entry(monkeypatch, _FIT_CFG)
