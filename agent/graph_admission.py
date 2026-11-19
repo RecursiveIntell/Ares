@@ -160,12 +160,14 @@ class GraphAdmissionService:
         keys = {"schema", "reference", "stage", "graph_id", "graph_version",
                 "request_digest", "execution_route", "run_id"}
         if stage == "provider":
-            keys |= {"node_id", "invocation_ref"}
+            keys |= {"node_id", "invocation_ref", "requested_effort"}
         if (type(stage) is not str or stage not in {"launch", "provider"} or request.keys() != keys
                 or request.get("schema") != SCHEMA
                 or not all(_identifier(request.get(k)) for k in ("reference", "run_id"))
-                or (stage == "provider" and not all(
-                    _identifier(request.get(k)) for k in ("node_id", "invocation_ref")))):
+                or (stage == "provider" and (not all(
+                    _identifier(request.get(k)) for k in ("node_id", "invocation_ref"))
+                    or type(request.get("requested_effort")) is not str
+                    or request.get("requested_effort") not in {"minimal", "low", "medium", "high", "xhigh"}))):
             return _error("graph_admission_request_invalid")
         with self._lock:
             entry = self._entries.get(request["reference"])
@@ -185,6 +187,12 @@ class GraphAdmissionService:
                 ("request_digest", scope.request_digest), ("execution_route", scope.execution_route),
             )):
                 return _error("graph_admission_binding_mismatch")
+            if stage == "provider":
+                effort_rank = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4}
+                granted_effort = scope.execution_route.get("reasoning_effort")
+                if (granted_effort not in effort_rank
+                        or effort_rank[request["requested_effort"]] > effort_rank[granted_effort]):
+                    return _error("graph_admission_effort_widened")
             if stage == "launch":
                 if entry.run_id is not None:
                     return _error("graph_admission_replay")

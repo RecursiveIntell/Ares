@@ -81,6 +81,7 @@ def _provider_request(grant, run_id="run-auth-1", node_id="rec", invocation_ref=
         "run_id": run_id,
         "node_id": node_id,
         "invocation_ref": invocation_ref,
+        "requested_effort": grant["execution_route"]["reasoning_effort"],
     }
 
 

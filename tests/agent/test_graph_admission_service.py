@@ -52,7 +52,7 @@ def request(scope,stage='launch',**kwargs):
         'graph_id':scope.graph_id,'graph_version':scope.graph_version,
         'request_digest':scope.request_digest,'execution_route':scope.execution_route,
         'run_id':'run-fixture'}
-    if stage=='provider':value.update(node_id='ask',invocation_ref='invocation-1')
+    if stage=='provider':value.update(node_id='ask',invocation_ref='invocation-1',requested_effort=scope.execution_route['reasoning_effort'])
     value.update(kwargs)
     return value
 
@@ -416,3 +416,23 @@ def test_budget_and_deadline_survive_socket_round_trip_without_leaking_reference
         assert denied['ok'] is False
         assert denied['code']=='graph_admission_budget_exhausted'
     assert count(owner)==2
+
+
+def test_provider_effort_may_lower_but_never_widen_granted_ceiling(owner):
+    service=GraphAdmissionService(); scope=issue(service,owner)
+    # The fixture's authorized session route is low. A lower request is allowed;
+    # a higher request (medium) is rejected before a new owner claim.
+    service.authorize(request(scope))
+    low=request(scope,'provider',requested_effort='minimal',invocation_ref='low:1')
+    assert service.authorize(low)['ok'] is True
+    higher=request(scope,'provider',requested_effort='medium',invocation_ref='wide:1')
+    assert service.authorize(higher)['code']=='graph_admission_effort_widened'
+
+
+def test_provider_effort_field_is_required_and_typed(owner):
+    service=GraphAdmissionService(); scope=issue(service,owner)
+    service.authorize(request(scope))
+    missing=request(scope,'provider'); missing.pop('requested_effort')
+    assert service.authorize(missing)['code']=='graph_admission_request_invalid'
+    wrong=request(scope,'provider',requested_effort={'effort':'medium'})
+    assert service.authorize(wrong)['code']=='graph_admission_request_invalid'
