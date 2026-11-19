@@ -8520,8 +8520,10 @@ class AIAgent:
         invocation paths (concurrent, sequential, inline).
         """
         from tools.delegate_tool import (
+            _load_config as _load_delegate_config,
             _strip_model_hidden_task_fields,
             delegate_task as _delegate_task,
+            resolve_workload_shape,
         )
         # Delegations from the top-level MODEL always run in the background —
         # the model does not get to choose. delegate_task returns immediately
@@ -8540,7 +8542,17 @@ class AIAgent:
             from agent.orchestration_policy import OrchestrationError
             from agent.orchestration_runtime import admit_worker, denial_result
             try:
-                admission = admit_worker(self)
+                shape_resolution = resolve_workload_shape(
+                    workload_shape=function_args.get("workload_shape"),
+                    graph_id=function_args.get("graph_id"),
+                    cfg=_load_delegate_config(),
+                )
+                graph_requested = (
+                    function_args.get("graph_id") is not None
+                    or shape_resolution.get("resolved") is True
+                )
+                admission = admit_worker(
+                    self, effect="graph" if graph_requested else "delegation")
             except OrchestrationError as exc:
                 return denial_result(exc)
         return _delegate_task(
@@ -8550,6 +8562,12 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=(not _is_subagent),
+            graph_id=function_args.get("graph_id"),
+            graph_version=function_args.get("graph_version"),
+            graph_input=function_args.get("graph_input"),
+            graph_budgets=function_args.get("graph_budgets"),
+            graph_operation_id=function_args.get("graph_operation_id"),
+            workload_shape=function_args.get("workload_shape"),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),

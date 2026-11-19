@@ -52,7 +52,7 @@ def request(scope,stage='launch',**kwargs):
         'graph_id':scope.graph_id,'graph_version':scope.graph_version,
         'request_digest':scope.request_digest,'execution_route':scope.execution_route,
         'run_id':'run-fixture'}
-    if stage=='provider':value.update(node_id='ask',invocation_ref='invocation-1')
+    if stage=='provider':value.update(node_id='ask',invocation_ref='invocation-1',requested_effort=scope.execution_route['reasoning_effort'])
     value.update(kwargs)
     return value
 
@@ -320,3 +320,119 @@ def test_incomplete_frame_expires_and_does_not_hold_the_listener(owner,ipc_path)
             assert reply['ok'] is False
         assert call_graph_admission(server.endpoint,request(scope))['ok'] is True
     assert count(owner)==1
+
+
+# --- HOST card (P1) deny witnesses: deadline, budget, route generation ---
+# LOCK contract-v1.md §2 additive fields; §3 frozen outcomes. These tests are
+# written BEFORE implementation (RED) and must fail on the unmodified base.
+
+def test_issue_binds_explicit_deadline_and_budget_to_the_reference(owner):
+    service=GraphAdmissionService()
+    scope=issue(service,owner,ttl_seconds=60,deadline_seconds=120,budget_invocations=3)
+    meta=scope.metadata()
+    assert meta['deadline_seconds']==120
+    assert meta['budget_invocations']==3
+    assert scope.deadline_seconds==120
+    assert scope.budget_invocations==3
+    # reference alone is not authorization: issuance writes zero claims
+    assert count(owner)==0
+
+
+def test_deadline_expiry_denies_launch_and_provider_with_zero_claims(owner):
+    now=[0.0]
+    service=GraphAdmissionService(clock=lambda:now[0])
+    scope=issue(service,owner,ttl_seconds=300,deadline_seconds=10,budget_invocations=5)
+    now[0]=10.0  # closed boundary: now >= deadline
+    result=service.authorize(request(scope))
+    assert result['ok'] is False
+    assert result['code']=='graph_admission_deadline_expired'
+    assert service.authorize(request(scope,'provider'))['ok'] is False
+    assert count(owner)==0
+
+
+def test_deadline_is_checked_before_each_provider_invocation(owner):
+    now=[0.0]
+    service=GraphAdmissionService(clock=lambda:now[0])
+    scope=issue(service,owner,ttl_seconds=300,deadline_seconds=10,budget_invocations=5)
+    assert service.authorize(request(scope))['ok'] is True
+    assert service.authorize(request(scope,'provider'))['ok'] is True
+    now[0]=11.0
+    result=service.authorize(request(scope,'provider',invocation_ref='invocation-2'))
+    assert result['ok'] is False
+    assert result['code']=='graph_admission_deadline_expired'
+    assert count(owner)==2  # launch + first provider only; no third claim
+
+
+def test_exhausted_parent_budget_yields_zero_new_starts(owner):
+    service=GraphAdmissionService()
+    scope=issue(service,owner,ttl_seconds=300,deadline_seconds=300,budget_invocations=1)
+    assert service.authorize(request(scope))['ok'] is True
+    assert service.authorize(request(scope,'provider'))['ok'] is True
+    result=service.authorize(request(scope,'provider',invocation_ref='invocation-2'))
+    assert result['ok'] is False
+    assert result['code']=='graph_admission_budget_exhausted'
+    # replay of the admitted invocation is still a replay, not a budget grant
+    assert service.authorize(request(scope,'provider'))['code']=='graph_admission_replay'
+    assert count(owner)==2
+
+
+def test_route_generation_captured_at_issue_for_new_admissions_only(owner):
+    service=GraphAdmissionService()
+    scope=issue(service,owner)
+    generation=scope.route_generation
+    assert type(generation) is int and generation>=0
+    assert scope.metadata()['route_generation']==generation
+    # operator changes the pinned route AFTER issue: new revision/generation
+    owner._session_db.set_orchestration_policy('root',OrchestrationPolicy(
+        secondary_route=SecondaryRoute('openai-codex','Newer-Worker','medium')).to_dict(),
+        expected_revision=1,origin='operator-command')
+    # the already-issued reference keeps its captured generation and binding;
+    # authorize must refuse the stale admission, not silently re-pin
+    result=service.authorize(request(scope))
+    assert result['ok'] is False
+    fresh=issue(service,owner)
+    assert fresh.route_generation!=generation
+    assert fresh.execution_route['model']=='Newer-Worker'
+    assert service.authorize(request(fresh))['ok'] is True
+
+
+def test_invalid_deadline_or_budget_is_typed_refusal(owner):
+    service=GraphAdmissionService()
+    for kwargs in ({'deadline_seconds':0},{'deadline_seconds':-5},
+                   {'deadline_seconds':float('inf')},{'budget_invocations':0},
+                   {'budget_invocations':-1},{'budget_invocations':1.5}):
+        with pytest.raises(OrchestrationError,match='graph_admission_request_invalid'):
+            issue(service,owner,**kwargs)
+    assert count(owner)==0
+
+
+def test_budget_and_deadline_survive_socket_round_trip_without_leaking_reference(owner,ipc_path):
+    service=GraphAdmissionService()
+    scope=issue(service,owner,ttl_seconds=300,deadline_seconds=300,budget_invocations=1)
+    with GraphAdmissionSocket(service,ipc_path/'private-ipc') as server:
+        assert call_graph_admission(server.endpoint,request(scope))['ok'] is True
+        assert call_graph_admission(server.endpoint,request(scope,'provider'))['ok'] is True
+        denied=call_graph_admission(server.endpoint,request(scope,'provider',invocation_ref='invocation-2'))
+        assert denied['ok'] is False
+        assert denied['code']=='graph_admission_budget_exhausted'
+    assert count(owner)==2
+
+
+def test_provider_effort_may_lower_but_never_widen_granted_ceiling(owner):
+    service=GraphAdmissionService(); scope=issue(service,owner)
+    # The fixture's authorized session route is low. A lower request is allowed;
+    # a higher request (medium) is rejected before a new owner claim.
+    service.authorize(request(scope))
+    low=request(scope,'provider',requested_effort='minimal',invocation_ref='low:1')
+    assert service.authorize(low)['ok'] is True
+    higher=request(scope,'provider',requested_effort='medium',invocation_ref='wide:1')
+    assert service.authorize(higher)['code']=='graph_admission_effort_widened'
+
+
+def test_provider_effort_field_is_required_and_typed(owner):
+    service=GraphAdmissionService(); scope=issue(service,owner)
+    service.authorize(request(scope))
+    missing=request(scope,'provider'); missing.pop('requested_effort')
+    assert service.authorize(missing)['code']=='graph_admission_request_invalid'
+    wrong=request(scope,'provider',requested_effort={'effort':'medium'})
+    assert service.authorize(wrong)['code']=='graph_admission_request_invalid'

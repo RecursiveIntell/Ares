@@ -70,6 +70,10 @@ def _fake_parent():
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
+    # Explicitly set orchestration attributes so getattr returns bool, not MagicMock
+    parent._orchestration_opt_out = False
+    parent._orchestration_admission = None
+    parent._delegate_depth = 0
     return parent
 
 
@@ -165,3 +169,166 @@ def test_apiserver_session_without_id_stays_synchronous(monkeypatch):
     assert parsed.get("status") != "dispatched", parsed
     assert "SYNCHRONOUSLY" in parsed.get("note", "")
     assert process_registry.completion_queue.empty()
+
+
+# --- EDGES card (P5): graph-route admission seam (default-off) ---
+# One caller row: delegate_task(background=True) on api_server. The seam
+# decides graph vs legacy BEFORE dispatch; default-off keeps legacy exactly.
+
+def test_graph_route_default_off_keeps_legacy_dispatch(monkeypatch):
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-edge-1")
+    set_session_vars(platform="api_server", chat_id="raw-sid-edge-1",
+                     session_key="raw-sid-edge-1", session_id="raw-sid-edge-1",
+                     async_delivery=False)
+    decision = dt.graph_route_decision(parent_agent=_fake_parent(), background=True)
+    assert decision["route"] == "legacy"
+    assert decision["reason"] == "no_explicit_graph_request"
+    out = dt.delegate_task(goal="edge default-off", background=True,
+                           parent_agent=_fake_parent())
+    parsed = json.loads(out)
+    assert parsed["status"] == "dispatched"
+    assert parsed["mode"] == "background"
+    assert parsed.get("backend_generation", "legacy") == "legacy"
+
+
+def test_graph_route_enabled_in_test_selects_graph_once(monkeypatch):
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setattr(dt, "_load_config",
+                        lambda: {"graph_route_enabled": True, "graph_route_allowlist": ["research-v1"]})
+    decision = dt.graph_route_decision(parent_agent=_fake_parent(), background=True,
+                                       graph_id="research-v1")
+    assert decision["route"] == "graph"
+    assert decision["reason"] == "explicit_graph_opt_in"
+    assert decision["backend_generation"] == "graph-v1"
+    # Opt-out is a block for an explicit graph request, never a legacy substitute.
+    parent = _fake_parent()
+    parent._orchestration_opt_out = True
+    decision2 = dt.graph_route_decision(parent_agent=parent, background=True,
+                                        graph_id="research-v1")
+    assert decision2["route"] == "blocked"
+    assert decision2["reason"] == "caller_opt_out"
+
+
+def test_graph_route_never_recursive_for_child_callers(monkeypatch):
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setattr(dt, "_load_config",
+                        lambda: {"graph_route_enabled": True})
+    parent = _fake_parent()
+    parent._delegate_depth = 1
+    decision = dt.graph_route_decision(parent_agent=parent, background=True,
+                                       graph_id="research-v1")
+    assert decision["route"] == "blocked"
+    assert decision["reason"] == "nested_worker_not_graph_eligible"
+
+
+def test_graph_route_sync_calls_stay_legacy(monkeypatch):
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setattr(dt, "_load_config",
+                        lambda: {"graph_route_enabled": True})
+    decision = dt.graph_route_decision(parent_agent=_fake_parent(), background=False)
+    assert decision["route"] == "legacy"
+    assert decision["reason"] == "no_explicit_graph_request"
+
+
+# --- EDGES card (P5): model-dispatch seam carries the host admission ---
+# run_agent._dispatch_delegate_task pre-admits and forwards the admission to
+# delegate_task. These exercise the REAL seam (delegate_task is NOT mocked):
+# the forwarded kwarg must be accepted, the effect must match the request,
+# and a stale admission must fail closed. The earlier mocked-seam tests could
+# not see the TypeError this row fixes.
+
+def _real_seam_parent(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_constants import set_hermes_home_override
+    from hermes_state import SessionDB
+    home = tmp_path / "profile"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    token = set_hermes_home_override(home)
+    db = SessionDB(home / "state.db")
+    db.create_session("edge-parent", "cli", model="main-model")
+    parent = SimpleNamespace(session_id="edge-parent", _session_db=db,
+                             model="main-model", provider="main-provider",
+                             _delegate_depth=0, enabled_toolsets=["file"],
+                             reasoning_config={"enabled": True, "effort": "high"},
+                             _orchestration_opt_out=False,
+                             _orchestration_admission=None)
+    return parent, token
+
+
+def test_model_dispatch_seam_accepts_forwarded_admission(tmp_path, monkeypatch):
+    from run_agent import AIAgent
+    from hermes_constants import reset_hermes_home_override
+    parent, token = _real_seam_parent(tmp_path, monkeypatch)
+    try:
+        dt = _patch_delegate(monkeypatch)
+        monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-edge-seam")
+        set_session_vars(platform="api_server", chat_id="raw-sid-edge-seam",
+                         session_key="raw-sid-edge-seam", session_id="raw-sid-edge-seam",
+                         async_delivery=False)
+        out = AIAgent._dispatch_delegate_task(
+            parent, {"goal": "real seam legacy task"})
+        parsed = json.loads(out)
+        assert parsed["status"] == "dispatched", parsed
+        assert parsed.get("backend_generation", "legacy") == "legacy"
+    finally:
+        reset_hermes_home_override(token)
+        parent._session_db.close()
+
+
+def test_model_dispatch_graph_request_uses_graph_effect(tmp_path, monkeypatch):
+    from run_agent import AIAgent
+    from hermes_constants import reset_hermes_home_override
+    from agent.orchestration_policy import OrchestrationPolicy
+    parent, token = _real_seam_parent(tmp_path, monkeypatch)
+    try:
+        dt = _patch_delegate(monkeypatch)
+        # Operator disables graph for this session: the forwarded admission
+        # must be re-checked under the GRAPH effect and refuse, not fall back.
+        parent._session_db.set_orchestration_policy(
+            "edge-parent", OrchestrationPolicy(allow_graph=False).to_dict(),
+            expected_revision=0, origin="operator-command")
+        monkeypatch.setattr(dt, "_load_config",
+                            lambda: {"graph_route_enabled": True,
+                                     "graph_route_allowlist": ["research-v1"]})
+        out = AIAgent._dispatch_delegate_task(parent, {
+            "goal": "graph via model seam", "graph_id": "research-v1",
+            "graph_version": "sha256:" + "a" * 64,
+            "graph_input": {"source": "frozen"},
+            "graph_budgets": {"max_llm_calls": 2, "max_wall_clock_ms": 30000},
+            "graph_operation_id": "edge-seam-graph-0001"})
+        parsed = json.loads(out)
+        assert parsed["status"] == "blocked", parsed
+        assert parsed["code"] == "graph_disabled", parsed
+        assert parsed.get("provider_calls") == 0
+    finally:
+        reset_hermes_home_override(token)
+        parent._session_db.close()
+
+
+def test_model_dispatch_stale_admission_fails_closed(tmp_path, monkeypatch):
+    from run_agent import AIAgent
+    from hermes_constants import reset_hermes_home_override
+    from agent.orchestration_policy import OrchestrationPolicy
+    from agent.orchestration_runtime import admit_worker
+    parent, token = _real_seam_parent(tmp_path, monkeypatch)
+    try:
+        dt = _patch_delegate(monkeypatch)
+        admission = admit_worker(parent, effect="delegation")
+        # Policy revision moves AFTER the host admission was issued: the
+        # forwarded snapshot is stale and must be refused, not reused.
+        parent._session_db.set_orchestration_policy(
+            "edge-parent", OrchestrationPolicy(allow_delegation=False).to_dict(),
+            expected_revision=0, origin="operator-command")
+        out = dt.delegate_task(goal="stale admission", background=True,
+                               parent_agent=parent,
+                               _orchestration_admission=admission)
+        parsed = json.loads(out)
+        assert parsed["status"] == "blocked", parsed
+        assert parsed["code"] in {"orchestration_revision_changed",
+                                  "orchestration_policy_changed",
+                                  "delegation_disabled"}, parsed
+    finally:
+        reset_hermes_home_override(token)
+        parent._session_db.close()
