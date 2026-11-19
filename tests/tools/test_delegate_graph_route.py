@@ -563,8 +563,14 @@ def test_entry_shape_routes_through_graph_seam(monkeypatch):
     assert spawned[0]["graph_id"] == "fanout4-v1"
     assert spawned[0]["graph_version"] == _FANOUT_VERSION
     assert spawned[0]["graph_budgets"]["max_llm_calls"] == 4
-    assert spawned[0]["graph_operation_id"].startswith("shape-wide-fanout-")
+    assert spawned[0]["graph_operation_id"].startswith("shape-")
     assert spawned[0]["graph_input"] == {"goal": "extract four spans", "context": None}
+    # Same owner + same shape + same payload -> stable retry identity.
+    retry = json.loads(delegate_task(goal="extract four spans", background=True,
+                                     workload_shape="wide_independent_fanout",
+                                     parent_agent=parent()))
+    assert retry["status"] == "dispatched"
+    assert spawned[1]["graph_operation_id"] == spawned[0]["graph_operation_id"]
 
 
 def test_entry_shape_without_rule_stays_legacy(monkeypatch):

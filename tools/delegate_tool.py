@@ -4159,11 +4159,22 @@ def delegate_task(
         if _shape_rule_id is not None:
             # Shape-resolved calls carry no caller graph fields; derive a stable
             # operation identity and freeze the task as the graph input.
-            if not graph_operation_id:
-                import uuid as _uuid
-                graph_operation_id = f"shape-{_shape_rule_id}-{_uuid.uuid4().hex[:16]}"
             if graph_input is None:
                 graph_input = {"goal": graph_goal, "context": graph_context}
+            if not graph_operation_id:
+                # Stable across retries of the same origin+shape+payload: the
+                # durable delivery owner can reattach instead of duplicate.
+                from agent.orchestration_graph import _canonical_digest
+                graph_operation_id = "shape-" + _canonical_digest({
+                    "origin_session": getattr(parent_agent, "session_id", None),
+                    "workload_shape": workload_shape,
+                    "rule_id": _shape_rule_id,
+                    "graph_id": graph_id,
+                    "graph_version": graph_version,
+                    "graph_input": graph_input,
+                    "goal": graph_goal,
+                    "context": graph_context,
+                }).removeprefix("sha256:")[:32]
         return _dispatch_graph_background(
             parent_agent=parent_agent, admission=admission,
             graph_id=graph_id, graph_version=graph_version or "",
