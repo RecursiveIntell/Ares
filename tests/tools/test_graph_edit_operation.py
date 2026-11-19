@@ -15,7 +15,10 @@ from tools.delegate_tool import (
     query_graph_edit_operation,
 )
 
-FIXTURES = Path("/home/sikmindz/.ares/plans/dispatch-takeover-kit/E/FIXTURES")
+# Repo-local copy of the frozen F3 preimage (byte-identical to the kit fixture,
+# sha256 0d660a528c998d6eaed8ef757445be4e5137219f7a86f7d1d72e8f9b008a0998).
+# Tests must not depend on an operator-home path.
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "graph_edit"
 
 
 def _parent():

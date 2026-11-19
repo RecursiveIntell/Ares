@@ -11,11 +11,18 @@ NOW = 200000.0
 @pytest.fixture
 def ledger(monkeypatch):
     conn = sqlite3.connect(":memory:")
+    # Mirrors tools.async_delegation._initialize_schema incl. additive
+    # graph-binding columns; positional INSERT below must match column order.
     conn.execute("""CREATE TABLE async_delegations (
       delegation_id TEXT PRIMARY KEY, origin_session TEXT, state TEXT,
       dispatched_at REAL, completed_at REAL, updated_at REAL, result_json TEXT,
       delivery_state TEXT, delivery_attempts INTEGER, origin_session_id TEXT,
-      delivery_claim TEXT, event_json TEXT)""")
+      delivery_claim TEXT, event_json TEXT,
+      graph_alias TEXT NOT NULL DEFAULT '',
+      backend_generation TEXT NOT NULL DEFAULT '',
+      request_digest TEXT NOT NULL DEFAULT '',
+      operation_key TEXT NOT NULL DEFAULT '',
+      graph_run_id TEXT NOT NULL DEFAULT '')""")
     @contextmanager
     def transaction():
         with conn:
@@ -36,7 +43,11 @@ def insert(conn, identifier, *, state="completed", delivery="pending", claim=Non
     result = {"summary": "tiny result"}
     if compact:
         event, result = {}, {}
-    conn.execute("INSERT INTO async_delegations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
+    conn.execute("""INSERT INTO async_delegations
+        (delegation_id, origin_session, state, dispatched_at, completed_at,
+         updated_at, result_json, delivery_state, delivery_attempts,
+         origin_session_id, delivery_claim, event_json)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (
         identifier, "" if compact else "inert-origin", state, NOW - age, NOW - age,
         NOW - age, json.dumps(result), delivery, 0, "" if compact else "inert-session", claim, json.dumps(event)))
     conn.commit()
@@ -114,7 +125,11 @@ def test_pending_payload_survives_prune_lookup_and_replay(ledger):
             self.events.append(event)
     queue = Queue()
     assert subject.restore_undelivered_completions(queue) == 51
-    expected = [dict(json.loads(row[11]), restored=True) for row in before]
+    graph_defaults = {
+        "graph_alias": "", "backend_generation": "", "request_digest": "",
+        "operation_key": "", "graph_run_id": "",
+    }
+    expected = [dict(json.loads(row[11]), **graph_defaults, restored=True) for row in before]
     assert sorted(queue.events, key=lambda event: event["delegation_id"]) == expected
     assert snapshot(ledger) == before
 
@@ -124,6 +139,9 @@ def test_pending_payload_survives_prune_lookup_and_replay(ledger):
 def admission_ledger(monkeypatch):
     from gateway import status as process_status
     conn = sqlite3.connect(":memory:")
+    # Schema mirrors tools.async_delegation._initialize_schema, including the
+    # additive graph-binding columns (LOCK contract-v1 §2). The fixture forbids
+    # the live initializer, so it must declare every column dispatch writes.
     conn.execute("""CREATE TABLE async_delegations (
         delegation_id TEXT PRIMARY KEY, origin_session TEXT,
         origin_ui_session_id TEXT, parent_session_id TEXT, state TEXT,
@@ -131,7 +149,12 @@ def admission_ledger(monkeypatch):
         event_json TEXT, result_json TEXT, delivery_state TEXT,
         delivery_attempts INTEGER, delivered_at REAL, owner_pid INTEGER,
         owner_started_at INTEGER, task_json TEXT, delivery_claim TEXT,
-        delivery_claimed_at REAL, origin_session_id TEXT)""")
+        delivery_claimed_at REAL, origin_session_id TEXT,
+        graph_alias TEXT NOT NULL DEFAULT '',
+        backend_generation TEXT NOT NULL DEFAULT '',
+        request_digest TEXT NOT NULL DEFAULT '',
+        operation_key TEXT NOT NULL DEFAULT '',
+        graph_run_id TEXT NOT NULL DEFAULT '')""")
     calls = {"executor": 0, "submit": 0, "monitor": 0, "runner": 0}
     captured = []
     trace = []
