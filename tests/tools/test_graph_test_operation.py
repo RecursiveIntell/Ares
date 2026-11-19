@@ -4,7 +4,9 @@ A named test operation binds fixed argv/deps and a captured project cwd.
 Not general command execution: only registered suites in isolated worktrees.
 """
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -104,6 +106,36 @@ def test_timeout_is_unknown_not_pass(suite):
     assert result["status"] == "unknown"
     assert result["exit_state"] == "timeout"
     assert result.get("exit_code") is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group cleanup")
+def test_timeout_kills_delayed_write_descendant_before_reporting_closed(suite, tmp_path):
+    marker = tmp_path / "late-child-write.txt"
+    child_code = (
+        "import time; from pathlib import Path; time.sleep(1.0); "
+        f"Path({str(marker)!r}).write_text('late')"
+    )
+    suite_code = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        "time.sleep(30)"
+    )
+    register_graph_test_operation(
+        "suite-tree-timeout",
+        argv=[sys.executable, "-c", suite_code],
+        cwd=suite,
+    )
+
+    result = run_graph_test_operation(
+        operation_id="op-test-tree-timeout", suite="suite-tree-timeout",
+        parent_agent=_parent(), timeout_seconds=0.25,
+    )
+
+    assert result["status"] == "unknown"
+    assert result["exit_state"] == "timeout"
+    assert result["cleanup_state"] == "closed"
+    time.sleep(1.2)
+    assert not marker.exists(), "descendant wrote after timeout cleanup was reported closed"
 
 
 def test_missing_owner_is_refused(suite):

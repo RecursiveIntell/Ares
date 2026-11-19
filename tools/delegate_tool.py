@@ -22,6 +22,7 @@ import contextvars
 import json
 import logging
 import re
+import signal
 
 logger = logging.getLogger(__name__)
 import os
@@ -5965,6 +5966,76 @@ _GRAPH_TEST_LOCK = threading.Lock()
 _TEST_OUTPUT_CAP = 8192
 
 
+def _process_group_has_live_members(group_id: int) -> bool:
+    """Conservatively detect live members of a POSIX process group."""
+    from pathlib import Path as _Path
+
+    proc_root = _Path("/proc")
+    if proc_root.is_dir():
+        for proc_entry in proc_root.iterdir():
+            if not proc_entry.name.isdigit():
+                continue
+            try:
+                stat = (proc_entry / "stat").read_text()
+                close = stat.rfind(")")
+                fields = stat[close + 2:].split()
+                if len(fields) >= 3 and int(fields[2]) == group_id and fields[0] != "Z":
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
+
+    try:
+        os.killpg(group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _kill_graph_test_process_group(proc: Any) -> tuple[str, bool]:
+    """Kill and reap an owned suite process group; never overclaim closure."""
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            logger.warning("Could not signal graph test process group %s", proc.pid,
+                           exc_info=True)
+    else:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    try:
+        proc.communicate(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+    process_exited = proc.poll() is not None
+
+    if os.name == "posix":
+        deadline = time.monotonic() + 5
+        while _process_group_has_live_members(proc.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        group_exited = not _process_group_has_live_members(proc.pid)
+    else:
+        # The stdlib cannot confirm or kill a Windows descendant tree; keep
+        # cleanup explicitly pending rather than claiming the process tree closed.
+        group_exited = False
+
+    return ("closed" if process_exited and group_exited else "kill_pending", process_exited)
+
+
 def register_graph_test_operation(name: str, *, argv: List[str], cwd: Any) -> None:
     """Host-side registration of one fixed test suite. Not model-facing."""
     from pathlib import Path as _Path
@@ -6011,6 +6082,7 @@ def run_graph_test_operation(
         proc = _sp.Popen(
             spec["argv"], cwd=spec["cwd"],
             stdout=_sp.PIPE, stderr=_sp.PIPE, text=True,
+            start_new_session=(os.name == "posix"),
         )
     except OSError as exc:
         return {"status": "unknown", "exit_state": "launch_failed",
@@ -6018,14 +6090,10 @@ def run_graph_test_operation(
     try:
         out, err = proc.communicate(timeout=timeout_seconds)
     except _sp.TimeoutExpired:
-        proc.kill()
-        try:
-            proc.communicate(timeout=5)
-        except Exception:
-            pass
+        cleanup_state, process_exited = _kill_graph_test_process_group(proc)
         return {"status": "unknown", "exit_state": "timeout",
                 "operation_id": operation_id, "exit_code": None,
-                "cleanup_state": "closed"}
+                "cleanup_state": cleanup_state, "process_exited": process_exited}
     code = proc.returncode
     if code is None:
         return {"status": "unknown", "exit_state": "missing_exit_record",
