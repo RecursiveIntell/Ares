@@ -68,6 +68,10 @@ _CERTIFIED_ARRAY_RESULT_COMMANDS = frozenset({"pending-v2", "search"})
 # dropped to fit this bound; the governor remains fail-closed above it.
 DEFAULT_MAX_PROVENANCE_BYTES = 16 * 1024 * 1024
 
+# Bound persistent lineage failures so an operator repair can recover without
+# a process restart while still preventing a hot retry loop.
+LINEAGE_FAILURE_RETRY_DELAY_SECONDS = 60.0
+
 
 @dataclass(frozen=True)
 class _SummaryLLMRoute:
@@ -250,6 +254,8 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self._summary_api_key = ""
         self._summary_base_url = ""
         self._llm_checkpoint_count = 0
+        self._lineage_retry_brake_error: str | None = None
+        self._lineage_retry_brake_started_at: float | None = None
         # Ares owns lifecycle under the profile root. No config-supplied key
         # path is ever a canonical signing authority.
         self._key_state = ContextGovernorKeyState(get_hermes_home(), self.binary)
@@ -368,6 +374,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         clone.compression_count = self.compression_count
         clone.last_receipt_id = self.last_receipt_id
         clone.last_error = self.last_error
+        clone._lineage_retry_brake_error = getattr(
+            self, "_lineage_retry_brake_error", None
+        )
+        clone._lineage_retry_brake_started_at = getattr(
+            self, "_lineage_retry_brake_started_at", None
+        )
         clone.last_warning = self.last_warning
         clone.last_outcome = copy.deepcopy(self.last_outcome)
         clone._lineage_integrity_vetoes = copy.deepcopy(
@@ -976,6 +988,8 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         super().on_session_reset()
         self.last_receipt_id = None
         self.last_error = None
+        self._lineage_retry_brake_error = None
+        self._lineage_retry_brake_started_at = None
         self.last_warning = None
         self.last_outcome = None
         self.last_summary_safety = None
@@ -1249,40 +1263,59 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     def get_active_compression_failure_cooldown(
         self,
     ) -> Optional[Dict[str, Any]]:
-        """Return the live compression-failure cooldown, or None.
+        """Return a bounded retry brake for persistent lineage failures.
 
-        The host reads this from agent/turn_context.py:368 to decide
-        whether to skip preflight compression. The adapter's Rust binary
-        tracks its own failure state internally; for the moment the
-        adapter exposes no durable cooldown (the next turn's compact
-        call will surface any failure via last_error / last_warning on
-        get_status). Returns None to mean "no active cooldown, proceed".
-
-        Per-session retry brake: if the last governor error was a persistent
-        index/lineage failure that is known not to self-repair, report a
-        readiness signal so the host can suppress an identical retry and
-        surface the actionable failure immediately.
+        The failure is suppressed for a short interval to avoid a hot loop,
+        then automatic compression may retry. Each actual failure restarts the
+        interval, so a store repair can recover without restarting the agent.
         """
         error = getattr(self, "last_error", "")
         if not error:
             return None
-        # Governed index rebuild is a store-level repair, not a transient
-        # condition that resolves on retry. Suppress immediate re-attempt.
+        failure = None
         if "lineage_index_rebuild_required" in error:
-            return {
+            failure = {
                 "reason": "index_rebuild_required",
                 "message": "Governed lineage index requires rebuild; identical retry will not succeed.",
                 "action": "rebuild-lineage-index on the canonical store",
             }
-        # Lineage integrity mismatch on same session persists until the
-        # authenticated prefix divergence is repaired at the source.
-        if "lineage_integrity_mismatch" in error:
-            return {
+        elif "lineage_integrity_mismatch" in error:
+            failure = {
                 "reason": "lineage_integrity_mismatch",
                 "message": "Authenticated prefix divergence; identical retry will not succeed.",
                 "action": "replay on isolated copy to identify mutator, then repair",
             }
-        return None
+        if failure is None:
+            return None
+
+        if getattr(self, "_lineage_retry_brake_error", None) != error:
+            self._remember_lineage_retry_brake(error)
+        started_at = getattr(self, "_lineage_retry_brake_started_at", None)
+        if not isinstance(started_at, (int, float)):
+            self._remember_lineage_retry_brake(error)
+            started_at = self._lineage_retry_brake_started_at
+        remaining = LINEAGE_FAILURE_RETRY_DELAY_SECONDS - (
+            time.monotonic() - float(started_at)
+        )
+        if remaining <= 0:
+            return None
+        return {**failure, "remaining_seconds": remaining}
+
+    def _remember_lineage_retry_brake(self, error: Any) -> None:
+        """Restart the bounded brake only for persistent lineage failures."""
+        text = str(error or "")
+        if any(
+            code in text
+            for code in (
+                "lineage_index_rebuild_required",
+                "lineage_integrity_mismatch",
+            )
+        ):
+            self._lineage_retry_brake_error = text
+            self._lineage_retry_brake_started_at = time.monotonic()
+        else:
+            self._lineage_retry_brake_error = None
+            self._lineage_retry_brake_started_at = None
 
     # ------------------------------------------------------------------
     # Tool schemas — expose context_expand, context_search, context_status
@@ -1578,6 +1611,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 error = self._recover_pending_before_compaction(messages)
                 if error is not None:
                     self.last_error = error
+                    self._remember_lineage_retry_brake(error)
                     self._last_compress_aborted = True
                     self._last_summary_error = error
                     if not isinstance(self.last_outcome, dict):
@@ -2174,6 +2208,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                         exc_info=True,
                     )
             self.last_error = str(exc)
+            self._remember_lineage_retry_brake(exc)
             self._last_compress_aborted = True
             self._last_summary_error = str(exc)
             self._last_compression_made_progress = False
@@ -2718,9 +2753,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 ]:
                     continue
                 if authenticated_tip_bound:
-                    # Equality with the lossy durable projection is precisely
-                    # the case that needs canonical field restoration.
-                    if projection == current_prefix:
+                    # Only an already-canonical prefix may skip restoration.
+                    # ``projection`` is a deliberately lossy host roundtrip
+                    # (assistant ids and non-durable metadata are absent), so
+                    # equality with it is exactly when the authenticated tip
+                    # must restore the canonical receipt fields.
+                    if compacted == current_prefix:
                         continue
                 elif durable_projection == current_prefix:
                     # Historical fixture/legacy behavior has no authenticated

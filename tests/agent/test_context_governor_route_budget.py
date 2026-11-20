@@ -14,16 +14,22 @@ def governor(tmp_path):
     with patch("hermes_cli.config.load_config", return_value={}):
         # Use the real managed binary for integration tests
         real_binary = str(Path.home() / ".ares/runtime/current/.venv/bin/context-governor")
-        # Restore real HERMES_HOME for the engine's key_state (pytest sandboxed it)
+        # Keep key-state and telemetry bound to the pytest sandbox.
         import os
-        real_hermes_home = str(Path.home() / ".ares")
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir(mode=0o700)
         old_hermes_home = os.environ.get("HERMES_HOME")
-        os.environ["HERMES_HOME"] = real_hermes_home
+        os.environ["HERMES_HOME"] = str(hermes_home)
         try:
-            return ContextGovernorEngine(
+            engine = ContextGovernorEngine(
                 binary=real_binary,
                 store_dir=str(tmp_path / "governor-store"),
             )
+            assert engine._key_state.hermes_home == str(hermes_home)
+            binding = engine._key_state.initialize_first_install()
+            binding.close()
+            return engine
         finally:
             if old_hermes_home is not None:
                 os.environ["HERMES_HOME"] = old_hermes_home
