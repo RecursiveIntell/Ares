@@ -794,11 +794,14 @@ def test_generation_limit_invokes_one_bounded_continuation_with_projection_retry
     assert engine.validate_pending_compression(compacted) is True
 
 
-def test_below_threshold_does_not_schedule_governor_compaction():
+def test_governor_compaction_respects_output_adjusted_threshold():
     engine = ContextGovernorEngine(binary="/tmp/context-governor")
     engine.update_model("fixture", context_length=1_000)
+    threshold = engine.threshold_tokens
 
-    assert engine.should_compress(499) is False
+    assert threshold > 0
+    assert engine.should_compress(threshold - 1) is False
+    assert engine.should_compress(threshold) is True
 
 
 def test_generation_limit_rejects_invalid_continuation_transition():

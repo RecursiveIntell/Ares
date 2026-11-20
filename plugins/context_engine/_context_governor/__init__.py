@@ -2687,12 +2687,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     if isinstance(content, str):
                         message["content"] = content.strip()
             try:
-                # The authenticated tip is the prefix lock: host replay must
-                # not merge across it, and the rehydration comparison must
-                # repair the receipt side under the same lock as the host.
-                repair_message_sequence(
-                    None, host_messages, prefix_lock=len(compacted)
-                )
+                # This is a comparison projection for old transcripts that
+                # were already repaired before prefix locking existed. Mirror
+                # that historical unlocked transformation here; the live
+                # SessionDB mutator now receives the authenticated prefix lock
+                # and cannot apply this repair to the durable tip.
+                repair_message_sequence(None, host_messages)
             except Exception:
                 return []
             return [
