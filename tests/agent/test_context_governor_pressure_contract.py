@@ -11,14 +11,29 @@ from plugins.context_engine._context_governor import ContextGovernorEngine
 @pytest.fixture
 def governor(tmp_path):
     with patch("hermes_cli.config.load_config", return_value={}):
-        engine = ContextGovernorEngine(
-            binary=str(tmp_path / "no-native-governor"),
-            store_dir=str(tmp_path / "governor"),
-        )
-    engine.update_model("test-model", 100_000, max_tokens=10_000,
-                        provider="test", api_mode="chat_completions",
-                        threshold_percent=0.5)
-    return engine
+        # These tests exercise host-side pressure bookkeeping; none crosses
+        # the native key or receipt boundary. Keep state isolated without
+        # depending on an operator-installed runtime binary.
+        import os
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir(mode=0o700)
+        old_hermes_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(hermes_home)
+        try:
+            engine = ContextGovernorEngine(
+                store_dir=str(tmp_path / "governor"),
+            )
+            assert engine._key_state.hermes_home == str(hermes_home)
+            engine.update_model("test-model", 100_000, max_tokens=10_000,
+                                provider="test", api_mode="chat_completions",
+                                threshold_percent=0.5)
+            yield engine
+        finally:
+            if old_hermes_home is not None:
+                os.environ["HERMES_HOME"] = old_hermes_home
+            else:
+                os.environ.pop("HERMES_HOME", None)
 
 
 def seed_pair(engine, rough=46_000, real=20_000):
@@ -70,6 +85,28 @@ def test_matching_fresh_usage_replaces_pair_and_not_predicate(governor):
     observe(governor, 70_000, 25_000)
     assert governor.last_rough_tokens_when_real_prompt_fit == 70_000
     assert governor.last_real_prompt_tokens == 25_000
+
+
+def test_lineage_retry_brake_expires_after_bounded_delay(governor, monkeypatch):
+    from plugins.context_engine import _context_governor as governor_module
+
+    now = [100.0]
+    monkeypatch.setattr(governor_module.time, "monotonic", lambda: now[0])
+    governor.last_error = (
+        "context-governor compact-v2 failed [lineage_index_rebuild_required]"
+    )
+
+    retry_delay = 60.0
+    assert governor.get_active_compression_failure_cooldown() is not None
+    now[0] += retry_delay - 1
+    assert governor.get_active_compression_failure_cooldown() is not None
+    now[0] += 1
+    assert governor.get_active_compression_failure_cooldown() is None
+
+    # A real repeat failure starts a fresh bounded interval.
+    now[0] += 1
+    governor._remember_lineage_retry_brake(governor.last_error)
+    assert governor.get_active_compression_failure_cooldown() is not None
 
 
 @pytest.mark.parametrize("usage", [{}, {"prompt_tokens": 0}])

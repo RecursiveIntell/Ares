@@ -794,11 +794,14 @@ def test_generation_limit_invokes_one_bounded_continuation_with_projection_retry
     assert engine.validate_pending_compression(compacted) is True
 
 
-def test_below_threshold_does_not_schedule_governor_compaction():
+def test_governor_compaction_respects_output_adjusted_threshold():
     engine = ContextGovernorEngine(binary="/tmp/context-governor")
     engine.update_model("fixture", context_length=1_000)
+    threshold = engine.threshold_tokens
 
-    assert engine.should_compress(499) is False
+    assert threshold > 0
+    assert engine.should_compress(threshold - 1) is False
+    assert engine.should_compress(threshold) is True
 
 
 def test_generation_limit_rejects_invalid_continuation_transition():
@@ -3712,3 +3715,87 @@ def test_resume_alternation_repair_rehydrates_authenticated_parent(tmp_path):
     # A provider-repaired shape with any changed byte is not a receipt match.
     incoming[0]["content"] += " drift"
     assert engine._rehydrate_legacy_parent_prefix(incoming) == incoming
+
+
+def test_authenticated_tip_restores_non_durable_assistant_id_when_projection_matches(
+    tmp_path, monkeypatch
+):
+    """Lossy host projection equality must restore the canonical receipt prefix."""
+    engine = ContextGovernorEngine(binary="/tmp/context-governor", store_dir=tmp_path)
+    engine.session_id = "tip-id-restoration"
+    engine._capabilities = {"supports_lineage_tip_projection": True}
+    receipt_prefix = [
+        {
+            "role": "assistant",
+            "id": "summary_ctxp_authenticated",
+            "name": "context_governor",
+            "content": "authenticated summary",
+        },
+        {"role": "user", "content": "active request"},
+    ]
+    monkeypatch.setattr(
+        engine,
+        "_run_certified_json",
+        lambda _args, _payload: {
+            "schema": "LineageTipProjectionV1",
+            "verified": True,
+            "session_id": engine.session_id,
+            "receipt_id": "ctxr_authenticated",
+            "generation": 1,
+            "lineage_epoch": 0,
+            "compacted_messages": receipt_prefix,
+        },
+    )
+    incoming = [
+        engine._message_to_governor(engine._message_from_governor(message), index)
+        for index, message in enumerate(receipt_prefix)
+    ]
+
+    assert incoming[0].get("id") is None
+    assert engine._rehydrate_legacy_parent_prefix(incoming) == receipt_prefix
+
+
+def test_authenticated_tip_rehydrates_history_repaired_before_resolver_binding(
+    tmp_path, monkeypatch
+):
+    """Cold resume repair stays recognizable even before SessionDB is bound."""
+    engine = ContextGovernorEngine(binary="/tmp/context-governor", store_dir=tmp_path)
+    engine.session_id = "cold-resume-tip"
+    engine._capabilities = {"supports_lineage_tip_projection": True}
+    receipt_prefix = [
+        {"role": "assistant", "content": "preserved answer"},
+        {
+            "role": "assistant",
+            "id": "summary_ctxp_cold_resume",
+            "name": "context_governor",
+            "content": "authenticated summary",
+        },
+        {"role": "assistant", "content": "preserved decision"},
+        {"role": "user", "content": "active task"},
+    ]
+    monkeypatch.setattr(
+        engine,
+        "_run_certified_json",
+        lambda _args, _payload: {
+            "schema": "LineageTipProjectionV1",
+            "verified": True,
+            "session_id": engine.session_id,
+            "receipt_id": "ctxr_cold_resume",
+            "generation": 2,
+            "lineage_epoch": 0,
+            "compacted_messages": receipt_prefix,
+        },
+    )
+    # Mirrors get_resume_conversations running before _start_agent_build has
+    # registered the prefix resolver: old adjacent roles are already merged.
+    resumed = [engine._message_from_governor(message) for message in receipt_prefix]
+    assert repair_message_sequence(None, resumed) == 2
+    resumed.append({"role": "assistant", "content": "new result"})
+    incoming = [
+        engine._message_to_governor(message, index)
+        for index, message in enumerate(resumed)
+    ]
+
+    assert engine._rehydrate_legacy_parent_prefix(incoming) == receipt_prefix + [
+        {"role": "assistant", "content": "new result"}
+    ]

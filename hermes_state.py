@@ -4460,6 +4460,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         _ensure_test_isolation(self.db_path)
         self.read_only = read_only
 
+        # Optional resolver for the receipt-authenticated replay prefix length.
+        # The active context engine registers this at bind time (agent_init).
+        # Resume-time alternation repair uses it as ``prefix_lock`` so it never
+        # rewrites messages owned by an authenticated compaction receipt.
+        # None / failure / non-positive result means "no protected prefix".
+        self._authenticated_prefix_resolver: Optional[Callable[[str], int]] = None
+
         self._lock = threading.Lock()
         # Read-path split (WAL only): recall/browse queries borrow a
         # read-only connection from a bounded pool so they never queue
@@ -13562,14 +13569,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             # widening the import surface at module load.
             from agent.agent_runtime_helpers import repair_message_sequence
 
-            repaired = repair_message_sequence(None, messages)
+            # The SessionDB applies its final .strip() to each durable
+            # user/assistant row before resume-time alternation repair.
+            # Preserve that order for whitespace recovery only: stripping
+            # after two user rows merge leaves the first row's former
+            # trailing newline internal. Do not apply the broader
+            # sanitize_context transformation here (see above).
+            for message in messages:
+                if message.get("role") not in {"user", "assistant"}:
+                    continue
+                content = message.get("content")
+                if isinstance(content, str):
+                    message["content"] = content.strip()
+
+            # Protect the receipt-authenticated prefix. The active context
+            # engine registers a resolver at bind time; without one (or on any
+            # failure) fall back to an unlocked repair, exactly as before.
+            prefix_lock = 0
+            resolver = getattr(self, "_authenticated_prefix_resolver", None)
+            if callable(resolver):
+                try:
+                    prefix_lock = int(resolver(session_id) or 0)
+                except Exception:
+                    prefix_lock = 0
+            if prefix_lock < 0:
+                prefix_lock = 0
+
+            repaired = repair_message_sequence(
+                None, messages, prefix_lock=prefix_lock
+            )
             if repaired:
                 logger.info(
                     "Repaired %d message-alternation violation(s) while "
-                    "restoring session %s — durable transcript kept them, "
-                    "see repair_message_sequence",
+                    "restoring session %s (prefix_lock=%d) — durable "
+                    "transcript kept them, see repair_message_sequence",
                     repaired,
                     session_id,
+                    prefix_lock,
                 )
         return messages
 

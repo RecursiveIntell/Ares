@@ -11,10 +11,26 @@ from plugins.context_engine._context_governor import ContextGovernorEngine
 @pytest.fixture
 def governor(tmp_path):
     with patch("hermes_cli.config.load_config", return_value={}):
-        return ContextGovernorEngine(
-            binary=str(tmp_path / "fake-governor"),
-            store_dir=str(tmp_path / "governor-store"),
-        )
+        # These tests exercise host-side budget math and route-state contracts;
+        # none crosses the native key or receipt boundary. Keep the home/store
+        # isolated without depending on an operator-installed runtime binary.
+        import os
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir(mode=0o700)
+        old_hermes_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(hermes_home)
+        try:
+            engine = ContextGovernorEngine(
+                store_dir=str(tmp_path / "governor-store"),
+            )
+            assert engine._key_state.hermes_home == str(hermes_home)
+            return engine
+        finally:
+            if old_hermes_home is not None:
+                os.environ["HERMES_HOME"] = old_hermes_home
+            else:
+                os.environ.pop("HERMES_HOME", None)
 
 
 @pytest.mark.parametrize(

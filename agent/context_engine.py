@@ -398,6 +398,24 @@ class ContextEngine(ABC):
         """
         return True
 
+    # -- Optional: authenticated prefix protection -------------------------
+
+    def authenticated_prefix_length(self, session_id: str) -> int:
+        """Return how many leading replay messages are receipt-authenticated.
+
+        Host mutators (resume-time alternation repair, model-switch marker
+        dedup) must not rewrite messages that belong to an authenticated
+        compaction receipt prefix: doing so makes the live transcript diverge
+        from its parent receipt and the next recursive compaction fails closed
+        with ``lineage_integrity_mismatch``.
+
+        Engines without receipt-backed lineage return 0 (no protected prefix).
+        Receipt-backed engines override this to read their authenticated tip.
+        The count is in the host's replay-message projection, not the engine's
+        internal wire format.
+        """
+        return 0
+
     # -- Optional: session lifecycle ---------------------------------------
 
     def on_session_start(self, session_id: str, **kwargs) -> None:

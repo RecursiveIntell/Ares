@@ -559,7 +559,7 @@ def note_turn_persisted(agent):
     agent._inflight_turn_session_id = None
 
 
-def repair_message_sequence(agent, messages: List[Dict], *, preserve_user_messages: bool = False) -> int:
+def repair_message_sequence(agent, messages: List[Dict], *, preserve_user_messages: bool = False, prefix_lock: int = 0) -> int:
     """Collapse malformed role-alternation left in the live history.
 
     Providers (OpenAI, OpenRouter, Anthropic) expect strict alternation:
@@ -599,6 +599,13 @@ def repair_message_sequence(agent, messages: List[Dict], *, preserve_user_messag
     pattern). The empty-response scaffolding stripper handles the
     genuinely-broken variant via its flag-gated rewind.
 
+    The ``prefix_lock`` parameter protects the first N messages from any
+    modification. This is used to preserve the authenticated tip prefix
+    from Context Governor receipts, which must remain byte-identical to
+    the authenticated parent transcript. When ``prefix_lock > 0``, the
+    first ``prefix_lock`` messages are treated as read-only and no
+    repairs are applied across the boundary at index ``prefix_lock - 1``.
+
     Returns the number of repairs made (for logging/telemetry).
     """
     if not messages:
@@ -633,10 +640,20 @@ def repair_message_sequence(agent, messages: List[Dict], *, preserve_user_messag
             "verify_hook_continue",
         }
 
-    collapsed: List[Dict] = []
-    for msg in messages:
+    # Prefix-lock: the first prefix_lock messages are read-only. Deep-copy
+    # them so no later pass can mutate a locked dict through a shared
+    # reference (Pass 0/2 mutate ``collapsed[-1]``/``merged[-1]`` in place).
+    # The lock also forbids merging ACROSS the boundary: a working message
+    # may never collapse into the last locked message.
+    prefix_lock = max(0, min(int(prefix_lock or 0), len(messages)))
+    locked_prefix = copy.deepcopy(messages[:prefix_lock]) if prefix_lock else []
+    working_messages = messages[prefix_lock:]
+
+    collapsed: List[Dict] = list(locked_prefix)
+    for msg in working_messages:
         if (
             collapsed
+            and len(collapsed) > prefix_lock
             and isinstance(msg, dict)
             and msg.get("role") == "assistant"
             and isinstance(collapsed[-1], dict)
@@ -770,6 +787,7 @@ def repair_message_sequence(agent, messages: List[Dict], *, preserve_user_messag
     for msg in filtered:
         if (
             merged
+            and len(merged) > prefix_lock
             and isinstance(msg, dict)
             and msg.get("role") == "user"
             and isinstance(merged[-1], dict)

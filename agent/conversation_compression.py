@@ -1208,6 +1208,11 @@ def _emit_compression_attempt_telemetry(
         payload["total_duration_ms"] = int((time.monotonic() - started_at) * 1000)
         payload["commit_status"] = commit_status
         payload["split_status"] = split_status
+        # Prefer typed governor failure over generic summary_generation_aborted
+        if failure_class == "summary_generation_aborted":
+            outcome = getattr(agent.context_compressor, "last_outcome", None)
+            if isinstance(outcome, dict) and outcome.get("source_error_code"):
+                failure_class = outcome["source_error_code"]
         if failure_class:
             payload["failure_class"] = failure_class
         payload.setdefault("chunking", False)
