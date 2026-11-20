@@ -36,6 +36,7 @@ from agent.message_sanitization import (
     tool_result_id_variants,
 )
 from agent.redact import redact_sensitive_text
+from ares_runtime.context_budget import resolve_output_reserve
 from hermes_constants import get_hermes_home
 from plugins.context_engine._context_governor.key_state import (
     ContextGovernorKeyError,
@@ -663,8 +664,15 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         protect_last_n: int | None = None,
     ) -> None:
         resolved_context_length = int(context_length or 0)
-        output_reserve = int(max_tokens) if max_tokens and int(max_tokens) > 0 else None
-        effective_window = resolved_context_length - (output_reserve or 0)
+        # An explicit host reservation always stands and an exhausted budget
+        # must be refused (no silent shrinking); only an absent/invalid
+        # reservation derives the shared proportional reserve.
+        explicit_reserve = int(max_tokens) if max_tokens and int(max_tokens) > 0 else None
+        if explicit_reserve is not None:
+            output_reserve = explicit_reserve
+        else:
+            output_reserve = resolve_output_reserve(None, resolved_context_length)
+        effective_window = resolved_context_length - output_reserve
         if resolved_context_length > 0 and effective_window <= 0:
             raise ValueError(
                 "context-governor response reservation leaves no input budget "
@@ -689,7 +697,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         if protect_last_n is not None:
             self.protect_last_n = int(protect_last_n)
         self.context_length = resolved_context_length
-        self.max_tokens = output_reserve
+        self.max_tokens = explicit_reserve
         # Account for output reservation in effective input budget
         self.threshold_tokens = (
             int(effective_window * self.threshold_percent) if effective_window > 0 else 0
@@ -701,6 +709,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             self._pending_request_rough_tokens = 0
             self.last_compression_rough_tokens = 0
             self.awaiting_real_usage_after_compression = False
+            # Stale route-bound measurements can suppress compression on the new
+            # route. Invalidate only route-scoped state; same-route evidence is
+            # preserved by the equality check above.
+            self.last_prompt_tokens = 0
+            self.last_real_prompt_tokens = 0
+            self._ineffective_compression_count = 0
 
     def note_request_rough_estimate(self, rough_tokens: int) -> None:
         """Record host request pressure for its next matching usage update.
@@ -774,7 +788,8 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         """Return the request-token band where anti-thrashing must yield."""
         if not self.context_length:
             return 0
-        effective_window = self.context_length - (self.max_tokens or 0)
+        output_reserve = resolve_output_reserve(self.max_tokens, self.context_length)
+        effective_window = self.context_length - output_reserve
         if effective_window <= 0:
             effective_window = self.context_length
         return max(1, int(effective_window * self.emergency_pressure_ratio))
@@ -1167,6 +1182,54 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     def _governor_session_id(self) -> str:
         return self._lineage_session_id or self.session_id or "hermes-session"
 
+    def authenticated_prefix_length(self, session_id: str) -> int:
+        """Return the authenticated tip length for host replay protection.
+
+        Reads the certified lineage tip for the session's logical lineage and
+        returns the number of leading host replay messages that belong to the
+        authenticated receipt prefix. Host mutators (resume alternation repair,
+        model-switch marker dedup) use this as ``prefix_lock`` so they never
+        rewrite receipt-authenticated content.
+
+        Fail-open to 0: an unavailable/unverified tip must not invent a lock.
+        The compact path still fails closed on any real divergence; this only
+        prevents the host from *causing* a divergence in the first place.
+        """
+        try:
+            root, resolved = self._context_lineage_root_with_evidence(
+                self._session_db, session_id
+            )
+            governor_sid = root if resolved else (session_id or self._governor_session_id())
+            if not governor_sid:
+                return 0
+            tip = self._run_certified_json(
+                ["lineage-tip-v2", "--dir", str(self.store_dir), "--session", governor_sid],
+                {},
+            )
+            if (
+                not isinstance(tip, dict)
+                or tip.get("schema") != "LineageTipProjectionV1"
+                or tip.get("verified") is not True
+                or tip.get("session_id") != governor_sid
+            ):
+                return 0
+            compacted = tip.get("compacted_messages")
+            if not isinstance(compacted, list) or not compacted:
+                return 0
+            if not all(isinstance(m, dict) for m in compacted):
+                return 0
+            # Project the authenticated tip into the host replay shape. The
+            # count is the protected prefix length in host message space.
+            host_messages = [self._message_from_governor(m) for m in compacted]
+            return len(host_messages)
+        except Exception:
+            logger.debug(
+                "context-governor: authenticated prefix length unavailable for %s",
+                session_id,
+                exc_info=True,
+            )
+            return 0
+
     def automatic_rebase_block_reason(self) -> str | None:
         """Veto rebase only for the active logical lineage's unresolved refusal.
 
@@ -1194,7 +1257,31 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         adapter exposes no durable cooldown (the next turn's compact
         call will surface any failure via last_error / last_warning on
         get_status). Returns None to mean "no active cooldown, proceed".
+
+        Per-session retry brake: if the last governor error was a persistent
+        index/lineage failure that is known not to self-repair, report a
+        readiness signal so the host can suppress an identical retry and
+        surface the actionable failure immediately.
         """
+        error = getattr(self, "last_error", "")
+        if not error:
+            return None
+        # Governed index rebuild is a store-level repair, not a transient
+        # condition that resolves on retry. Suppress immediate re-attempt.
+        if "lineage_index_rebuild_required" in error:
+            return {
+                "reason": "index_rebuild_required",
+                "message": "Governed lineage index requires rebuild; identical retry will not succeed.",
+                "action": "rebuild-lineage-index on the canonical store",
+            }
+        # Lineage integrity mismatch on same session persists until the
+        # authenticated prefix divergence is repaired at the source.
+        if "lineage_integrity_mismatch" in error:
+            return {
+                "reason": "lineage_integrity_mismatch",
+                "message": "Authenticated prefix divergence; identical retry will not succeed.",
+                "action": "replay on isolated copy to identify mutator, then repair",
+            }
         return None
 
     # ------------------------------------------------------------------
@@ -2578,6 +2665,8 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     projection.pop("metadata", None)
             return projection
 
+        from agent.agent_runtime_helpers import repair_message_sequence
+
         def repaired_projection(
             compacted: List[Dict[str, Any]],
         ) -> List[Dict[str, Any]]:
@@ -2598,9 +2687,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     if isinstance(content, str):
                         message["content"] = content.strip()
             try:
-                from agent.agent_runtime_helpers import repair_message_sequence
-
-                repair_message_sequence(None, host_messages)
+                # The authenticated tip is the prefix lock: host replay must
+                # not merge across it, and the rehydration comparison must
+                # repair the receipt side under the same lock as the host.
+                repair_message_sequence(
+                    None, host_messages, prefix_lock=len(compacted)
+                )
             except Exception:
                 return []
             return [
@@ -2628,7 +2720,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 if authenticated_tip_bound:
                     # Equality with the lossy durable projection is precisely
                     # the case that needs canonical field restoration.
-                    if compacted == current_prefix:
+                    if projection == current_prefix:
                         continue
                 elif durable_projection == current_prefix:
                     # Historical fixture/legacy behavior has no authenticated

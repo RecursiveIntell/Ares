@@ -6771,6 +6771,7 @@ def _is_pivot_marker(entry: Any) -> bool:
 
 def _append_model_switch_marker(
     session: dict | None, *, model: str, provider: str, history_lock_held: bool = False,
+    prefix_lock: int = 0,
 ) -> None:
     """Record a real system-history pivot after a live model switch.
 
@@ -6780,6 +6781,12 @@ def _append_model_switch_marker(
     every subsequent API call (#65891). The in-memory history is the payload
     re-sent each turn; the dedup is self-healing across resumes because the
     next switch collapses whatever markers a reload brought back.
+
+    The ``prefix_lock`` parameter protects the first N messages from marker
+    stripping. This is used to preserve the authenticated tip prefix from
+    Context Governor receipts, which may contain a model-switch marker as
+    part of the authenticated transcript. When ``prefix_lock > 0``, markers
+    at index < ``prefix_lock`` are preserved.
     """
     if not session:
         return
@@ -6802,7 +6809,15 @@ def _append_model_switch_marker(
     def _replace_markers() -> None:
         history = session.setdefault("history", [])
         # Drop any earlier markers in place before appending the new one.
-        history[:] = [h for h in history if not _is_model_switch_marker(h)]
+        # Respect prefix_lock: do not strip markers at index < prefix_lock.
+        if prefix_lock > 0:
+            locked_prefix = history[:prefix_lock]
+            working_history = history[prefix_lock:]
+            working_history[:] = [h for h in working_history if not _is_model_switch_marker(h)]
+            history[:] = locked_prefix + working_history
+        else:
+            # Drop any earlier markers in place before appending the new one.
+            history[:] = [h for h in history if not _is_model_switch_marker(h)]
         history.append(entry)
         session["history_version"] = int(session.get("history_version", 0)) + 1
 
@@ -7705,9 +7720,24 @@ def _apply_model_switch(
             _set_agent_fast_runtime(agent, fast_tier, fast_overrides, requested_tier=requested_tier)
             _persist_live_session_runtime(session)
             _persist_live_session_system_prompt(session)
+            # Protect the receipt-authenticated prefix: a model-switch marker
+            # that lives inside the authenticated tip must not be stripped by
+            # the dedup, or the live transcript diverges from its parent
+            # receipt and the next recursive compaction fails closed.
+            _switch_prefix_lock = 0
+            _switch_engine = getattr(agent, "context_compressor", None)
+            _switch_auth = getattr(_switch_engine, "authenticated_prefix_length", None)
+            if callable(_switch_auth):
+                try:
+                    _switch_prefix_lock = int(
+                        _switch_auth(str(session.get("session_key") or "")) or 0
+                    )
+                except Exception:
+                    _switch_prefix_lock = 0
             _append_model_switch_marker(
                 session, model=result.new_model, provider=result.target_provider,
                 history_lock_held=model_commit_lock is not None,
+                prefix_lock=max(0, _switch_prefix_lock),
             )
             # The turn consumer uses this lock: snapshot and ownership must become
             # visible (or retire) together, never as a partially published lease.

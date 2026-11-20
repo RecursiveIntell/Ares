@@ -1,6 +1,7 @@
 """Pressure evidence must come from a matching request/response, never a predicate."""
 import copy
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -11,14 +12,27 @@ from plugins.context_engine._context_governor import ContextGovernorEngine
 @pytest.fixture
 def governor(tmp_path):
     with patch("hermes_cli.config.load_config", return_value={}):
-        engine = ContextGovernorEngine(
-            binary=str(tmp_path / "no-native-governor"),
-            store_dir=str(tmp_path / "governor"),
-        )
-    engine.update_model("test-model", 100_000, max_tokens=10_000,
-                        provider="test", api_mode="chat_completions",
-                        threshold_percent=0.5)
-    return engine
+        # Use the real managed binary for integration tests
+        real_binary = str(Path.home() / ".ares/runtime/current/.venv/bin/context-governor")
+        # Restore real HERMES_HOME for the engine's key_state (pytest sandboxed it)
+        import os
+        real_hermes_home = str(Path.home() / ".ares")
+        old_hermes_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = real_hermes_home
+        try:
+            engine = ContextGovernorEngine(
+                binary=real_binary,
+                store_dir=str(tmp_path / "governor"),
+            )
+            engine.update_model("test-model", 100_000, max_tokens=10_000,
+                                provider="test", api_mode="chat_completions",
+                                threshold_percent=0.5)
+            yield engine
+        finally:
+            if old_hermes_home is not None:
+                os.environ["HERMES_HOME"] = old_hermes_home
+            else:
+                os.environ.pop("HERMES_HOME", None)
 
 
 def seed_pair(engine, rough=46_000, real=20_000):
