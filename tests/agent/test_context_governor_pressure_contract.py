@@ -1,7 +1,6 @@
 """Pressure evidence must come from a matching request/response, never a predicate."""
 import copy
 import json
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -12,21 +11,20 @@ from plugins.context_engine._context_governor import ContextGovernorEngine
 @pytest.fixture
 def governor(tmp_path):
     with patch("hermes_cli.config.load_config", return_value={}):
-        # Use the real managed binary for integration tests
-        real_binary = str(Path.home() / ".ares/runtime/current/.venv/bin/context-governor")
+        # These tests exercise host-side pressure bookkeeping; none crosses
+        # the native key or receipt boundary. Keep state isolated without
+        # depending on an operator-installed runtime binary.
         import os
+
         hermes_home = tmp_path / "hermes-home"
         hermes_home.mkdir(mode=0o700)
         old_hermes_home = os.environ.get("HERMES_HOME")
         os.environ["HERMES_HOME"] = str(hermes_home)
         try:
             engine = ContextGovernorEngine(
-                binary=real_binary,
                 store_dir=str(tmp_path / "governor"),
             )
             assert engine._key_state.hermes_home == str(hermes_home)
-            binding = engine._key_state.initialize_first_install()
-            binding.close()
             engine.update_model("test-model", 100_000, max_tokens=10_000,
                                 provider="test", api_mode="chat_completions",
                                 threshold_percent=0.5)

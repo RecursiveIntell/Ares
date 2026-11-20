@@ -1,6 +1,5 @@
 """Route admission limits and signature-compatible model budget handoffs."""
 
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -12,9 +11,9 @@ from plugins.context_engine._context_governor import ContextGovernorEngine
 @pytest.fixture
 def governor(tmp_path):
     with patch("hermes_cli.config.load_config", return_value={}):
-        # Use the real managed binary for integration tests
-        real_binary = str(Path.home() / ".ares/runtime/current/.venv/bin/context-governor")
-        # Keep key-state and telemetry bound to the pytest sandbox.
+        # These tests exercise host-side budget math and route-state contracts;
+        # none crosses the native key or receipt boundary. Keep the home/store
+        # isolated without depending on an operator-installed runtime binary.
         import os
 
         hermes_home = tmp_path / "hermes-home"
@@ -23,12 +22,9 @@ def governor(tmp_path):
         os.environ["HERMES_HOME"] = str(hermes_home)
         try:
             engine = ContextGovernorEngine(
-                binary=real_binary,
                 store_dir=str(tmp_path / "governor-store"),
             )
             assert engine._key_state.hermes_home == str(hermes_home)
-            binding = engine._key_state.initialize_first_install()
-            binding.close()
             return engine
         finally:
             if old_hermes_home is not None:
