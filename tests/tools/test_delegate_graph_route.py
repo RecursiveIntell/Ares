@@ -21,6 +21,33 @@ def test_graph_handler_prefers_mcp_structured_content_when_text_is_also_present(
     assert _graph_handler_value(raw) == structured
 
 
+def test_canonical_receipt_rejects_run_or_graph_identity_mismatch():
+    from copy import deepcopy
+    from tools.delegate_tool import _verified_terminal_receipt
+
+    run_id = "run-fixture"
+    version = "sha256:" + "a" * 64
+    receipt = {"schema": "agent-graph-mcp-receipt-v2", "run_id": run_id,
+               "graph_version": version, "persistence_status": "durable_terminal",
+               "error_code": None}
+    response = {"ok": True, "data": {"run_id": run_id, "receipt": receipt,
+        "receipt_digest": "hmac-sha256:" + "b" * 64,
+        "storage_class": "sqlite_terminal_receipt",
+        "bundle": {"payload": {"run_id": run_id, "graph_version": version,
+                   "receipt": receipt, "output": {"answer": "ok"}}}}}
+    assert _verified_terminal_receipt(response, run_id, version)[0] is not None
+
+    wrong_run = deepcopy(response)
+    wrong_run["data"]["receipt"]["run_id"] = "another-run"
+    assert _verified_terminal_receipt(wrong_run, run_id, version) == (
+        None, "canonical_receipt_identity_or_integrity_invalid")
+
+    wrong_version = deepcopy(response)
+    wrong_version["data"]["bundle"]["payload"]["graph_version"] = "sha256:" + "c" * 64
+    assert _verified_terminal_receipt(wrong_version, run_id, version) == (
+        None, "canonical_receipt_bundle_mismatch")
+
+
 def parent(depth=0, optout=False):
     return SimpleNamespace(session_id="route-owner", _delegate_depth=depth,
                            _orchestration_opt_out=optout,
@@ -67,7 +94,7 @@ def test_optout_nested_and_sync_graph_requests_are_blocked():
     assert [x["reason"] for x in cases] == ["caller_opt_out", "nested_worker_not_graph_eligible", "graph_route_requires_background"]
 
 
-def _install_mock_dispatch(monkeypatch, *, start_result=None, wait_results=None):
+def _install_mock_dispatch(monkeypatch, *, start_result=None, wait_results=None, receipt_result=None):
     from tools import delegate_tool as dt
     calls = []
     runner_result = {}
@@ -75,6 +102,19 @@ def _install_mock_dispatch(monkeypatch, *, start_result=None, wait_results=None)
         calls.append((tool, args))
         if tool == "graph_run_start":
             return start_result or {"ok":True,"data":{"run_id":"run-fixture","status":"running"}}
+        if tool == "graph_run_receipt":
+            if receipt_result is not None:
+                return receipt_result
+            receipt = {"schema": "agent-graph-mcp-receipt-v2", "run_id": "run-fixture",
+                       "graph_version": "sha256:" + "a" * 64,
+                       "persistence_status": "durable_terminal", "error_code": None}
+            return {"ok": True, "data": {"run_id": "run-fixture", "receipt": receipt,
+                    "receipt_digest": "hmac-sha256:" + "b" * 64,
+                    "storage_class": "sqlite_terminal_receipt",
+                    "bundle": {"payload": {"run_id": "run-fixture",
+                               "graph_version": "sha256:" + "a" * 64,
+                               "receipt": receipt,
+                               "output": {"research_result": {"answer": "verified"}}}}}}
         if tool == "graph_run_wait":
             if wait_results:
                 return wait_results.pop(0)
@@ -161,9 +201,29 @@ def test_allowlisted_graph_runs_once_and_never_calls_legacy(durable_home, monkey
         graph_operation_id="research-operation-0001", goal="Research F1", context=None))
     assert out["status"] == "dispatched"
     assert out["legacy_fallback"] is False
-    assert [name for name,_ in calls] == ["graph_run_start","graph_run_wait"]
+    assert [name for name,_ in calls] == ["graph_run_start","graph_run_wait","graph_run_receipt"]
     assert runner_result["status"] == "completed"
+    assert runner_result["receipt_status"] == "verified"
+    assert runner_result["summary"] == json.dumps({"research_result": {"answer": "verified"}})
     assert runner_result["graph_run_id"] == "run-fixture"
+
+
+def test_graph_completion_without_canonical_receipt_is_unknown_not_success(durable_home, monkeypatch):
+    monkeypatch.setattr("tools.delegate_tool._load_config",
+        lambda: {"graph_route_enabled": True, "graph_route_allowlist": ["research-v1"]})
+    calls, runner_result = _install_mock_dispatch(
+        monkeypatch, receipt_result={"ok": False, "error_code": "RUN_NOT_FOUND"})
+    _dispatch_graph_background(
+        parent_agent=parent(),
+        admission=SimpleNamespace(resolved_optional_route=SimpleNamespace(model="gpt-6-luna")),
+        graph_id="research-v1", graph_version="sha256:" + "a" * 64,
+        graph_input={"source": "frozen"},
+        graph_budgets={"max_llm_calls": 2, "max_wall_clock_ms": 30000},
+        graph_operation_id="research-operation-receipt-missing", goal="Research F1", context=None)
+    assert runner_result["status"] == "unknown"
+    assert runner_result["receipt_status"] == "unverified"
+    assert runner_result["error"] == "canonical_receipt_unavailable"
+    assert [name for name, _ in calls] == ["graph_run_start", "graph_run_wait", "graph_run_receipt"]
 
 
 def test_graph_start_denial_is_typed_and_never_legacy(durable_home, monkeypatch):
@@ -298,6 +358,16 @@ def _counting_mcp(monkeypatch, *, wait_results=None, hold_until_cancel=False):
         calls.append((tool, args))
         if tool == "graph_run_start":
             return {"ok": True, "data": {"run_id": "run-live-1", "status": "running"}}
+        if tool == "graph_run_receipt":
+            receipt = {"schema": "agent-graph-mcp-receipt-v2", "run_id": "run-live-1",
+                       "graph_version": "sha256:" + "a" * 64,
+                       "persistence_status": "durable_terminal", "error_code": None}
+            return {"ok": True, "data": {"run_id": "run-live-1", "receipt": receipt,
+                    "receipt_digest": "hmac-sha256:" + "b" * 64,
+                    "storage_class": "sqlite_terminal_receipt",
+                    "bundle": {"payload": {"run_id": "run-live-1",
+                               "graph_version": "sha256:" + "a" * 64,
+                               "receipt": receipt, "output": {"answer": "REC [S1]"}}}}}
         if tool == "graph_run_cancel":
             cancelled.set()
             return {"ok": True}
