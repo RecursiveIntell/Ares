@@ -5604,6 +5604,40 @@ def _graph_mcp_call(parent_agent: Any, tool_name: str, arguments: Dict[str, Any]
     return _graph_handler_value(raw)
 
 
+def _verified_terminal_receipt(response: Dict[str, Any], run_id: str, graph_version: str):
+    """Accept only the Graph owner's durable, identity-matched receipt."""
+    import re
+
+    if not isinstance(response, dict):
+        return None, "canonical_receipt_unavailable"
+    data = response.get("data")
+    if not (response.get("ok") is True and isinstance(data, dict)):
+        return None, "canonical_receipt_unavailable"
+    receipt = data.get("receipt")
+    bundle = data.get("bundle")
+    payload = bundle.get("payload") if isinstance(bundle, dict) else None
+    if not isinstance(receipt, dict) or not isinstance(payload, dict):
+        return None, "canonical_receipt_missing"
+    if (receipt.get("schema") != "agent-graph-mcp-receipt-v2"
+            or receipt.get("run_id") != run_id
+            or receipt.get("graph_version") != graph_version
+            or receipt.get("persistence_status") != "durable_terminal"
+            or receipt.get("error_code") is not None
+            or data.get("run_id") != run_id
+            or data.get("storage_class") != "sqlite_terminal_receipt"
+            or not isinstance(data.get("receipt_digest"), str)
+            or not re.fullmatch(r"hmac-sha256:[0-9a-f]{64}", data["receipt_digest"])):
+        return None, "canonical_receipt_identity_or_integrity_invalid"
+    if (payload.get("run_id") != run_id
+            or payload.get("graph_version") != graph_version
+            or payload.get("receipt") != receipt
+            or not isinstance(payload.get("output"), dict)):
+        return None, "canonical_receipt_bundle_mismatch"
+    return {"receipt": receipt, "output": payload["output"],
+            "receipt_digest": data["receipt_digest"],
+            "storage_class": data["storage_class"]}, None
+
+
 def _dispatch_graph_background(
     *, parent_agent: Any, graph_id: str, graph_version: str,
     graph_input: Dict[str, Any], graph_budgets: Dict[str, Any],
@@ -5745,13 +5779,38 @@ def _dispatch_graph_background(
             status = rdata.get("status")
             if status in {"completed", "failed", "cancelled", "interrupted_non_resumable"}:
                 success = rdata.get("success") is True and status == "completed"
-                final_state = rdata.get("final_state")
-                return {"status":"completed" if success else ("cancelled" if status=="cancelled" else "error"),
-                        "summary":json.dumps(final_state,ensure_ascii=False) if final_state is not None else json.dumps(rdata,ensure_ascii=False),
-                        "error":None if success else rdata.get("error") or status,
-                        "graph_run_id":run_id, "graph_id":graph_id,
-                        "graph_version":graph_version,
-                        "api_calls":rdata.get("budget_counters",{}).get("llm_calls",0)}
+                if success:
+                    try:
+                        receipt_response = _graph_mcp_call(
+                            parent_agent, "graph_run_receipt", {"run_id": run_id})
+                    except Exception:
+                        logger.exception("Canonical graph receipt lookup failed for %s", run_id)
+                        receipt_response = None
+                    verified, receipt_error = _verified_terminal_receipt(
+                        receipt_response, run_id, graph_version)
+                    if verified is None:
+                        return {"status": "unknown",
+                                "summary": "Graph reported completion, but its canonical durable receipt could not be verified",
+                                "error": receipt_error,
+                                "receipt_status": "unverified",
+                                "graph_run_id": run_id, "graph_id": graph_id,
+                                "graph_version": graph_version,
+                                "api_calls": rdata.get("budget_counters", {}).get("llm_calls", 0)}
+                    return {"status": "completed",
+                            "summary": json.dumps(verified["output"], ensure_ascii=False),
+                            "error": None, "receipt_status": "verified",
+                            "receipt_digest": verified["receipt_digest"],
+                            "receipt_storage_class": verified["storage_class"],
+                            "graph_run_id": run_id, "graph_id": graph_id,
+                            "graph_version": graph_version,
+                            "api_calls": rdata.get("budget_counters", {}).get("llm_calls", 0)}
+                return {"status": "cancelled" if status == "cancelled" else "error",
+                        "summary": json.dumps(rdata, ensure_ascii=False),
+                        "error": rdata.get("error") or status,
+                        "receipt_status": "not_required_for_non_success",
+                        "graph_run_id": run_id, "graph_id": graph_id,
+                        "graph_version": graph_version,
+                        "api_calls": rdata.get("budget_counters", {}).get("llm_calls", 0)}
         _graph_mcp_call(parent_agent,"graph_run_cancel",{"run_id":run_id})
         return {"status":"unknown", "summary":"graph run exceeded caller deadline",
                 "error":"graph_deadline_expired", "graph_run_id":run_id,
