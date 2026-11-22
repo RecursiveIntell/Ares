@@ -5604,6 +5604,35 @@ def _graph_mcp_call(parent_agent: Any, tool_name: str, arguments: Dict[str, Any]
     return _graph_handler_value(raw)
 
 
+def _receipts_equivalent(durable: Dict[str, Any], bundled: Dict[str, Any]) -> bool:
+    """Compare a durable receipt with its bundle copy.
+
+    The Graph daemon redacts usage numbers in the bundle copy (it stamps
+    ``[REDACTED]``) while the durable receipt keeps them. Only those exact
+    leaves may differ; every other field must match, or the bundle is not
+    the same receipt and must be rejected.
+    """
+    if not isinstance(durable, dict) or not isinstance(bundled, dict):
+        return False
+    if durable.keys() != bundled.keys():
+        return False
+
+    def compare(a: Any, b: Any, path: str) -> bool:
+        # The owner's documented redaction: llm_invocations[*].usage.* leaves.
+        if (isinstance(b, str) and b == "[REDACTED]"
+                and ".llm_invocations[" in path and ".usage." in path):
+            return True
+        if isinstance(a, dict) and isinstance(b, dict):
+            return a.keys() == b.keys() and all(
+                compare(a[k], b[k], f"{path}.{k}") for k in a)
+        if isinstance(a, list) and isinstance(b, list):
+            return len(a) == len(b) and all(
+                compare(x, y, f"{path}[{i}]") for i, (x, y) in enumerate(zip(a, b)))
+        return a == b
+
+    return compare(durable, bundled, "receipt")
+
+
 def _verified_terminal_receipt(response: Dict[str, Any], run_id: str, graph_version: str):
     """Accept only the Graph owner's durable, identity-matched receipt."""
     import re
@@ -5618,20 +5647,26 @@ def _verified_terminal_receipt(response: Dict[str, Any], run_id: str, graph_vers
     payload = bundle.get("payload") if isinstance(bundle, dict) else None
     if not isinstance(receipt, dict) or not isinstance(payload, dict):
         return None, "canonical_receipt_missing"
+    # The daemon places run_id at the response top level; some wrappers also
+    # carry it under data. Accept either, reject a conflicting inner value.
+    outer_run_id = response.get("run_id")
+    inner_run_id = data.get("run_id")
+    if (outer_run_id != run_id
+            or (inner_run_id is not None and inner_run_id != run_id)):
+        return None, "canonical_receipt_identity_or_integrity_invalid"
     if (receipt.get("schema") != "agent-graph-mcp-receipt-v2"
             or receipt.get("run_id") != run_id
             or receipt.get("graph_version") != graph_version
             or receipt.get("persistence_status") != "durable_terminal"
             or receipt.get("error_code") is not None
-            or data.get("run_id") != run_id
             or data.get("storage_class") != "sqlite_terminal_receipt"
             or not isinstance(data.get("receipt_digest"), str)
             or not re.fullmatch(r"hmac-sha256:[0-9a-f]{64}", data["receipt_digest"])):
         return None, "canonical_receipt_identity_or_integrity_invalid"
     if (payload.get("run_id") != run_id
             or payload.get("graph_version") != graph_version
-            or payload.get("receipt") != receipt
-            or not isinstance(payload.get("output"), dict)):
+            or not isinstance(payload.get("output"), dict)
+            or not _receipts_equivalent(receipt, payload.get("receipt"))):
         return None, "canonical_receipt_bundle_mismatch"
     return {"receipt": receipt, "output": payload["output"],
             "receipt_digest": data["receipt_digest"],
