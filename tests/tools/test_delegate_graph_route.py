@@ -30,7 +30,7 @@ def test_canonical_receipt_rejects_run_or_graph_identity_mismatch():
     receipt = {"schema": "agent-graph-mcp-receipt-v2", "run_id": run_id,
                "graph_version": version, "persistence_status": "durable_terminal",
                "error_code": None}
-    response = {"ok": True, "data": {"run_id": run_id, "receipt": receipt,
+    response = {"ok": True, "run_id": run_id, "data": {"receipt": receipt,
         "receipt_digest": "hmac-sha256:" + "b" * 64,
         "storage_class": "sqlite_terminal_receipt",
         "bundle": {"payload": {"run_id": run_id, "graph_version": version,
@@ -46,6 +46,43 @@ def test_canonical_receipt_rejects_run_or_graph_identity_mismatch():
     wrong_version["data"]["bundle"]["payload"]["graph_version"] = "sha256:" + "c" * 64
     assert _verified_terminal_receipt(wrong_version, run_id, version) == (
         None, "canonical_receipt_bundle_mismatch")
+
+
+def test_canonical_receipt_real_daemon_shape_and_usage_redaction():
+    """The daemon returns run_id at top level and redacts usage in the bundle.
+
+    A genuine completion must still verify; a non-usage field difference must
+    still be rejected.
+    """
+    from copy import deepcopy
+    from tools.delegate_tool import _verified_terminal_receipt
+
+    run_id = "run-real-shape"
+    version = "sha256:" + "d" * 64
+    durable = {"schema": "agent-graph-mcp-receipt-v2", "run_id": run_id,
+               "graph_version": version, "persistence_status": "durable_terminal",
+               "error_code": None,
+               "llm_invocations": [{"node_id": "s1", "usage": {"prompt_tokens": 42}}]}
+    bundled = deepcopy(durable)
+    bundled["llm_invocations"][0]["usage"]["prompt_tokens"] = "[REDACTED]"
+    response = {"ok": True, "run_id": run_id,
+                "data": {"receipt": durable, "receipt_digest": "hmac-sha256:" + "e" * 64,
+                         "storage_class": "sqlite_terminal_receipt",
+                         "bundle": {"payload": {"run_id": run_id, "graph_version": version,
+                                                "receipt": bundled, "output": {"answer": "ok"}}}}}
+    assert _verified_terminal_receipt(response, run_id, version)[0] is not None
+
+    # A difference outside the documented usage redaction is a real mismatch.
+    tampered = deepcopy(response)
+    tampered["data"]["bundle"]["payload"]["receipt"]["error_code"] = "FORGED"
+    assert _verified_terminal_receipt(tampered, run_id, version) == (
+        None, "canonical_receipt_bundle_mismatch")
+
+    # Conflicting inner run_id is rejected rather than silently ignored.
+    conflict = deepcopy(response)
+    conflict["data"]["run_id"] = "another-run"
+    assert _verified_terminal_receipt(conflict, run_id, version) == (
+        None, "canonical_receipt_identity_or_integrity_invalid")
 
 
 def parent(depth=0, optout=False):
@@ -108,7 +145,7 @@ def _install_mock_dispatch(monkeypatch, *, start_result=None, wait_results=None,
             receipt = {"schema": "agent-graph-mcp-receipt-v2", "run_id": "run-fixture",
                        "graph_version": "sha256:" + "a" * 64,
                        "persistence_status": "durable_terminal", "error_code": None}
-            return {"ok": True, "data": {"run_id": "run-fixture", "receipt": receipt,
+            return {"ok": True, "run_id": "run-fixture", "data": {"receipt": receipt,
                     "receipt_digest": "hmac-sha256:" + "b" * 64,
                     "storage_class": "sqlite_terminal_receipt",
                     "bundle": {"payload": {"run_id": "run-fixture",
@@ -362,7 +399,7 @@ def _counting_mcp(monkeypatch, *, wait_results=None, hold_until_cancel=False):
             receipt = {"schema": "agent-graph-mcp-receipt-v2", "run_id": "run-live-1",
                        "graph_version": "sha256:" + "a" * 64,
                        "persistence_status": "durable_terminal", "error_code": None}
-            return {"ok": True, "data": {"run_id": "run-live-1", "receipt": receipt,
+            return {"ok": True, "run_id": "run-live-1", "data": {"receipt": receipt,
                     "receipt_digest": "hmac-sha256:" + "b" * 64,
                     "storage_class": "sqlite_terminal_receipt",
                     "bundle": {"payload": {"run_id": "run-live-1",
