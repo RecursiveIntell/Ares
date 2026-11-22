@@ -1,0 +1,64 @@
+{
+  "schema": "ares2.host-readiness.source-manifest/v1",
+  "repository": "RecursiveIntell/Ares",
+  "branch": "lab/ares2-00-evidence-2026-11-21",
+  "purpose": "Source-pinned preparation-only staging, not a new independent repository and not a qualified Ares migration",
+  "source": {
+    "stock_hermes": "88a1c1f4b19d1bc2b9fe8db870dee9ba0803fad5",
+    "ares_main": "90334d596068fd73488bdc71f11b5e68a8c7810c",
+    "libraries_main": "8355499c0653130ac55456bdfe7d3f391604a27b"
+  },
+  "mandatory_sources": [
+    {
+      "id": "P0-94878",
+      "url": "https://github.com/NousResearch/hermes-agent/pull/94878",
+      "head": "61e2dede7f92a76919ca797c314c5a2e83541bbd",
+      "state_at_inspection": "open, unmerged, merge conflicts",
+      "role": "Profile-owned child environment security and provenance; mandatory before capability migration"
+    },
+    {
+      "id": "P0-362",
+      "url": "https://github.com/NousResearch/hermes-official-plugins/pull/362",
+      "head": "4d6dcb23063613865abda1fa641be401dd6dea79",
+      "state_at_inspection": "draft, unmerged",
+      "role": "Singularity/Apptainer companion, conditional on enabling backend"
+    },
+    {
+      "id": "SOURCE-91293",
+      "url": "https://github.com/NousResearch/hermes-agent/pull/91293",
+      "role": "Overlapping provenance carrier; not a second independently mandatory merge"
+    }
+  ],
+  "active_staging": [
+    {
+      "branch": "lab/ares2-stock-hermes-2026-11-21",
+      "head": "88a1c1f4b19d1bc2b9fe8db870dee9ba0803fad5",
+      "purpose": "Unmodified stock-Hermes pin"
+    },
+    {
+      "branch": "lab/ares2-01-required-context-2026-11-21",
+      "head": "b6a28ef2482f0557a8184f97a99b5429f3fe3773",
+      "purpose": "Opt-in mandatory context-engine load; source committed; tests NOT executed"
+    },
+    {
+      "branch": "lab/ares2-00-evidence-2026-11-21",
+      "head": "this commit",
+      "purpose": "Traceability and readiness contracts"
+    }
+  ],
+  "test_environment": {
+    "required_python": "3.14.x per upstream CONTRIBUTING.md",
+    "available_execution": "GitHub connector remote source edits only; no local Hermes checkout or test environment",
+    "tests_run": [],
+    "tests_not_run_reason": "No authenticated git remote access or complete checkout; GitHub status check returned no statuses at commit b6a28ef",
+    "test_status": "NOT EXECUTED"
+  },
+  "safety": {
+    "production_ares_main_changed": false,
+    "production_state_migrated": false,
+    "real_credentials_used": false,
+    "provider_egress_authorized": false,
+    "github_actions_verified": false
+  },
+  "go_no_go": "NO-GO capability porting until every mandatory readiness gate has executed independent evidence"
+}
