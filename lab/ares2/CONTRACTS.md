@@ -6,7 +6,7 @@ All requirements describe semantics to PROVE against the separately pinned stock
 
 | ID | Contract / effect owner | Relevant source of truth | Acceptance evidence | State |
 | --- | --- | --- | --- | --- |
-| P0-01 | Child inherits no foreign profile-owned environment values | #94878: `agent/secret_scope.py`, `tools/environments/local.py` | A→B absent/different values at actual child spawn | Not yet ported |
+| P0-01 | Child inherits no foreign profile-owned environment values | #94878: `agent/secret_scope.py`, `tools/environments/local.py` | A→B absent/different values at actual child spawn | First synthetic contract tests committed; implementation not ported, tests NOT RUN |
 | P0-02 | Revocation does not reclassify previously owned launch values | #94878: monotone owned-name history | delete source, re-spawn, prove no stale value | Not yet ported |
 | P0-03 | Unreadable/malformed/stale secret source refuses explicit cross-profile child boundary | #94878: env loader and profile scope | failure before child creation | Not yet ported |
 | P0-04 | Wrapped/forwarded variables cannot reintroduce source credentials | #94878: direct/Apptainer/Singularity carrier normalization | nested wrapper and force-alias permutations | Not yet ported |
@@ -18,7 +18,7 @@ All requirements describe semantics to PROVE against the separately pinned stock
 | P0-10 | Contributor provenance and release attribution parity | #94878 author resolver/checker | casefold collision and raw %ae tests | Not yet ported |
 | P0-11 | Singularity lifecycle and overlay identity (only if backend enabled) | official plugin draft #362 | cross-process restart + retry + native backend when available | Conditional, unqualified |
 | H1-01 | Required named context engine cannot silently fall back | `agent/agent_init.py` + opt-in config | missing, clone fail, wrong name, safe worker, legacy fallback | Code committed, tests not executed |
-| H1-02 | Critical context selection errors cannot silently fall back | `agent/conversation_loop.py` | fail closed when explicitly required; no-op/legacy preserved | Not implemented |
+| H1-02 | Critical context selection errors cannot silently fall back | `agent/conversation_loop.py` | fail closed when explicitly required; no-op/legacy preserved | Code committed on 01b branch, tests NOT RUN |
 | H2-01 | Exact post-rewrite tool action denied before effect | #32719/#95247, `tools/registry.py`, `agent/tool_executor.py` | main/direct/MCP/nested/parallel dispatch once-only | Not implemented |
 | H3-01 | Receipt activation follows exact durable transcript commit | `persistence.conversation`, Ares context governor | prepare/validate/commit/abort/crash/recovery tests | Not implemented |
 | H4-01 | Exact physical model send needs valid permit | Ares `ares_runtime/physical_dispatch.py` and upstream transport | denied sends exactly zero bytes; streams/retries settle | Not implemented |
@@ -38,7 +38,7 @@ All requirements describe semantics to PROVE against the separately pinned stock
 
 - `lab/ares2-stock-hermes-2026-11-21`: pristine upstream Hermes source.
 - `lab/ares2-01-required-context-2026-11-21`: commit `b6a28ef2482f0557a8184f97a99b5429f3fe3773`, four-file implementation and synthetic regression tests, **NOT RUN**.
-- This branch: manifests and coverage ledger; **no execution claims**.
+- `lab/ares2-00a-pr94878-contracts-2026-11-21`: exact first #94878 behavioral acceptance scenarios committed, not run.\n- `lab/ares2-01b-required-selection-2026-11-21`: commit `f7dbce98b34973948113a11ef6b4deec1e68eb90`, opt-in per-request context selection, not run.\n- This branch: manifests and coverage ledger; **no execution claims**.
 
 ## Rollback
 

@@ -42,8 +42,19 @@
     },
     {
       "branch": "lab/ares2-00-evidence-2026-11-21",
-      "head": "this commit",
-      "purpose": "Traceability and readiness contracts"
+      "head": null,
+      "head_lookup": "Resolve branch at use time; self-referencing commit hash is not fixed",
+      "purpose": "Source/contract evidence"
+    },
+    {
+      "branch": "lab/ares2-00a-pr94878-contracts-2026-11-21",
+      "head": "a67d50cdb4ac359f4d16bd9dd41c5ba060a4086d",
+      "purpose": "PR #94878 first behavioral red witness; tests NOT executed"
+    },
+    {
+      "branch": "lab/ares2-01b-required-selection-2026-11-21",
+      "head": "f7dbce98b34973948113a11ef6b4deec1e68eb90",
+      "purpose": "Opt-in required context selection, source committed; tests NOT executed"
     }
   ],
   "test_environment": {
