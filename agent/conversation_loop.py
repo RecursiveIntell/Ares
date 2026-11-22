@@ -1331,10 +1331,16 @@ def _apply_context_engine_selection(
     agent: Any, api_messages: list[dict[str, Any]], conversation_messages: list[dict[str, Any]],
     incoming_message: Optional[dict[str, Any]], *, logger: Any,
 ) -> list[dict[str, Any]]:
-    """Run the optional per-turn ``ContextEngine.select_context()`` hook, fail-open: any
-    exception or invalid return yields ``api_messages`` unchanged; history is never mutated."""
+    """Select request context without touching durable history.
+
+    Default mode remains fail-open; an explicitly required selection refuses
+    before inference when the provider-bound projection is unavailable.
+    """
     engine = getattr(agent, "context_compressor", None)
+    required = bool(getattr(agent, "_context_selection_required", False))
     if not _engine_overrides_hook(engine, "select_context"):
+        if required:
+            raise RuntimeError("Required context selection hook is unavailable")
         return api_messages
 
     session_label = getattr(agent, "session_id", None) or "-"
@@ -1353,7 +1359,9 @@ def _apply_context_engine_selection(
             ),
             budget_tokens=getattr(engine, "context_length", 0) or 0,
         )
-    except Exception:
+    except Exception as exc:
+        if required:
+            raise RuntimeError("Required context selection failed; refusing provider request") from exc
         logger.warning(
             "Context engine select_context hook failed; using unmodified request messages (session=%s)",
             session_label, exc_info=True,
@@ -1361,6 +1369,8 @@ def _apply_context_engine_selection(
         return api_messages
 
     if selected is None:
+        if required:
+            raise RuntimeError("Required context selection returned no provider context")
         return api_messages
     # Require a NON-EMPTY list of dicts: ``all([])`` is ``True``, so a ``[]`` from a
     # buggy engine would otherwise replace the request instead of failing open.
@@ -1370,6 +1380,8 @@ def _apply_context_engine_selection(
         # selection too or those fields reach the provider. Dicts without them pass through as-is.
         stripped = [without_persistence_fields(m) for m in selected]
         return selected if all(a is b for a, b in zip(stripped, selected)) else stripped
+    if required:
+        raise RuntimeError("Required context selection returned an invalid provider context")
     logger.warning(
         "Context engine select_context returned an invalid value "
         "(not a non-empty list of dicts); ignoring (session=%s)", session_label,

@@ -1821,7 +1821,20 @@ def _compressor_max_tokens(agent):
 
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db,
                           persistence=None):
+    _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
+    _ctx_cfg = _ctx_cfg if isinstance(_ctx_cfg, dict) else {}
+    _selection_required = _ctx_cfg.get("selection_required", False)
+    if type(_selection_required) is not bool:
+        raise ValueError("context.selection_required must be a boolean")
+    if _selection_required and _ctx_cfg.get("engine_required") is not True:
+        raise ValueError("context.selection_required requires context.engine_required: true")
     _selected_engine = _select_context_engine(_agent_cfg)
+    if _selection_required:
+        from agent.context_engine import ContextEngine
+        hook = getattr(type(_selected_engine), "select_context", None)
+        if _selected_engine is None or hook is ContextEngine.select_context or not callable(hook):
+            raise RuntimeError("Required context engine must implement select_context")
+    agent._context_selection_required = _selection_required
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
         # External engines own compaction policy — the host threshold (and its Codex

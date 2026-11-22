@@ -1253,6 +1253,10 @@ DEFAULT_CONFIG = {
         # configured engines refuse the operation instead of silently using the
         # built-in compressor. The built-in "compressor" remains valid.
         "engine_required": False,
+        # Stricter, per-request contract: require the selected engine to implement
+        # select_context() and return a nonempty provider projection for every
+        # conversation request. Requires engine_required=true. Default is fail-open.
+        "selection_required": False,
         # Return freed glibc pages at agent/TUI cleanup boundaries (no-op elsewhere).
         "memory_trim": {
             "enabled": True,

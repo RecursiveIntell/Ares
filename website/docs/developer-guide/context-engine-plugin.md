@@ -41,9 +41,23 @@ mode produce a visible error rather than silently selecting another engine.
 `context.engine: compressor` is always available. The default is `false`,
 which preserves existing installations' fallback behavior.
 
-This option is an **activation requirement**, not transactional compaction
-receipt verification or mandatory per-request `select_context()` validation.
-Those require separate lifecycle contracts.
+The separate `selection_required: true` option additionally requires a
+selected context engine to implement `select_context()` and produce a nonempty
+provider-message list on every conversational request. With this setting,
+missing hooks, exceptions, `None` and invalid selections refuse the request
+instead of falling back to the unmodified context. It requires
+`engine_required: true`.
+
+```yaml
+context:
+  engine: "lcm"
+  engine_required: true
+  selection_required: true
+```
+
+The default for both options is `false`. Strict selection does **not** cover
+auxiliary/provider requests outside the conversation assembly path, or attest
+to durable compaction receipt activation. Those require distinct host contracts.
 
 ## Directory structure
 
