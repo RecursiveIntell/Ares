@@ -1337,7 +1337,7 @@ def _apply_context_engine_selection(
     before inference when the provider-bound projection is unavailable.
     """
     engine = getattr(agent, "context_compressor", None)
-    required = bool(getattr(agent, "_context_selection_required", False))
+    required = getattr(agent, "_context_selection_required", False) is True
     if not _engine_overrides_hook(engine, "select_context"):
         if required:
             raise RuntimeError("Required context selection hook is unavailable")
