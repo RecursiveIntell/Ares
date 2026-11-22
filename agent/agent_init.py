@@ -1737,14 +1737,22 @@ def _select_context_engine(_agent_cfg):
     general plugin system → None (built-in ContextCompressor)."""
     from agent.safe_worker_policy import safe_worker_enabled
 
+    _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
+    _ctx_cfg = _ctx_cfg if isinstance(_ctx_cfg, dict) else {}
+    _required = _ctx_cfg.get("engine_required", False)
+    if type(_required) is not bool:
+        raise ValueError("context.engine_required must be a boolean")
+    _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
+    if _required and (not isinstance(_engine_name, str) or not _engine_name.strip()):
+        raise ValueError("context.engine must name an engine when engine_required is true")
     if safe_worker_enabled():
+        if _required and _engine_name != "compressor":
+            raise RuntimeError(
+                f"Required context engine '{_engine_name}' is unavailable in safe-worker mode"
+            )
         return None
-    _engine_name = "compressor"
-    with suppress(Exception):
-        _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
-        _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
     if _engine_name == "compressor":
-        return None  # built-in; don't auto-activate plugins
+        return None  # explicitly selected built-in always satisfies the requirement
     _selected_engine = None
     _copy_failed = False
     try:
@@ -1777,6 +1785,15 @@ def _select_context_engine(_agent_cfg):
                     _engine_name, _copy_err,
                 )
 
+    if _selected_engine is None and _required:
+        raise RuntimeError(
+            f"Required context engine '{_engine_name}' is unavailable; refusing built-in fallback"
+        )
+    if _selected_engine is not None and _required:
+        if _selected_engine.name != _engine_name:
+            raise RuntimeError(
+                f"Required context engine '{_engine_name}' resolved to '{_selected_engine.name}'"
+            )
     if _selected_engine is None and not _copy_failed:
         _ra().logger.warning(
             "Context engine '%s' not found — falling back to built-in compressor", _engine_name

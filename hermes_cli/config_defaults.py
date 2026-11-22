@@ -1249,6 +1249,10 @@ DEFAULT_CONFIG = {
     # plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
+        # Opt in to required plugin activation: missing, unloadable or uncloneable
+        # configured engines refuse the operation instead of silently using the
+        # built-in compressor. The built-in "compressor" remains valid.
+        "engine_required": False,
         # Return freed glibc pages at agent/TUI cleanup boundaries (no-op elsewhere).
         "memory_trim": {
             "enabled": True,

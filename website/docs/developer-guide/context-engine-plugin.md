@@ -23,6 +23,28 @@ context:
 
 Plugin engines are **never auto-activated** — the user must explicitly set `context.engine` to the plugin's name.
 
+### Required context engines (opt-in)
+
+By default, if a named engine cannot be loaded or cloned, Hermes warns and
+falls back to the built-in compressor. Profiles whose context policy depends
+on the selected engine can instead refuse to start an operation:
+
+```yaml
+context:
+  engine: "lcm"
+  engine_required: true
+```
+
+The value must be a boolean. With `engine_required: true`, missing engines,
+clone failures, wrong-name results, and an unavailable plugin in safe-worker
+mode produce a visible error rather than silently selecting another engine.
+`context.engine: compressor` is always available. The default is `false`,
+which preserves existing installations' fallback behavior.
+
+This option is an **activation requirement**, not transactional compaction
+receipt verification or mandatory per-request `select_context()` validation.
+Those require separate lifecycle contracts.
+
 ## Directory structure
 
 Each context engine lives in `plugins/context_engine/<name>/`:
