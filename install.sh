@@ -360,7 +360,7 @@ PY
 
 STEP=managed-runtime
 "$BOOTSTRAP_PYTHON" - <<'PY'
-import hashlib, json, os, shutil, subprocess, time
+import hashlib, json, os, shutil, subprocess, sys, time
 from pathlib import Path
 from ares_runtime.local_runtime import AresLocalRuntime
 from hermes_cli.managed_uv import ensure_uv

@@ -22,6 +22,7 @@ import contextvars
 import json
 import logging
 import re
+import signal
 
 logger = logging.getLogger(__name__)
 import os
@@ -3996,12 +3997,19 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    graph_id: Optional[str] = None,
+    graph_version: Optional[str] = None,
+    graph_input: Optional[Dict[str, Any]] = None,
+    graph_budgets: Optional[Dict[str, Any]] = None,
+    graph_operation_id: Optional[str] = None,
+    workload_shape: Optional[str] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
     parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
     window_not_after=None,
+    _orchestration_admission=None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -4074,12 +4082,48 @@ def delegate_task(
             f"multiplies API cost)."
         )
 
+    # Workload-fit routing (Phase 4, additive/default-off) resolves a declared
+    # shape before selecting the admission effect. This chooses the requested
+    # route only; graph_route_decision below still enforces enablement/allowlist.
+    _shape_resolution = resolve_workload_shape(
+        workload_shape=workload_shape, graph_id=graph_id, cfg=_load_config())
+    if _shape_resolution.get("blocked"):
+        return json.dumps({"status":"blocked", "code":_shape_resolution["blocked"],
+                           "provider_calls":0, "legacy_fallback":False})
+    _shape_rule_id = None
+    if _shape_resolution.get("resolved"):
+        graph_id = _shape_resolution["graph_id"]
+        graph_version = _shape_resolution["graph_version"]
+        graph_budgets = _shape_resolution["graph_budgets"]
+        _shape_rule_id = _shape_resolution["rule_id"]
+
     # Mandatory session admission is independent of optional tool observers.
     # It precedes credential resolution, child construction and queueing.
+    from dataclasses import replace
     from agent.orchestration_policy import OrchestrationError
-    from agent.orchestration_runtime import admit_worker, denial_result
+    from agent.orchestration_runtime import SpawnAdmission, admit_worker, denial_result
     try:
-        admission = admit_worker(parent_agent)
+        effect = "graph" if graph_id is not None else "delegation"
+        if type(_orchestration_admission) is SpawnAdmission:
+            # Host-issued admission forwarded by the runtime dispatch site
+            # (run_agent._dispatch_delegate_task). Revalidate it fail-closed;
+            # a graph request re-checks the graph effect on the SAME snapshot
+            # instead of admitting a second, potentially divergent policy.
+            admission = _orchestration_admission
+            if admission.effect != effect:
+                admission = replace(admission, effect=effect)
+            admission.assert_current()
+            if effect == "delegation" and not admission.policy.allow_delegation:
+                raise OrchestrationError("delegation_disabled")
+            if effect == "graph" and not admission.policy.allow_graph:
+                raise OrchestrationError("graph_disabled")
+        else:
+            admission = admit_worker(parent_agent, effect=effect)
+        route_keys = ("provider", "model", "reasoning_effort", "base_url", "api_key", "api_mode")
+        explicit_credentials_override = (
+            credentials_cfg is not None
+            and any(credentials_cfg.get(k) != admission.routing_config.get(k) for k in route_keys)
+        )
         if admission.policy.secondary_route is not None and credentials_cfg:
             route = admission.policy.secondary_route
             if (credentials_cfg.get("model") != route.model
@@ -4089,6 +4133,57 @@ def delegate_task(
             credentials_cfg = admission.routing_config
     except OrchestrationError as exc:
         return denial_result(exc)
+
+    if graph_id is not None:
+        decision = graph_route_decision(
+            parent_agent=parent_agent, background=bool(background), graph_id=graph_id)
+        if decision.get("route") != "graph":
+            return json.dumps({"status":"blocked", "code":decision.get("reason"),
+                               "provider_calls":0, "legacy_fallback":False})
+        if tasks is not None:
+            if not isinstance(tasks, list) or len(tasks) != 1 or not isinstance(tasks[0], dict):
+                return json.dumps({"status":"blocked", "code":"graph_route_one_task_only",
+                                   "provider_calls":0, "legacy_fallback":False})
+            graph_goal = str(tasks[0].get("goal") or goal or "")
+            graph_context = tasks[0].get("context", context)
+            if tasks[0].get("output_schema") is not None:
+                return json.dumps({"status":"blocked", "code":"graph_output_schema_unqualified",
+                                   "provider_calls":0, "legacy_fallback":False})
+        else:
+            graph_goal = goal or ""
+            graph_context = context
+        if output_schema is not None:
+            return json.dumps({"status":"blocked", "code":"graph_output_schema_unqualified",
+                               "provider_calls":0, "legacy_fallback":False})
+        if explicit_credentials_override:
+            return json.dumps({"status":"blocked", "code":"graph_route_override_unqualified",
+                               "provider_calls":0, "legacy_fallback":False})
+        if _shape_rule_id is not None:
+            # Shape-resolved calls carry no caller graph fields; derive a stable
+            # operation identity and freeze the task as the graph input.
+            if graph_input is None:
+                graph_input = {"goal": graph_goal, "context": graph_context}
+            if not graph_operation_id:
+                # Stable across retries of the same origin+shape+payload: the
+                # durable delivery owner can reattach instead of duplicate.
+                from agent.orchestration_graph import _canonical_digest
+                graph_operation_id = "shape-" + _canonical_digest({
+                    "origin_session": getattr(parent_agent, "session_id", None),
+                    "workload_shape": workload_shape,
+                    "rule_id": _shape_rule_id,
+                    "graph_id": graph_id,
+                    "graph_version": graph_version,
+                    "graph_input": graph_input,
+                    "goal": graph_goal,
+                    "context": graph_context,
+                }).removeprefix("sha256:")[:32]
+        return _dispatch_graph_background(
+            parent_agent=parent_agent, admission=admission,
+            graph_id=graph_id, graph_version=graph_version or "",
+            graph_input=graph_input or {}, graph_budgets=graph_budgets or {},
+            graph_operation_id=graph_operation_id or "",
+            goal=graph_goal, context=graph_context,
+        )
 
     # Load the same admitted configuration snapshot for budgets and routing.
     cfg = admission.routing_config
@@ -4526,6 +4621,11 @@ def delegate_task(
     if background:
         from tools.async_delegation import dispatch_async_delegation_batch
         from tools.approval import get_current_session_key
+        # EDGES seam: classify ONCE per new submission; default-off keeps the
+        # legacy path byte-identical. The decision rides on the handle so the
+        # origin consumer can bind the result to its backend generation.
+        _route_decision = graph_route_decision(
+            parent_agent=parent_agent, background=True)
 
         # Finite sessions cannot route a detached subagent result back to the
         # agent after their turn/process ends. This includes stateless HTTP
@@ -4715,6 +4815,8 @@ def delegate_task(
                 f"single message once ALL of them finish. Do not wait or poll "
                 f"— just continue."
             )
+            _route_decision = graph_route_decision(
+                parent_agent=parent_agent, background=True)
             payload = {
                 "status": "dispatched",
                 "mode": "background",
@@ -4722,6 +4824,8 @@ def delegate_task(
                 "delegation_id": dispatch["delegation_id"],
                 "goals": _goals,
                 "note": note,
+                "backend_generation": _route_decision.get("backend_generation", "legacy"),
+                "graph_route_decision": _route_decision,
             }
             _sids = [
                 getattr(_c, "_subagent_id", None) for _c in _child_agents
@@ -5323,6 +5427,30 @@ DELEGATE_TASK_SCHEMA = {
                 # caller-declared. Unadvertised on purpose; do not re-add.
                 "description": "(rebuilt at get_definitions() time)",
             },
+            "graph_id": {
+                "type": "string",
+                "description": "Explicit request to route this ONE background task through the named pre-registered AgentGraph workflow. Only IDs in the operator's delegation.graph_route_allowlist are eligible. If supplied but blocked, the call is BLOCKED; it is never rerouted to legacy delegation.",
+            },
+            "graph_version": {
+                "type": "string",
+                "description": "Exact pinned sha256 graph version. Required with graph_id; unpinned graph calls are refused.",
+            },
+            "graph_input": {
+                "type": "object",
+                "description": "Frozen input object for the allowlisted graph. The graph receives this object as its input; it is bound into the owner request digest.",
+            },
+            "graph_budgets": {
+                "type": "object",
+                "description": "Explicit positive max_llm_calls and max_wall_clock_ms budgets. Required for graph_id; the owner may tighten but never widen these limits.",
+            },
+            "graph_operation_id": {
+                "type": "string",
+                "description": "Stable idempotency key for the graph operation. Same key+payload reattaches; changed payload conflicts.",
+            },
+            "workload_shape": {
+                "type": "string",
+                "description": "Optional declared workload shape (e.g. 'wide_independent_fanout'). When the operator has enabled workload-fit routing with a qualified rule for this shape, the task is routed to the rule's pinned, allowlisted AgentGraph workflow. Without a matching enabled rule the call keeps its normal behavior. Cannot be combined with graph_id.",
+            },
             # NOTE: the handler also accepts `background` (bool) — DEPRECATED,
             # ignored: top-level delegations always run in the background.
             # Deliberately unadvertised (old transcripts/callers only); do not
@@ -5362,6 +5490,906 @@ DELEGATE_TASK_SCHEMA = {
 
 
 # --- Registry ---
+# ── EDGES card (P5): graph-route admission seam (default-off) ──────────────
+# One logical dispatch decision per NEW background submission. Default-off:
+# legacy behavior is byte-identical. Enabled-in-test routes new eligible work
+# to the graph scheduler exactly once; old handles stay on their pinned
+# backend. No recursive re-entry: nested workers are never graph-eligible.
+
+def resolve_workload_shape(
+    *, workload_shape: Optional[str], graph_id: Optional[str], cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Workload-fit routing (Phase 4): map a declared workload shape to ONE
+    qualified, allowlisted graph via operator-owned routing rules.
+
+    Additive and default-off: with no workload_shape, or no matching enabled
+    rule, the caller keeps its exact prior behavior (explicit graph_id path or
+    byte-identical legacy). A shape label is a routing request, never authority:
+    the resolved graph must still pass graph_route_enabled + allowlist, and the
+    rule's pinned version/budgets are operator-owned, not caller-supplied.
+    """
+    if workload_shape is None:
+        return {"resolved": False}
+    if not isinstance(workload_shape, str) or not workload_shape.strip():
+        return {"resolved": False, "blocked": "workload_shape_invalid"}
+    if graph_id is not None:
+        return {"resolved": False, "blocked": "workload_shape_conflicts_with_graph_id"}
+    agent_graph = cfg.get("agent_graph") or {}
+    if not isinstance(agent_graph, dict) or agent_graph.get("enabled") is not True:
+        return {"resolved": False}
+    routing = agent_graph.get("routing") or {}
+    if not isinstance(routing, dict) or routing.get("mode") != "workload_fit":
+        return {"resolved": False}
+    rules = routing.get("rules") or []
+    if not isinstance(rules, list):
+        return {"resolved": False, "blocked": "workload_fit_rules_invalid"}
+    matches = [r for r in rules if isinstance(r, dict)
+               and r.get("workload_shape") == workload_shape
+               and r.get("enabled", True) is True]
+    if not matches:
+        return {"resolved": False}  # unqualified shape -> default (legacy) path
+    if len(matches) != 1:
+        return {"resolved": False, "blocked": "workload_fit_rule_ambiguous"}
+    rule = matches[0]
+    rid = rule.get("graph_id")
+    version = rule.get("graph_version")
+    budgets = rule.get("graph_budgets")
+    if (not isinstance(rid, str) or not rid
+            or not isinstance(version, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", version)
+            or not isinstance(budgets, dict)
+            or type(budgets.get("max_llm_calls")) is not int
+            or budgets.get("max_llm_calls", 0) <= 0
+            or type(budgets.get("max_wall_clock_ms")) is not int
+            or budgets.get("max_wall_clock_ms", 0) <= 0):
+        return {"resolved": False, "blocked": "workload_fit_rule_unqualified"}
+    return {"resolved": True, "graph_id": rid, "graph_version": version,
+            "graph_budgets": dict(budgets), "rule_id": rule.get("id") or workload_shape}
+
+
+def graph_route_decision(
+    *, parent_agent: Any, background: bool, graph_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Decide one explicitly opted-in graph operation versus legacy.
+
+    No graph_id means byte-identical legacy behavior. Supplying graph_id is an
+    explicit request to use Graph; if disabled/unallowlisted it is BLOCKED,
+    never silently substituted with a legacy worker.
+    """
+    if graph_id is None:
+        return {"route": "legacy", "reason": "no_explicit_graph_request"}
+    if not background:
+        return {"route": "blocked", "reason": "graph_route_requires_background"}
+    if getattr(parent_agent, "_orchestration_opt_out", False):
+        return {"route": "blocked", "reason": "caller_opt_out"}
+    depth = getattr(parent_agent, "_delegate_depth", 0)
+    if isinstance(depth, int) and depth > 0:
+        return {"route": "blocked", "reason": "nested_worker_not_graph_eligible"}
+    cfg = _load_config()
+    if not cfg.get("graph_route_enabled", False):
+        return {"route": "blocked", "reason": "graph_route_disabled"}
+    allowlist = cfg.get("graph_route_allowlist", [])
+    if (not isinstance(allowlist, (list, tuple))
+            or not all(isinstance(item, str) for item in allowlist)
+            or graph_id not in allowlist):
+        return {"route": "blocked", "reason": "graph_id_not_allowlisted"}
+    return {"route": "graph", "reason": "explicit_graph_opt_in",
+            "graph_id": graph_id, "backend_generation": "graph-v1"}
+
+
+def _graph_handler_value(raw: str) -> Dict[str, Any]:
+    """Parse the structured owner MCP result without inferring success."""
+    try:
+        outer = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {"ok": False, "error_code": "graph_adapter_response_invalid"}
+    value = outer.get("structuredContent")
+    if value is None:
+        value = outer.get("result")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return {"ok": False, "error_code": "graph_adapter_response_invalid"}
+    return value if isinstance(value, dict) else outer
+
+
+def _graph_mcp_call(parent_agent: Any, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Use the same Ares MCP guard/preflight path as a direct Graph tool call."""
+    from tools.mcp_tool import _make_tool_handler
+    from agent.subagent_lifecycle import bind_subagent_parent
+    handler = _make_tool_handler("agent_graph", tool_name, 30)
+    with bind_subagent_parent(parent_agent):
+        raw = handler(arguments)
+    return _graph_handler_value(raw)
+
+
+def _receipts_equivalent(durable: Dict[str, Any], bundled: Dict[str, Any]) -> bool:
+    """Compare a durable receipt with its bundle copy.
+
+    The Graph daemon redacts usage numbers in the bundle copy (it stamps
+    ``[REDACTED]``) while the durable receipt keeps them. Only those exact
+    leaves may differ; every other field must match, or the bundle is not
+    the same receipt and must be rejected.
+    """
+    if not isinstance(durable, dict) or not isinstance(bundled, dict):
+        return False
+    if durable.keys() != bundled.keys():
+        return False
+
+    def compare(a: Any, b: Any, path: str) -> bool:
+        # The owner's documented redaction: llm_invocations[*].usage.* leaves.
+        if (isinstance(b, str) and b == "[REDACTED]"
+                and ".llm_invocations[" in path and ".usage." in path):
+            return True
+        if isinstance(a, dict) and isinstance(b, dict):
+            return a.keys() == b.keys() and all(
+                compare(a[k], b[k], f"{path}.{k}") for k in a)
+        if isinstance(a, list) and isinstance(b, list):
+            return len(a) == len(b) and all(
+                compare(x, y, f"{path}[{i}]") for i, (x, y) in enumerate(zip(a, b)))
+        return a == b
+
+    return compare(durable, bundled, "receipt")
+
+
+def _verified_terminal_receipt(response: Dict[str, Any], run_id: str, graph_version: str):
+    """Accept only the Graph owner's durable, identity-matched receipt."""
+    import re
+
+    if not isinstance(response, dict):
+        return None, "canonical_receipt_unavailable"
+    data = response.get("data")
+    if not (response.get("ok") is True and isinstance(data, dict)):
+        return None, "canonical_receipt_unavailable"
+    receipt = data.get("receipt")
+    bundle = data.get("bundle")
+    payload = bundle.get("payload") if isinstance(bundle, dict) else None
+    if not isinstance(receipt, dict) or not isinstance(payload, dict):
+        return None, "canonical_receipt_missing"
+    # The daemon places run_id at the response top level; some wrappers also
+    # carry it under data. Accept either, reject a conflicting inner value.
+    outer_run_id = response.get("run_id")
+    inner_run_id = data.get("run_id")
+    if (outer_run_id != run_id
+            or (inner_run_id is not None and inner_run_id != run_id)):
+        return None, "canonical_receipt_identity_or_integrity_invalid"
+    if (receipt.get("schema") != "agent-graph-mcp-receipt-v2"
+            or receipt.get("run_id") != run_id
+            or receipt.get("graph_version") != graph_version
+            or receipt.get("persistence_status") != "durable_terminal"
+            or receipt.get("error_code") is not None
+            or data.get("storage_class") != "sqlite_terminal_receipt"
+            or not isinstance(data.get("receipt_digest"), str)
+            or not re.fullmatch(r"hmac-sha256:[0-9a-f]{64}", data["receipt_digest"])):
+        return None, "canonical_receipt_identity_or_integrity_invalid"
+    if (payload.get("run_id") != run_id
+            or payload.get("graph_version") != graph_version
+            or not isinstance(payload.get("output"), dict)
+            or not _receipts_equivalent(receipt, payload.get("receipt"))):
+        return None, "canonical_receipt_bundle_mismatch"
+    return {"receipt": receipt, "output": payload["output"],
+            "receipt_digest": data["receipt_digest"],
+            "storage_class": data["storage_class"]}, None
+
+
+def _dispatch_graph_background(
+    *, parent_agent: Any, graph_id: str, graph_version: str,
+    graph_input: Dict[str, Any], graph_budgets: Dict[str, Any],
+    graph_operation_id: str, goal: str, context: Optional[str],
+    admission: Any,
+) -> str:
+    """Run one explicitly allowlisted Graph workflow and deliver to origin.
+
+    Graph owns the workflow; Ares's async_delegation remains only the durable
+    origin/delivery owner. It never launches legacy children on this branch.
+    """
+    decision = graph_route_decision(
+        parent_agent=parent_agent, background=True, graph_id=graph_id)
+    if decision["route"] != "graph":
+        return json.dumps({"status":"blocked", "code":decision["reason"],
+                           "provider_calls":0, "legacy_fallback":False})
+    if (not isinstance(graph_version, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", graph_version)):
+        return json.dumps({"status":"blocked", "code":"graph_version_pin_required",
+                           "provider_calls":0, "legacy_fallback":False})
+    if not isinstance(graph_input, dict):
+        return json.dumps({"status":"blocked", "code":"graph_input_required",
+                           "provider_calls":0, "legacy_fallback":False})
+    if (not isinstance(graph_budgets, dict)
+            or type(graph_budgets.get("max_llm_calls")) is not int
+            or graph_budgets["max_llm_calls"] <= 0
+            or type(graph_budgets.get("max_wall_clock_ms")) is not int
+            or graph_budgets["max_wall_clock_ms"] <= 0):
+        return json.dumps({"status":"blocked", "code":"graph_budget_required",
+                           "provider_calls":0, "legacy_fallback":False})
+    if (not isinstance(graph_operation_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", graph_operation_id)):
+        return json.dumps({"status":"blocked", "code":"graph_operation_id_invalid",
+                           "provider_calls":0, "legacy_fallback":False})
+    from agent.orchestration_graph import _canonical_digest
+    request_digest = _canonical_digest({
+        "graph_id":graph_id, "graph_version":graph_version,
+        "graph_input":graph_input, "graph_budgets":graph_budgets,
+        "operation_id":graph_operation_id,
+    })
+    from tools.approval import get_current_session_key
+    try:
+        session_key = get_current_session_key() or ""
+    except Exception:
+        session_key = ""
+    origin_sid = ""
+    try:
+        from tools.async_delegation import _current_origin_session_id
+        origin_sid = _current_origin_session_id()
+    except Exception:
+        pass
+    origin_ui = ""
+    try:
+        from gateway.session_context import get_session_env
+        origin_ui = get_session_env("HERMES_UI_SESSION_ID", "")
+    except Exception:
+        pass
+    operation_key = "graphop-" + _canonical_digest({
+        "origin_session": getattr(parent_agent, "session_id", None),
+        "origin_wake_session": origin_sid,
+        "session_key": session_key,
+        "graph_operation_id": graph_operation_id,
+    }).removeprefix("sha256:")
+    if not session_key and not origin_sid and not getattr(parent_agent, "session_id", None):
+        return json.dumps({"status":"blocked", "code":"graph_origin_required",
+                           "provider_calls":0, "legacy_fallback":False})
+    try:
+        from gateway.session_context import async_delivery_supported, get_session_env
+        _async_ok = async_delivery_supported()
+    except Exception:
+        _async_ok = True
+        get_session_env = None
+    if not _async_ok:
+        _api_server_wake = False
+        if origin_sid and get_session_env is not None:
+            try:
+                _api_server_wake = get_session_env("HERMES_SESSION_PLATFORM", "") == "api_server"
+            except Exception:
+                _api_server_wake = False
+        if not _api_server_wake:
+            return json.dumps({"status":"blocked", "code":"graph_async_delivery_unavailable",
+                               "provider_calls":0, "legacy_fallback":False})
+
+    from tools.async_delegation import bind_graph_backend, dispatch_async_delegation
+    import threading
+    run_state = {"run_id": None}
+    cancel_requested = threading.Event()
+    cancel_sent = threading.Event()
+
+    def _cancel_graph():
+        cancel_requested.set()
+        run_id = run_state.get("run_id")
+        if run_id and not cancel_sent.is_set():
+            cancel_sent.set()
+            _graph_mcp_call(parent_agent, "graph_run_cancel", {"run_id":run_id})
+
+    def _runner():
+        if cancel_requested.is_set():
+            return {"status":"cancelled", "summary":"cancelled before graph launch", "api_calls":0}
+        start = _graph_mcp_call(parent_agent, "graph_run_start", {
+            "graph_id":graph_id, "graph_version":graph_version,
+            "input":graph_input, "budgets":graph_budgets,
+            "idempotency_key":graph_operation_id,
+        })
+        if start.get("ok") is not True:
+            return {"status":"blocked", "summary":json.dumps(start),
+                    "error":start.get("error_code") or start.get("error"), "api_calls":0}
+        data = start.get("data") if isinstance(start.get("data"), dict) else start
+        run_id = data.get("run_id")
+        if not isinstance(run_id, str):
+            return {"status":"unknown", "summary":"graph start returned no run_id",
+                    "error":"graph_run_id_missing", "api_calls":0}
+        run_state["run_id"] = run_id
+        # Persist graph-run binding in the origin delivery owner immediately.
+        try:
+            binding = bind_graph_backend(operation_key, graph_alias=graph_id,
+                backend_generation=graph_version, request_digest=request_digest,
+                graph_run_id=run_id)
+        except Exception:
+            logger.exception("Could not bind graph run to delivery owner")
+            _graph_mcp_call(parent_agent,"graph_run_cancel",{"run_id":run_id})
+            return {"status":"unknown", "summary":"graph run accepted but delivery binding failed",
+                    "error":"graph_delivery_binding_failed", "graph_run_id":run_id}
+        if not (isinstance(binding, dict) and binding.get("ok") is True):
+            # Typed binding conflict: cancel the orphaned run, never deliver
+            # against a record that refused the binding.
+            _cancel_graph()
+            return {"status":"blocked",
+                    "summary":"graph run accepted but delivery owner refused the binding",
+                    "error":(binding or {}).get("code") or "graph_delivery_binding_failed",
+                    "graph_run_id":run_id, "api_calls":0}
+        deadline = time.monotonic() + graph_budgets["max_wall_clock_ms"] / 1000
+        while time.monotonic() < deadline:
+            if cancel_requested.is_set():
+                _cancel_graph()  # idempotent: cancel_sent guards duplicate sends
+            result = _graph_mcp_call(parent_agent,"graph_run_wait",{
+                "run_id":run_id, "timeout_ms":min(5000, max(1, int((deadline-time.monotonic())*1000)))})
+            rdata = result.get("data") if isinstance(result.get("data"), dict) else result
+            status = rdata.get("status")
+            if status in {"completed", "failed", "cancelled", "interrupted_non_resumable"}:
+                success = rdata.get("success") is True and status == "completed"
+                if success:
+                    try:
+                        receipt_response = _graph_mcp_call(
+                            parent_agent, "graph_run_receipt", {"run_id": run_id})
+                    except Exception:
+                        logger.exception("Canonical graph receipt lookup failed for %s", run_id)
+                        receipt_response = None
+                    verified, receipt_error = _verified_terminal_receipt(
+                        receipt_response, run_id, graph_version)
+                    if verified is None:
+                        return {"status": "unknown",
+                                "summary": "Graph reported completion, but its canonical durable receipt could not be verified",
+                                "error": receipt_error,
+                                "receipt_status": "unverified",
+                                "graph_run_id": run_id, "graph_id": graph_id,
+                                "graph_version": graph_version,
+                                "api_calls": rdata.get("budget_counters", {}).get("llm_calls", 0)}
+                    return {"status": "completed",
+                            "summary": json.dumps(verified["output"], ensure_ascii=False),
+                            "error": None, "receipt_status": "verified",
+                            "receipt_digest": verified["receipt_digest"],
+                            "receipt_storage_class": verified["storage_class"],
+                            "graph_run_id": run_id, "graph_id": graph_id,
+                            "graph_version": graph_version,
+                            "api_calls": rdata.get("budget_counters", {}).get("llm_calls", 0)}
+                return {"status": "cancelled" if status == "cancelled" else "error",
+                        "summary": json.dumps(rdata, ensure_ascii=False),
+                        "error": rdata.get("error") or status,
+                        "receipt_status": "not_required_for_non_success",
+                        "graph_run_id": run_id, "graph_id": graph_id,
+                        "graph_version": graph_version,
+                        "api_calls": rdata.get("budget_counters", {}).get("llm_calls", 0)}
+        _graph_mcp_call(parent_agent,"graph_run_cancel",{"run_id":run_id})
+        return {"status":"unknown", "summary":"graph run exceeded caller deadline",
+                "error":"graph_deadline_expired", "graph_run_id":run_id,
+                "api_calls":0}
+
+    handle_id = "graph-bg-" + operation_key.removeprefix("graphop-")[:16]
+    graph_handle = _GraphBackgroundHandle(operation_key, _cancel_graph)
+    control_record = {
+        "subagent_id": handle_id,
+        "parent_id": None,
+        "depth": 0,
+        "goal": goal or f"AgentGraph workflow {graph_id}",
+        "model": "graph-background",
+        "started_at": time.time(),
+        "status": "running",
+        "tool_count": 0,
+        "agent": graph_handle,
+        "accepting_steer": False,
+        "owner_agent_session_id": getattr(parent_agent, "session_id", None),
+        "_delegate_parent_ref": _try_parent_weakref(parent_agent),
+    }
+    # Install the control record before dispatch can start a worker. If the
+    # durable dispatcher reattaches instead, remove only this exact record.
+    with _active_subagents_lock:
+        control_registered = handle_id not in _active_subagents
+        if control_registered:
+            _active_subagents[handle_id] = control_record
+
+    def _runner_with_cleanup():
+        try:
+            return _runner()
+        finally:
+            _unregister_subagent(handle_id, agent=graph_handle)
+
+    dispatch = dispatch_async_delegation(
+        goal=goal or f"AgentGraph workflow {graph_id}", context=context,
+        toolsets=None, role="graph", model=(admission.resolved_optional_route.model if admission.resolved_optional_route else None),
+        session_key=session_key, parent_session_id=getattr(parent_agent,"session_id",None),
+        runner=_runner_with_cleanup, origin_ui_session_id=origin_ui, origin_session_id=origin_sid,
+        interrupt_fn=_cancel_graph, graph_alias=graph_id,
+        backend_generation=graph_version, request_digest=request_digest,
+        operation_key=operation_key,
+    )
+    if dispatch.get("status") not in {"dispatched", "reattached"}:
+        if control_registered:
+            _unregister_subagent(handle_id, agent=graph_handle)
+        return json.dumps({**dispatch, "legacy_fallback":False},ensure_ascii=False)
+    if dispatch.get("status") == "reattached" and control_registered:
+        # The durable owner did not submit this runner; no worker exists to
+        # perform terminal cleanup for a record installed before submission.
+        _unregister_subagent(handle_id, agent=graph_handle)
+    return json.dumps({
+        "status":"dispatched" if dispatch.get("status")=="dispatched" else "reattached",
+        "mode":"graph_background", "operation_key":operation_key,
+        "handle_id":handle_id,
+        "graph_id":graph_id, "graph_version":graph_version,
+        "delegation_id":dispatch.get("delegation_id"),
+        "graph_run_id":dispatch.get("graph_run_id"),
+        "backend_generation":graph_version, "legacy_fallback":False,
+        "origin_session_id":origin_sid or None,
+        "note":"AgentGraph owns the workflow; this handle is only the durable origin-delivery owner. Do not retry on another backend.",
+    },ensure_ascii=False)
+
+
+# ── READ card (P4): fixed read-only graph operation ────────────────────────
+# LOCK contract-v1: ONE fixed operation, scoped workspace, unique session,
+# timeout, control handle bound to owner lineage. The daemon never receives
+# the parent's full tool list; the op exposes only ["artifact_read"].
+
+_GRAPH_OP_RESULTS: Dict[str, Dict[str, Any]] = {}
+_GRAPH_OP_LOCK = threading.Lock()
+
+
+class _GraphReadHandle:
+    """Control-plane stand-in for a completed/held read operation.
+
+    Supports stop (marks exited) but NOT steer — a fixed read op has no
+    running model loop to steer, and the control surface must say so.
+    """
+
+    def __init__(self, operation_id: str):
+        self.operation_id = operation_id
+        self.interrupted = False
+        self._live_transcript_path = None
+
+    def steer(self, text: str) -> bool:
+        return False
+
+    def interrupt(self) -> None:
+        self.interrupted = True
+
+
+def _try_parent_weakref(parent_agent: Any):
+    """Weakref when possible; test doubles/proxies fall back to durable lineage."""
+    if isinstance(parent_agent, dict):
+        return None
+    try:
+        return weakref.ref(parent_agent)
+    except TypeError:
+        return None
+
+
+class _GraphBackgroundHandle:
+    """Control handle for ONE running graph-background operation (ROUTE).
+
+    stop routes graph_run_cancel to the same owner-bound run through the
+    dispatch's cancel closure. steer is unsupported: a fixed graph workflow
+    has no running model loop to steer, and the control surface must say so.
+    """
+
+    def __init__(self, operation_key: str, cancel_fn):
+        self.operation_key = operation_key
+        self._cancel_fn = cancel_fn
+        self._live_transcript_path = None
+
+    def steer(self, text: str) -> bool:
+        return False
+
+    def interrupt(self, message=None) -> None:
+        self._cancel_fn()
+
+
+def run_graph_read_operation(
+    *,
+    operation_id: str,
+    workspace: Any,
+    path: str,
+    parent_agent: Any,
+    timeout_seconds: float = 30,
+    keep_handle: bool = False,
+) -> Dict[str, Any]:
+    """Execute ONE fixed read-only operation inside a scoped workspace.
+
+    Same operation_id returns the original result (reattach); the workspace
+    boundary is resolved with realpath so symlinks cannot escape. No shell,
+    no arbitrary executable, no parent tool list.
+    """
+    import hashlib
+    from pathlib import Path as _Path
+
+    started = time.monotonic()
+    if parent_agent is None:
+        return {"status": "blocked", "code": "policy_owner_required",
+                "operation_id": operation_id, "api_calls": 0}
+    if not isinstance(operation_id, str) or not operation_id.strip():
+        return {"status": "blocked", "code": "read_operation_invalid",
+                "operation_id": operation_id, "api_calls": 0}
+    with _GRAPH_OP_LOCK:
+        prior = _GRAPH_OP_RESULTS.get(operation_id)
+    if prior is not None:
+        return {**prior, "reattached": True}
+    if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+        return {"status": "blocked", "code": "read_deadline_expired",
+                "operation_id": operation_id, "api_calls": 0}
+    try:
+        root = _Path(workspace).resolve(strict=True)
+        target = (root / path).resolve(strict=True)
+    except (OSError, ValueError, RuntimeError):
+        return {"status": "blocked", "code": "read_path_out_of_scope",
+                "operation_id": operation_id, "api_calls": 0}
+    if not target.is_relative_to(root) or not target.is_file():
+        return {"status": "blocked", "code": "read_path_out_of_scope",
+                "operation_id": operation_id, "api_calls": 0}
+    if time.monotonic() - started > timeout_seconds:
+        return {"status": "blocked", "code": "read_deadline_expired",
+                "operation_id": operation_id, "api_calls": 0}
+    try:
+        data = target.read_bytes()
+    except OSError:
+        return {"status": "blocked", "code": "read_path_out_of_scope",
+                "operation_id": operation_id, "api_calls": 0}
+    result = {
+        "status": "completed",
+        "operation_id": operation_id,
+        "content_sha256": hashlib.sha256(data).hexdigest(),
+        "bytes": len(data),
+        "tool_classes": ["artifact_read"],
+        "api_calls": 0,
+        "duration_seconds": round(time.monotonic() - started, 4),
+        "reattached": False,
+    }
+    handle_id = f"graph-read-{hashlib.sha256(operation_id.encode()).hexdigest()[:16]}"
+    result["handle_id"] = handle_id
+    with _GRAPH_OP_LOCK:
+        _GRAPH_OP_RESULTS[operation_id] = result
+    if keep_handle:
+        handle = _GraphReadHandle(operation_id)
+        _register_subagent({
+            "subagent_id": handle_id,
+            "parent_id": None,
+            "depth": 0,
+            "goal": f"graph read op {operation_id}",
+            "model": "fixed-read-op",
+            "started_at": time.time(),
+            "status": "running",
+            "tool_count": 0,
+            "agent": handle,
+            "accepting_steer": False,
+            "owner_agent_session_id": getattr(parent_agent, "session_id", None),
+            "_delegate_parent_ref": weakref.ref(parent_agent)
+            if not isinstance(parent_agent, dict) else None,
+        })
+    return result
+
+
+# ── TESTOP card (P4): disposable test execution as a fixed operation ───────
+# Named suites bind fixed argv + captured cwd at registration (host-side).
+# Callers select a suite by name only — never supply argv at run time.
+
+_GRAPH_TEST_SUITES: Dict[str, Dict[str, Any]] = {}
+_GRAPH_TEST_LOCK = threading.Lock()
+_TEST_OUTPUT_CAP = 8192
+
+
+def _process_group_has_live_members(group_id: int) -> bool:
+    """Conservatively detect live members of a POSIX process group."""
+    from pathlib import Path as _Path
+
+    proc_root = _Path("/proc")
+    if proc_root.is_dir():
+        for proc_entry in proc_root.iterdir():
+            if not proc_entry.name.isdigit():
+                continue
+            try:
+                stat = (proc_entry / "stat").read_text(encoding="utf-8")
+                close = stat.rfind(")")
+                fields = stat[close + 2:].split()
+                if len(fields) >= 3 and int(fields[2]) == group_id and fields[0] != "Z":
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
+
+    killpg = getattr(os, "killpg", None)
+    if not callable(killpg):
+        return True
+    try:
+        killpg(group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _kill_graph_test_process_group(proc: Any) -> tuple[str, bool]:
+    """Kill and reap an owned suite process group; never overclaim closure."""
+    killpg = getattr(os, "killpg", None)
+    if os.name == "posix" and callable(killpg):
+        try:
+            kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+            killpg(proc.pid, kill_signal)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            logger.warning("Could not signal graph test process group %s", proc.pid,
+                           exc_info=True)
+    else:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    try:
+        proc.communicate(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+    process_exited = proc.poll() is not None
+
+    if os.name == "posix":
+        deadline = time.monotonic() + 5
+        while _process_group_has_live_members(proc.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        group_exited = not _process_group_has_live_members(proc.pid)
+    else:
+        # The stdlib cannot confirm or kill a Windows descendant tree; keep
+        # cleanup explicitly pending rather than claiming the process tree closed.
+        group_exited = False
+
+    return ("closed" if process_exited and group_exited else "kill_pending", process_exited)
+
+
+def register_graph_test_operation(name: str, *, argv: List[str], cwd: Any) -> None:
+    """Host-side registration of one fixed test suite. Not model-facing."""
+    from pathlib import Path as _Path
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("test_suite_name_invalid")
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        raise ValueError("test_argv_invalid")
+    root = _Path(cwd).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("test_cwd_invalid")
+    with _GRAPH_TEST_LOCK:
+        _GRAPH_TEST_SUITES[name] = {"argv": list(argv), "cwd": str(root)}
+
+
+def run_graph_test_operation(
+    *,
+    operation_id: str,
+    suite: str,
+    parent_agent: Any,
+    timeout_seconds: float = 300,
+    argv: Any = None,
+) -> Dict[str, Any]:
+    """Run ONE registered test suite in its captured isolated cwd.
+
+    Test failures are failures. Timeout or missing exit record is unknown,
+    never pass. Output is bounded; the child is cleaned up on timeout.
+    """
+    import subprocess as _sp
+    if parent_agent is None:
+        return {"status": "blocked", "code": "policy_owner_required",
+                "operation_id": operation_id}
+    if argv is not None:
+        return {"status": "blocked", "code": "test_argv_not_caller_supplied",
+                "operation_id": operation_id}
+    if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+        return {"status": "blocked", "code": "test_deadline_expired",
+                "operation_id": operation_id}
+    with _GRAPH_TEST_LOCK:
+        spec = _GRAPH_TEST_SUITES.get(suite)
+    if spec is None:
+        return {"status": "blocked", "code": "test_suite_unregistered",
+                "operation_id": operation_id}
+    try:
+        proc = _sp.Popen(
+            spec["argv"], cwd=spec["cwd"],
+            stdout=_sp.PIPE, stderr=_sp.PIPE, text=True,
+            start_new_session=(os.name == "posix"),
+        )
+    except OSError as exc:
+        return {"status": "unknown", "exit_state": "launch_failed",
+                "operation_id": operation_id, "error": str(exc)}
+    try:
+        out, err = proc.communicate(timeout=timeout_seconds)
+    except _sp.TimeoutExpired:
+        cleanup_state, process_exited = _kill_graph_test_process_group(proc)
+        return {"status": "unknown", "exit_state": "timeout",
+                "operation_id": operation_id, "exit_code": None,
+                "cleanup_state": cleanup_state, "process_exited": process_exited}
+    code = proc.returncode
+    if code is None:
+        return {"status": "unknown", "exit_state": "missing_exit_record",
+                "operation_id": operation_id, "cleanup_state": "closed"}
+    return {
+        "status": "completed" if code == 0 else "failed",
+        "operation_id": operation_id,
+        "exit_code": code,
+        "exit_state": "observed",
+        "stdout_tail": (out or "")[-_TEST_OUTPUT_CAP:],
+        "stderr_tail": (err or "")[-_TEST_OUTPUT_CAP:],
+        "cleanup_state": "closed",
+    }
+
+
+# ── EDIT card (P4): bounded edit with interruption reconciliation ──────────
+# One expected preimage + intended postimage bound to a stable operation ID.
+# The durable effect journal is the operation owner: recovery compares the
+# ACTUAL artifact against the expected postimage, never blindly re-applies.
+
+_GRAPH_EDIT_JOURNAL: Dict[str, Dict[str, Any]] = {}
+_GRAPH_EDIT_LOCK = threading.Lock()
+
+
+def _edit_scope(workspace: Any, path: str):
+    from pathlib import Path as _Path
+    try:
+        root = _Path(workspace).resolve(strict=True)
+        target = (root / path).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None, None
+    if not target.is_relative_to(root):
+        return None, None
+    return root, target
+
+
+def run_graph_edit_operation(
+    *,
+    operation_id: str,
+    workspace: Any,
+    path: str,
+    expected_preimage_sha256: str,
+    intended_postimage: str,
+    parent_agent: Any,
+    crash_before_receipt: bool = False,
+) -> Dict[str, Any]:
+    """Apply ONE bounded edit bound to a stable operation ID.
+
+    Wrong preimage refuses without writing. A crash after apply but before
+    the outward receipt leaves an unknown outcome reconcilable via
+    query_graph_edit_operation; a retry never blindly re-applies.
+    """
+    import hashlib
+    if parent_agent is None:
+        return {"status": "blocked", "code": "policy_owner_required",
+                "operation_id": operation_id}
+    while True:
+        with _GRAPH_EDIT_LOCK:
+            prior = _GRAPH_EDIT_JOURNAL.get(operation_id)
+            if prior is None:
+                reservation_event = threading.Event()
+                entry = {
+                    "operation_id": operation_id,
+                    "receipt_state": "reserved",
+                    "effect_count": 0,
+                    "quarantined": False,
+                    "_reservation_event": reservation_event,
+                }
+                _GRAPH_EDIT_JOURNAL[operation_id] = entry
+                owns_reservation = True
+            else:
+                reservation_event = prior.get("_reservation_event")
+                owns_reservation = False
+        if owns_reservation:
+            break
+        if prior.get("quarantined"):
+            return {"status": "blocked", "code": "edit_outcome_quarantined",
+                    "operation_id": operation_id, "effect_count": prior.get("effect_count", 0)}
+        if reservation_event is not None and not reservation_event.is_set():
+            reservation_event.wait()
+            continue
+        if prior.get("receipt_state") == "committed":
+            return {**prior["result"], "reattached": True}
+        # Interrupted before receipt: reconcile, do not re-apply.
+        return query_graph_edit_operation(operation_id, workspace=workspace)
+
+    try:
+        root, target = _edit_scope(workspace, path)
+        if root is None or target is None or not target.is_file():
+            return {"status": "blocked", "code": "edit_path_out_of_scope",
+                    "operation_id": operation_id}
+        try:
+            current = target.read_bytes()
+        except OSError:
+            return {"status": "blocked", "code": "edit_path_out_of_scope",
+                    "operation_id": operation_id}
+        if hashlib.sha256(current).hexdigest() != expected_preimage_sha256:
+            return {"status": "blocked", "code": "edit_preimage_mismatch",
+                    "operation_id": operation_id}
+        post_bytes = intended_postimage.encode("utf-8")
+        post_sha = hashlib.sha256(post_bytes).hexdigest()
+        # Persist the reserved intent before the effect, so concurrent calls
+        # wait on this identity and interruption remains reconcilable.
+        with _GRAPH_EDIT_LOCK:
+            entry.update({
+                "target": str(target),
+                "expected_postimage_sha256": post_sha,
+                "receipt_state": "pending",
+            })
+        target.write_bytes(post_bytes)
+        with _GRAPH_EDIT_LOCK:
+            entry["effect_count"] = 1
+        if crash_before_receipt:
+            return {"status": "unknown", "exit_state": "interrupted_before_receipt",
+                    "operation_id": operation_id, "effect_count": 1}
+        result = {
+            "status": "completed", "operation_id": operation_id,
+            "effect_count": 1, "postimage_sha256": post_sha, "reattached": False,
+        }
+        with _GRAPH_EDIT_LOCK:
+            entry["receipt_state"] = "committed"
+            entry["result"] = result
+        return result
+    finally:
+        with _GRAPH_EDIT_LOCK:
+            if (entry.get("receipt_state") == "reserved"
+                    and _GRAPH_EDIT_JOURNAL.get(operation_id) is entry):
+                _GRAPH_EDIT_JOURNAL.pop(operation_id, None)
+            reservation_event.set()
+
+
+def query_graph_edit_operation(operation_id: str, *, workspace: Any = None) -> Dict[str, Any]:
+    """Reconcile an interrupted edit by comparing ACTUAL vs expected artifact."""
+    import hashlib
+    from pathlib import Path as _Path
+    with _GRAPH_EDIT_LOCK:
+        entry = _GRAPH_EDIT_JOURNAL.get(operation_id)
+    if entry is None:
+        return {"status": "blocked", "code": "edit_operation_unknown",
+                "operation_id": operation_id}
+    if entry.get("receipt_state") == "committed":
+        return {**entry["result"], "reconciled": True}
+    try:
+        actual = _Path(entry["target"]).read_bytes()
+    except OSError:
+        entry["quarantined"] = True
+        return {"status": "unknown", "quarantined": True,
+                "operation_id": operation_id, "effect_count": entry["effect_count"]}
+    actual_sha = hashlib.sha256(actual).hexdigest()
+    if actual_sha == entry["expected_postimage_sha256"]:
+        result = {
+            "status": "completed", "operation_id": operation_id,
+            "effect_count": entry["effect_count"],
+            "postimage_sha256": actual_sha, "reattached": False,
+        }
+        entry["receipt_state"] = "committed"
+        entry["result"] = result
+        return {**result, "reconciled": True}
+    # Actual state matches neither preimage nor intended postimage: quarantine.
+    entry["quarantined"] = True
+    return {"status": "unknown", "quarantined": True,
+            "operation_id": operation_id, "effect_count": entry["effect_count"]}
+
+
+def graph_operation_control(
+    action: str,
+    subagent_id: Optional[str],
+    message: Optional[str],
+    parent_agent: Any,
+) -> str:
+    """Control plane for fixed graph operations: list/stop via owner lineage;
+    steer is explicitly unsupported (no running model loop to steer)."""
+    if action == "steer" and subagent_id:
+        with _active_subagents_lock:
+            record = _active_subagents.get(subagent_id)
+        if record is not None and _owns_subagent_record(record, parent_agent) \
+                and isinstance(record.get("agent"), _GraphReadHandle):
+            return tool_error(
+                "steer unsupported for fixed read operations: the worker has "
+                "no running model loop to receive steering text."
+            )
+    if action == "stop" and subagent_id:
+        with _active_subagents_lock:
+            record = _active_subagents.get(subagent_id)
+        if record is not None and _owns_subagent_record(record, parent_agent) \
+                and isinstance(record.get("agent"), _GraphReadHandle):
+            record["agent"].interrupt()
+            record["status"] = "interrupt_requested"
+            return json.dumps({
+                "action": "stop", "subagent_id": subagent_id,
+                "status": "interrupt_requested",
+                "worker_exit": "confirmed" if record["agent"].interrupted else "pending",
+                "note": "Cancellation requested is reported separately from worker exit.",
+            })
+    return _handle_control_action(action, subagent_id, message, parent_agent)
+
+
 from tools.registry import registry, tool_error
 
 
@@ -5416,6 +6444,11 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
+        graph_id=args.get("graph_id"),
+        graph_version=args.get("graph_version"),
+        graph_input=args.get("graph_input"),
+        graph_budgets=args.get("graph_budgets"),
+        graph_operation_id=args.get("graph_operation_id"),
         window_not_after=kw.get("window_not_after"),
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),

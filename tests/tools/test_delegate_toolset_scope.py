@@ -73,3 +73,111 @@ class TestEmitParentConsole:
         _emit_parent_console(parent, "  ✓ [3/3] non-callable guard")
         captured = capsys.readouterr()
         assert "non-callable guard" in captured.out
+
+
+# --- READ card (P4): fixed read-only graph operation ---
+# LOCK contract-v1: one fixed op, scoped workspace, unique session, timeout,
+# control handle bound to owner lineage. Never the parent's full tool list.
+
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+
+class TestGraphReadOperation:
+    def _parent(self, tmp_path):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            enabled_toolsets=["terminal", "file", "web", "browser"],
+            session_id="read-owner-session",
+            _delegate_depth=0,
+        )
+
+    def test_allowed_file_returns_verified_content_hash(self, tmp_path):
+        from tools.delegate_tool import run_graph_read_operation
+        fixture = tmp_path / "work" / "data.txt"
+        fixture.parent.mkdir()
+        fixture.write_text("fixture read content\n")
+        parent = self._parent(tmp_path)
+        result = run_graph_read_operation(
+            operation_id="op-read-0001",
+            workspace=tmp_path / "work",
+            path="data.txt",
+            parent_agent=parent,
+            timeout_seconds=5,
+        )
+        assert result["status"] == "completed"
+        assert result["content_sha256"] == hashlib.sha256(fixture.read_bytes()).hexdigest()
+        assert result["operation_id"] == "op-read-0001"
+        # Fixed op exposes ONLY the read capability, never parent toolsets.
+        assert result["tool_classes"] == ["artifact_read"]
+
+    def test_refused_path_outside_workspace_never_executes(self, tmp_path):
+        from tools.delegate_tool import run_graph_read_operation
+        outside = tmp_path / "secret.txt"
+        outside.write_text("secret")
+        work = tmp_path / "work"; work.mkdir()
+        parent = self._parent(tmp_path)
+        for bad in ("../secret.txt", str(outside), "/etc/passwd"):
+            result = run_graph_read_operation(
+                operation_id="op-read-bad", workspace=work, path=bad,
+                parent_agent=parent, timeout_seconds=5,
+            )
+            assert result["status"] == "blocked"
+            assert result["code"] == "read_path_out_of_scope"
+            assert result.get("content_sha256") is None
+
+    def test_symlink_escape_is_refused(self, tmp_path):
+        from tools.delegate_tool import run_graph_read_operation
+        work = tmp_path / "work"; work.mkdir()
+        outside = tmp_path / "outside.txt"; outside.write_text("outside")
+        (work / "link.txt").symlink_to(outside)
+        result = run_graph_read_operation(
+            operation_id="op-read-link", workspace=work, path="link.txt",
+            parent_agent=self._parent(tmp_path), timeout_seconds=5,
+        )
+        assert result["status"] == "blocked"
+        assert result["code"] == "read_path_out_of_scope"
+
+    def test_missing_owner_is_refused(self, tmp_path):
+        from tools.delegate_tool import run_graph_read_operation
+        work = tmp_path / "work"; work.mkdir()
+        (work / "f.txt").write_text("x")
+        result = run_graph_read_operation(
+            operation_id="op-read-noowner", workspace=work, path="f.txt",
+            parent_agent=None, timeout_seconds=5,
+        )
+        assert result["status"] == "blocked"
+        assert result["code"] == "policy_owner_required"
+
+    def test_duplicate_operation_key_reattaches_without_second_read(self, tmp_path):
+        from tools.delegate_tool import run_graph_read_operation
+        work = tmp_path / "work"; work.mkdir()
+        f = work / "f.txt"; f.write_text("one")
+        parent = self._parent(tmp_path)
+        first = run_graph_read_operation(
+            operation_id="op-read-dup", workspace=work, path="f.txt",
+            parent_agent=parent, timeout_seconds=5,
+        )
+        assert first["status"] == "completed"
+        f.write_text("changed after first read")
+        again = run_graph_read_operation(
+            operation_id="op-read-dup", workspace=work, path="f.txt",
+            parent_agent=parent, timeout_seconds=5,
+        )
+        # Same key returns the ORIGINAL result, not a fresh read.
+        assert again["content_sha256"] == first["content_sha256"]
+        assert again["reattached"] is True
+
+    def test_expired_deadline_does_not_read(self, tmp_path):
+        from tools.delegate_tool import run_graph_read_operation
+        work = tmp_path / "work"; work.mkdir()
+        (work / "f.txt").write_text("x")
+        result = run_graph_read_operation(
+            operation_id="op-read-expired", workspace=work, path="f.txt",
+            parent_agent=self._parent(tmp_path), timeout_seconds=0,
+        )
+        assert result["status"] == "blocked"
+        assert result["code"] == "read_deadline_expired"

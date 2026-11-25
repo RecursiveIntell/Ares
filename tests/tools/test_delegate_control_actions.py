@@ -708,3 +708,62 @@ def test_control_action_not_blocked_at_spawn_cap():
     )
     # And spawns remain blocked afterwards — the control call didn't reset it
     assert ctl2.before_call("delegate_task", {"goal": "c"}).action == "block"
+
+
+# --- READ card (P4): control handle bound to owner/lineage ---
+
+class TestGraphReadControls:
+    def _run_read(self, tmp_path, parent, sid="op-ctl-0001"):
+        from tools.delegate_tool import run_graph_read_operation
+        work = tmp_path / "work"; work.mkdir(exist_ok=True)
+        (work / "f.txt").write_text("control fixture")
+        return run_graph_read_operation(
+            operation_id=sid, workspace=work, path="f.txt",
+            parent_agent=parent, timeout_seconds=5,
+        )
+
+    def test_owner_list_shows_read_operation(self, tmp_path):
+        import weakref
+        from tools.delegate_tool import run_graph_read_operation, graph_operation_control
+        work = tmp_path / "work"; work.mkdir()
+        (work / "f.txt").write_text("x")
+        parent = _StubParent()
+        parent.session_id = "ctl-owner"
+        parent.enabled_toolsets = ["file"]
+        # Long-lived handle: register but keep the operation live for controls.
+        result = run_graph_read_operation(
+            operation_id="op-ctl-live", workspace=work, path="f.txt",
+            parent_agent=parent, timeout_seconds=5, keep_handle=True,
+        )
+        assert result["status"] == "completed"
+        listing = json.loads(graph_operation_control("list", None, None, parent))
+        assert any(e["subagent_id"] == result["handle_id"] for e in listing["subagents"])
+
+    def test_non_owner_control_never_executes(self, tmp_path):
+        from tools.delegate_tool import run_graph_read_operation, graph_operation_control
+        work = tmp_path / "work"; work.mkdir()
+        (work / "f.txt").write_text("x")
+        owner = _StubParent(); owner.session_id = "ctl-owner"; owner.enabled_toolsets = ["file"]
+        foreign = _StubParent(); foreign.session_id = "ctl-foreign"; foreign.enabled_toolsets = ["file"]
+        result = run_graph_read_operation(
+            operation_id="op-ctl-foreign", workspace=work, path="f.txt",
+            parent_agent=owner, timeout_seconds=5, keep_handle=True,
+        )
+        hid = result["handle_id"]
+        stop_reply = graph_operation_control("stop", hid, None, foreign)
+        assert "No live subagent" in stop_reply or "error" in stop_reply.lower()
+        # Owner CAN stop; requested vs exited reported separately.
+        owner_stop = json.loads(graph_operation_control("stop", hid, None, owner))
+        assert owner_stop["status"] == "interrupt_requested"
+
+    def test_steer_on_read_op_reports_unsupported(self, tmp_path):
+        from tools.delegate_tool import run_graph_read_operation, graph_operation_control
+        work = tmp_path / "work"; work.mkdir()
+        (work / "f.txt").write_text("x")
+        owner = _StubParent(); owner.session_id = "ctl-owner2"; owner.enabled_toolsets = ["file"]
+        result = run_graph_read_operation(
+            operation_id="op-ctl-steer", workspace=work, path="f.txt",
+            parent_agent=owner, timeout_seconds=5, keep_handle=True,
+        )
+        reply = graph_operation_control("steer", result["handle_id"], "more text", owner)
+        assert "unsupported" in reply.lower() or "not accept" in reply.lower()

@@ -44,16 +44,27 @@ class GraphAdmissionScope:
     graph_version: str
     request_digest: str
     _route: tuple[str, str, str] = field(repr=False)
+    # LOCK contract-v1 §2 additive fields. Captured at issue time; a reference
+    # is a capability to ASK, never cached permission or a budget grant.
+    deadline_seconds: float | None = None
+    budget_invocations: int | None = None
+    route_generation: int = 0
 
     @property
     def execution_route(self):
         return dict(zip(("provider", "model", "reasoning_effort"), self._route))
 
     def metadata(self):
-        return {"schema": SCHEMA, "reference": self.reference,
-                "graph_id": self.graph_id, "graph_version": self.graph_version,
-                "request_digest": self.request_digest,
-                "execution_route": self.execution_route}
+        value = {"schema": SCHEMA, "reference": self.reference,
+                 "graph_id": self.graph_id, "graph_version": self.graph_version,
+                 "request_digest": self.request_digest,
+                 "execution_route": self.execution_route,
+                 "route_generation": self.route_generation}
+        if self.deadline_seconds is not None:
+            value["deadline_seconds"] = self.deadline_seconds
+        if self.budget_invocations is not None:
+            value["budget_invocations"] = self.budget_invocations
+        return value
 
 
 @dataclass
@@ -61,6 +72,7 @@ class _Entry:
     scope: GraphAdmissionScope
     admission: SpawnAdmission
     expires_at: float
+    deadline_at: float | None = None
     run_id: str | None = None
     invocations: set[str] = field(default_factory=set)
 
@@ -78,12 +90,22 @@ class GraphAdmissionService:
         self._entries = {}
         self._lock = threading.Lock()
 
-    def issue(self, parent, *, graph_id, graph_version, request_digest, ttl_seconds=300):
+    def issue(self, parent, *, graph_id, graph_version, request_digest, ttl_seconds=300,
+              deadline_seconds=None, budget_invocations=None):
         if (not _identifier(graph_id) or type(graph_version) is not str
                 or not _DIGEST.fullmatch(graph_version) or type(request_digest) is not str
                 or not _DIGEST.fullmatch(request_digest)
                 or type(ttl_seconds) not in (int, float) or not math.isfinite(ttl_seconds)
                 or not 0 < ttl_seconds <= 3600):
+            raise OrchestrationError("graph_admission_request_invalid")
+        # LOCK contract-v1 §2: optional parent deadline and invocation budget.
+        # Invalid values are typed refusals before any ticket exists.
+        if deadline_seconds is not None and (
+                type(deadline_seconds) not in (int, float)
+                or not math.isfinite(deadline_seconds) or not 0 < deadline_seconds <= 86400):
+            raise OrchestrationError("graph_admission_request_invalid")
+        if budget_invocations is not None and (
+                type(budget_invocations) is not int or not 1 <= budget_invocations <= 65536):
             raise OrchestrationError("graph_admission_request_invalid")
         if (type(getattr(parent, "_delegate_depth", None)) is not int
                 or parent._delegate_depth != 0
@@ -96,14 +118,21 @@ class GraphAdmissionService:
                 or route.reasoning_effort not in {"minimal", "low", "medium", "high", "xhigh"}):
             raise OrchestrationError("graph_route_unqualified")
         # Issuance is not an attempt and grants no permission to start work.
+        # Route generation is captured from the owner revision at issue time;
+        # it pins NEW admissions only and never re-pins an existing reference.
         scope = GraphAdmissionScope(secrets.token_urlsafe(32), graph_id, graph_version,
-                                    request_digest, (route.provider, route.model, route.reasoning_effort))
+                                    request_digest, (route.provider, route.model, route.reasoning_effort),
+                                    deadline_seconds=deadline_seconds,
+                                    budget_invocations=budget_invocations,
+                                    route_generation=admission.revision)
         with self._lock:
             now = self._clock()
             self._entries = {k: v for k, v in self._entries.items() if now < v.expires_at}
             if len(self._entries) >= self._max_scopes:
                 raise OrchestrationError("graph_admission_capacity")
-            self._entries[scope.reference] = _Entry(scope, admission, now + ttl_seconds)
+            deadline_at = now + deadline_seconds if deadline_seconds is not None else None
+            self._entries[scope.reference] = _Entry(scope, admission, now + ttl_seconds,
+                                                    deadline_at=deadline_at)
         return scope
 
     def retire(self, scope):
@@ -111,6 +140,13 @@ class GraphAdmissionService:
             entry = self._entries.get(scope.reference)
             if entry is not None and entry.scope is scope:
                 del self._entries[scope.reference]
+
+    def retire_reference(self, reference):
+        """Revoke a pending host-issued reference after preflight refusal."""
+        if not _identifier(reference):
+            return False
+        with self._lock:
+            return self._entries.pop(reference, None) is not None
 
     def authorize(self, request):
         """Every accepted callback commits a fresh, non-replayable owner claim.
@@ -124,12 +160,14 @@ class GraphAdmissionService:
         keys = {"schema", "reference", "stage", "graph_id", "graph_version",
                 "request_digest", "execution_route", "run_id"}
         if stage == "provider":
-            keys |= {"node_id", "invocation_ref"}
+            keys |= {"node_id", "invocation_ref", "requested_effort"}
         if (type(stage) is not str or stage not in {"launch", "provider"} or request.keys() != keys
                 or request.get("schema") != SCHEMA
                 or not all(_identifier(request.get(k)) for k in ("reference", "run_id"))
-                or (stage == "provider" and not all(
-                    _identifier(request.get(k)) for k in ("node_id", "invocation_ref")))):
+                or (stage == "provider" and (not all(
+                    _identifier(request.get(k)) for k in ("node_id", "invocation_ref"))
+                    or type(request.get("requested_effort")) is not str
+                    or request.get("requested_effort") not in {"minimal", "low", "medium", "high", "xhigh"}))):
             return _error("graph_admission_request_invalid")
         with self._lock:
             entry = self._entries.get(request["reference"])
@@ -138,12 +176,23 @@ class GraphAdmissionService:
             if self._clock() >= entry.expires_at:
                 del self._entries[request["reference"]]
                 return _error("graph_admission_expired")
+            # LOCK contract-v1 §3: the parent deadline is enforced before each
+            # NEW effect (launch and every provider invocation), closed boundary.
+            if entry.deadline_at is not None and self._clock() >= entry.deadline_at:
+                del self._entries[request["reference"]]
+                return _error("graph_admission_deadline_expired")
             scope = entry.scope
             if any(request[k] != v for k, v in (
                 ("graph_id", scope.graph_id), ("graph_version", scope.graph_version),
                 ("request_digest", scope.request_digest), ("execution_route", scope.execution_route),
             )):
                 return _error("graph_admission_binding_mismatch")
+            if stage == "provider":
+                effort_rank = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4}
+                granted_effort = scope.execution_route.get("reasoning_effort")
+                if (granted_effort not in effort_rank
+                        or effort_rank[request["requested_effort"]] > effort_rank[granted_effort]):
+                    return _error("graph_admission_effort_widened")
             if stage == "launch":
                 if entry.run_id is not None:
                     return _error("graph_admission_replay")
@@ -154,6 +203,11 @@ class GraphAdmissionService:
                     return _error("graph_admission_binding_mismatch")
                 if request["invocation_ref"] in entry.invocations:
                     return _error("graph_admission_replay")
+                # Parent budget is checked AFTER replay detection so a replay
+                # stays a replay and an exhausted budget never evicts history.
+                if (entry.scope.budget_invocations is not None
+                        and len(entry.invocations) >= entry.scope.budget_invocations):
+                    return _error("graph_admission_budget_exhausted")
                 if len(entry.invocations) >= self._max_invocations:
                     return _error("graph_admission_capacity")
             try:

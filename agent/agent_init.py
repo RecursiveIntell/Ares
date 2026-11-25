@@ -2955,6 +2955,15 @@ def init_agent(
                     f"configured context engine '{_engine_name}' failed its "
                     f"session binding: {_ce_bind_err}"
                 ) from _ce_bind_err
+    # Let SessionDB's resume-time alternation repair protect the receipt-
+    # authenticated prefix. Only engines that expose the accessor register a
+    # resolver; the built-in compressor leaves SessionDB's default (no lock).
+    _auth_prefix = getattr(agent.context_compressor, "authenticated_prefix_length", None)
+    if callable(_auth_prefix) and session_db is not None:
+        try:
+            session_db._authenticated_prefix_resolver = _auth_prefix
+        except Exception:
+            pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
     agent.context_rebase_enabled = compression_context_rebase
