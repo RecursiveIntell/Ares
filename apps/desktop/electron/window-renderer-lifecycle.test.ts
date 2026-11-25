@@ -114,6 +114,11 @@ test('shouldReloadAfterRendererGone never reloads expected teardown or unknown r
     reload: false,
     suppressedReason: 'unrecoverable-reason'
   })
+  // EXCEPTION: killed with exitCode=9 (SIGKILL from OOM killer) IS recoverable.
+  // The renderer was forcibly terminated by the kernel, not by the user.
+  assert.deepEqual(shouldReloadAfterRendererGone({ reason: 'killed', exitCode: 9, isDestroyed: false, recentReloadTimes: [] }), {
+    reload: true
+  })
   assert.deepEqual(
     shouldReloadAfterRendererGone({ reason: 'launch-failed', isDestroyed: false, recentReloadTimes: [] }),
     {
@@ -197,6 +202,28 @@ test('installWindowRendererLifecycle logs expected teardown without reloading', 
 
   assert.equal(win.reloadCalls.length, 0)
   assert.match(logs[0], /render-process-gone reason=killed exitCode=1 \(expected teardown\)/)
+})
+
+test('installWindowRendererLifecycle reloads on OOM kill (killed + exitCode=9)', async () => {
+  const win = makeFakeWindow()
+  const { logs, options } = makeOptions(win, 'secondary', {
+    callbacks: {
+      log: (message: string) => {
+        logs.push(message)
+      },
+      reload: () => {
+        win.webContents.reload()
+      }
+    }
+  })
+
+  installWindowRendererLifecycle(win, options)
+  // Simulate OOM killer: reason='killed', exitCode=9 (SIGKILL)
+  win.webContents.emit('render-process-gone', {}, { reason: 'killed', exitCode: 9 })
+  await flushDeferred()
+
+  assert.equal(win.reloadCalls.length, 1)
+  assert.match(logs[0], /\[renderer:secondary\] render-process-gone reason=killed exitCode=9/)
 })
 
 test('installWindowRendererLifecycle suppresses a peer crash loop after the budget', async () => {

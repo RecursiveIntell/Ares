@@ -147,9 +147,16 @@ export function pushReloadTime(times: number[], now: number): number[] {
  * rolling crash-loop budget. Anything else — expected teardown (`killed` after
  * close/destroy), unrecoverable reasons, unknown reasons — is log-only, exactly
  * like the primary window's previous behavior but now per window kind.
+ *
+ * Exception: `reason='killed'` with `exitCode=9` (SIGKILL, typically the Linux
+ * OOM killer) IS recoverable — the renderer was forcibly terminated by the
+ * kernel, not by the user closing the window. This was observed as
+ * `render-process-gone reason=killed exitCode=9` leading to a solid white
+ * window with no recovery.
  */
 export function shouldReloadAfterRendererGone(details: {
   reason?: string
+  exitCode?: number | string | undefined
   isDestroyed?: boolean
   recentReloadTimes: number[]
   reloadWindowMs?: number
@@ -161,8 +168,13 @@ export function shouldReloadAfterRendererGone(details: {
   }
 
   const reason = String(details.reason || '')
+  const exitCode = details.exitCode !== undefined ? String(details.exitCode) : ''
 
-  if (!RECOVERABLE_REASONS.has(reason)) {
+  // OOM killer sends SIGKILL (exitCode=9) with reason='killed'.
+  // Treat this as recoverable since the renderer didn't crash on its own.
+  const isOomKill = reason === 'killed' && exitCode === '9'
+
+  if (!RECOVERABLE_REASONS.has(reason) && !isOomKill) {
     return { reload: false, suppressedReason: 'unrecoverable-reason' }
   }
 
@@ -285,6 +297,7 @@ export function installWindowRendererLifecycle(
 
     const decision = shouldReloadAfterRendererGone({
       reason: details?.reason,
+      exitCode: details?.exitCode,
       isDestroyed: destroyed,
       recentReloadTimes: budgetRef.current,
       reloadWindowMs,
