@@ -74,18 +74,19 @@ def test_authenticated_merged_row_is_not_rewritten():
     agent._apply_persist_user_message_override(history)
 
     assert history[2]["content"] == committed
-    assert history[2]["timestamp"] == 1730000000
+    assert "timestamp" not in history[2]
     assert engine.calls == ["sess-auth-prefix"]
 
 
 def test_row_after_authenticated_prefix_is_still_cleaned():
     history = _merged_history()
     agent = _agent(_Engine(2))
-    _arm(agent, 2, "finish everything here")
+    _arm(agent, 2, "finish everything here", timestamp=1730000000)
 
     agent._apply_persist_user_message_override(history)
 
     assert history[2]["content"] == "finish everything here"
+    assert history[2]["timestamp"] == 1730000000
 
 
 def test_resolver_error_fails_open_to_previous_behavior():

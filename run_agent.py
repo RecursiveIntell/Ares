@@ -2089,7 +2089,7 @@ class AIAgent:
                 # with ``lineage_integrity_mismatch`` for the rest of the
                 # session. The committed row is already durable as signed;
                 # leaving it keeps memory, SessionDB, and receipt identical.
-                if (
+                should_override_content = (
                     override is not None
                     and not msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
                     and (
@@ -2097,11 +2097,16 @@ class AIAgent:
                         or isinstance(override, list)
                     )
                     and msg.get("content") != override
+                )
+                should_override_timestamp = timestamp is not None
+                if (
+                    (should_override_content or should_override_timestamp)
                     and not self._index_in_authenticated_prefix(idx)
                 ):
-                    msg["content"] = override
-                if timestamp is not None:
-                    msg["timestamp"] = timestamp
+                    if should_override_content:
+                        msg["content"] = override
+                    if should_override_timestamp:
+                        msg["timestamp"] = timestamp
 
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
