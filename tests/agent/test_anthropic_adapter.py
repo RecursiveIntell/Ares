@@ -281,9 +281,8 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        # Isolate source #5 (credential_pool): ensure source #4 (Claude Code
-        # creds, incl. the macOS keychain read which Path.home does not cover)
-        # returns nothing, mirroring a Hermes-PKCE-only setup.
+        # Isolate credential_pool: auto-discovered Claude Code credentials
+        # return nothing, mirroring a Hermes-PKCE-only setup.
         monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
 
         pool_entry = SimpleNamespace(
@@ -296,6 +295,33 @@ class TestResolveAnthropicToken:
         monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
 
         assert resolve_anthropic_token() == "pool-oauth-token"
+
+    def test_active_anthropic_pool_precedes_auto_discovered_claude_code_file(
+        self, monkeypatch, tmp_path
+    ):
+        """The selected pool account must not be shadowed by a separate CC login."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: {
+                "accessToken": "claude-code-file-token",
+                "refreshToken": "fixture-refresh-token",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            },
+        )
+        pool_entry = SimpleNamespace(
+            auth_type="oauth",
+            access_token="selected-pool-token",
+        )
+        pool = SimpleNamespace(
+            _available_entries=lambda **_kwargs: ([pool_entry], []),
+        )
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: pool)
+
+        assert resolve_anthropic_token() == "selected-pool-token"
 
     def test_api_key_wins_over_anthropic_credential_pool_oauth(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant...ykey")
@@ -330,7 +356,7 @@ class TestResolveAnthropicToken:
         )
         monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
 
-        # Must fall through to source #3 (ANTHROPIC_API_KEY), not raise.
+        # Must fall through to ANTHROPIC_API_KEY, not raise.
         assert resolve_anthropic_token() == "sk-ant...ykey"
 
     def test_pool_api_key_only_entry_is_not_returned_as_token(self, monkeypatch, tmp_path):

@@ -58,3 +58,20 @@ def test_anthropic_falls_back_to_curated_when_live_unavailable():
 
     assert result == list(M._PROVIDER_MODELS["anthropic"])
     assert "claude-fable-5" in result
+
+
+def test_anthropic_fable_52_is_curated_when_live_catalog_lags():
+    """A newly released alias stays pickable if /v1/models lags it."""
+    curated = M._PROVIDER_MODELS["anthropic"]
+    assert "claude-fable-5-2" in curated
+    with patch.object(M, "_fetch_anthropic_models", return_value=["claude-opus-5-5"]):
+        result = M.provider_model_ids("anthropic")
+    assert "claude-fable-5-2" in result
+
+
+def test_anthropic_catalog_fingerprint_includes_auth_policy_revision(monkeypatch):
+    monkeypatch.setattr(M, "_ANTHROPIC_CATALOG_AUTH_POLICY_REVISION", "test-v1", raising=False)
+    first = M._credential_fingerprint("anthropic")
+    monkeypatch.setattr(M, "_ANTHROPIC_CATALOG_AUTH_POLICY_REVISION", "test-v2", raising=False)
+    second = M._credential_fingerprint("anthropic")
+    assert first != second

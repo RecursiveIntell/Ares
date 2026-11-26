@@ -452,6 +452,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "MiniMax-M2",
     ],
     "anthropic": [
+        "claude-fable-5-2",
         "claude-fable-5",
         "claude-opus-5-5",
         "claude-sonnet-5-5",
@@ -4231,6 +4232,10 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 #     to a live fetch — the picker keeps working.
 
 _PROVIDER_MODELS_CACHE_TTL = 3600  # 1h
+# Model-catalog cache identity must change when Anthropic credential-source
+# precedence changes, even when auth-file mtimes do not. This prevents a stale
+# catalog fetched under a different account from persisting through SWR.
+_ANTHROPIC_CATALOG_AUTH_POLICY_REVISION = "pool-first-v1"
 # Stale-while-revalidate window: an expired-but-same-credentials entry is
 # served IMMEDIATELY (picker opens stay instant) while a background daemon
 # thread re-fetches the live catalog and rewrites the disk cache for the
@@ -4427,6 +4432,12 @@ def _credential_fingerprint(provider: str) -> str:
             parts.append(f"{path}@missing")
         except Exception:
             pass
+
+    if provider == "anthropic":
+        parts.append(
+            "anthropic_catalog_auth_policy="
+            + _ANTHROPIC_CATALOG_AUTH_POLICY_REVISION
+        )
 
     blob = "|".join(parts).encode("utf-8", errors="replace")
     # blake2b for cache-key fingerprinting only — not for credential storage.
