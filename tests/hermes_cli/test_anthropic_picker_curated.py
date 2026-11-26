@@ -58,3 +58,21 @@ def test_anthropic_falls_back_to_curated_when_live_unavailable():
 
     assert result == list(M._PROVIDER_MODELS["anthropic"])
     assert "claude-fable-5" in result
+
+
+def test_curated_anthropic_alias_survives_live_catalog_omission(monkeypatch):
+    """Curated aliases remain selectable when the live catalog omits them."""
+    curated = list(M._PROVIDER_MODELS["anthropic"])
+    curated.append("test-curated-alias")
+    monkeypatch.setitem(M._PROVIDER_MODELS, "anthropic", curated)
+    with patch.object(M, "_fetch_anthropic_models", return_value=["claude-opus-5-5"]):
+        result = M.provider_model_ids("anthropic")
+    assert "test-curated-alias" in result
+
+
+def test_anthropic_catalog_fingerprint_includes_auth_policy_revision(monkeypatch):
+    monkeypatch.setattr(M, "_ANTHROPIC_CATALOG_AUTH_POLICY_REVISION", "test-v1", raising=False)
+    first = M._credential_fingerprint("anthropic")
+    monkeypatch.setattr(M, "_ANTHROPIC_CATALOG_AUTH_POLICY_REVISION", "test-v2", raising=False)
+    second = M._credential_fingerprint("anthropic")
+    assert first != second

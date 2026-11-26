@@ -1415,6 +1415,13 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     for entry in entries:
         if getattr(entry, "auth_type", None) != AUTH_TYPE_OAUTH:
             continue
+        # Claude Code credentials are mirrored into the pool as a singleton
+        # entry. Keep them on the file resolver path so it can refresh an
+        # expired access token; resolving the mirrored token read-only here
+        # would bypass that refresh. Explicit pool accounts still take
+        # precedence over an unrelated Claude Code login.
+        if getattr(entry, "source", None) == "claude_code":
+            continue
         # access_token is a declared field but a persisted entry can carry an
         # explicit null (or a partially-written OAuth entry), so coerce before
         # strip — a bare None.strip() here would escape the try/excepts above
@@ -1434,9 +1441,11 @@ def resolve_anthropic_token() -> Optional[str]:
       1. ANTHROPIC_TOKEN env var (OAuth/setup token saved by Hermes)
       2. CLAUDE_CODE_OAUTH_TOKEN env var
       3. ANTHROPIC_API_KEY env var (explicit regular API key)
-      4. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
-         — with automatic refresh if expired and a refresh token is available
-      5. Anthropic credential_pool OAuth entry (~/.hermes/auth.json)
+      4. The first available Anthropic credential_pool OAuth entry. This
+         respects the profile's selected/priority-managed account.
+      5. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
+         — with automatic refresh if expired and a refresh token is available;
+         used only when no pool OAuth credential is available.
 
     Returns the token string or None.
     """
@@ -1472,15 +1481,18 @@ def resolve_anthropic_token() -> Optional[str]:
     if api_key:
         return api_key
 
-    # 4. Claude Code credential file
-    resolved_claude_token = _resolve_claude_code_token_from_credentials(_read_creds())
-    if resolved_claude_token:
-        return resolved_claude_token
-
-    # 5. Hermes credential_pool OAuth entry.
+    # 4. The profile's credential_pool is the account-selection owner. A valid
+    # Claude Code singleton may belong to a different Anthropic account and
+    # must not shadow the pool entry the operator selected in `hermes auth`.
     resolved_pool_token = _resolve_anthropic_pool_token()
     if resolved_pool_token:
         return resolved_pool_token
+
+    # 5. Auto-discovered Claude Code credentials are a fallback only when the
+    # profile has no usable OAuth pool entry.
+    resolved_claude_token = _resolve_claude_code_token_from_credentials(_read_creds())
+    if resolved_claude_token:
+        return resolved_claude_token
 
     return None
 
