@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from hermes_cli import models
 
@@ -119,3 +120,38 @@ def test_anthropic_picker_uses_curated_fallback_when_catalog_is_unavailable(monk
     monkeypatch.setattr(models, "_fetch_anthropic_models", lambda **_kwargs: None)
 
     assert models.provider_model_ids("anthropic") == expected
+
+
+def test_anthropic_picker_catalog_uses_pool_account_before_claude_code_file(monkeypatch):
+    """The model list must use the pool-selected account, not another login."""
+    monkeypatch.setattr(models, "_get_model_config_dict", lambda: {"provider": "nous"})
+    for key in ("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        lambda: {
+            "accessToken": "claude-code-file-token",
+            "refreshToken": "fixture-refresh-token",
+            "expiresAt": 9_999_999_999_000,
+        },
+    )
+    pool_entry = SimpleNamespace(auth_type="oauth", access_token="sk-ant-oat01-selected-pool-token")
+    pool = SimpleNamespace(_available_entries=lambda **_kwargs: ([pool_entry], []))
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: pool)
+
+    captured = {}
+
+    def _open(request, *, timeout):
+        captured["url"] = request.full_url
+        captured["headers"] = {
+            key.lower(): value for key, value in request.header_items()
+        }
+        return _Response({"data": [{"id": "claude-fable-5-2"}]})
+
+    monkeypatch.setattr(models, "_urlopen_model_catalog_request", _open)
+
+    result = models.provider_model_ids("anthropic")
+
+    assert "claude-fable-5-2" in result
+    assert captured["url"] == "https://api.anthropic.com/v1/models"
+    assert captured["headers"]["authorization"] == "Bearer sk-ant-oat01-selected-pool-token"
