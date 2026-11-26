@@ -323,6 +323,33 @@ class TestResolveAnthropicToken:
 
         assert resolve_anthropic_token() == "selected-pool-token"
 
+    def test_claude_code_pool_mirror_falls_through_to_refreshable_file(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: {"accessToken": "expired-file-token", "refreshToken": "refresh"},
+        )
+        pool_entry = SimpleNamespace(
+            auth_type="oauth",
+            source="claude_code",
+            access_token="expired-mirrored-token",
+        )
+        pool = SimpleNamespace(
+            _available_entries=lambda **_kwargs: ([pool_entry], []),
+        )
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: pool)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._resolve_claude_code_token_from_credentials",
+            lambda creds: "refreshed-file-token" if creds else None,
+        )
+
+        assert resolve_anthropic_token() == "refreshed-file-token"
+
     def test_api_key_wins_over_anthropic_credential_pool_oauth(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant...ykey")
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)

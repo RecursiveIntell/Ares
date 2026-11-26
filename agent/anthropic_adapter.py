@@ -1415,6 +1415,13 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     for entry in entries:
         if getattr(entry, "auth_type", None) != AUTH_TYPE_OAUTH:
             continue
+        # Claude Code credentials are mirrored into the pool as a singleton
+        # entry. Keep them on the file resolver path so it can refresh an
+        # expired access token; resolving the mirrored token read-only here
+        # would bypass that refresh. Explicit pool accounts still take
+        # precedence over an unrelated Claude Code login.
+        if getattr(entry, "source", None) == "claude_code":
+            continue
         # access_token is a declared field but a persisted entry can carry an
         # explicit null (or a partially-written OAuth entry), so coerce before
         # strip — a bare None.strip() here would escape the try/excepts above
