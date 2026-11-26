@@ -152,6 +152,7 @@ jobs:
             tests/ares_runtime/test_context_controller_credentials.py \
             tests/ares_runtime/test_context_authority_binding.py \
             tests/ares_runtime/test_context_native_dispatch.py \
+            tests/ares_runtime/test_context_native_authenticated_prefix.py \
             tests/test_sqlite_lock_safe_inspection.py \
             tests/agent/test_file_safety_credentials.py \
             tests/hermes_cli/test_backup.py \
