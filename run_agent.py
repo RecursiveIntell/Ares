@@ -2023,6 +2023,26 @@ class AIAgent:
             tool_call_id=tool_call_id,
         )
 
+    def _index_in_authenticated_prefix(self, idx: int) -> bool:
+        """Whether ``idx`` lies inside the context engine's authenticated prefix.
+
+        Uses the same ``authenticated_prefix_length`` accessor as the
+        model-switch marker dedup and resume-time repair. Fails open (False)
+        when the engine has no accessor, errors, or returns a non-int, which
+        preserves the previous behavior exactly.
+        """
+        engine = getattr(self, "context_compressor", None)
+        resolver = getattr(engine, "authenticated_prefix_length", None)
+        if not callable(resolver):
+            return False
+        try:
+            locked = resolver(str(getattr(self, "session_id", "") or ""))
+        except Exception:
+            return False
+        if type(locked) is not int:
+            return False
+        return 0 <= idx < locked
+
     def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
         """Rewrite the current-turn user message before persistence/return.
 
@@ -2057,17 +2077,36 @@ class AIAgent:
                 # next turn is built from — the same hazard the DB-write twin
                 # below already refuses (see the sibling guard in
                 # ``_flush_messages_to_session_db_unlocked``).
-                if (
+                #
+                # Never rewrite a row inside the Context Governor's
+                # receipt-authenticated prefix. Pre-request alternation repair
+                # can merge this turn's user text into the preceding user row
+                # (typically a model-switch marker); preflight compaction then
+                # signs and durably commits that merged row, and the anchor
+                # falls back to it. Restoring the clean text here changed only
+                # the live dict, so the next recursive compaction saw a prefix
+                # that no longer matched its parent receipt and failed closed
+                # with ``lineage_integrity_mismatch`` for the rest of the
+                # session. The committed row is already durable as signed;
+                # leaving it keeps memory, SessionDB, and receipt identical.
+                should_override_content = (
                     override is not None
                     and not msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
                     and (
                         not isinstance(msg.get("content"), list)
                         or isinstance(override, list)
                     )
+                    and msg.get("content") != override
+                )
+                should_override_timestamp = timestamp is not None
+                if (
+                    (should_override_content or should_override_timestamp)
+                    and not self._index_in_authenticated_prefix(idx)
                 ):
-                    msg["content"] = override
-                if timestamp is not None:
-                    msg["timestamp"] = timestamp
+                    if should_override_content:
+                        msg["content"] = override
+                    if should_override_timestamp:
+                        msg["timestamp"] = timestamp
 
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
