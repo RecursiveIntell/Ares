@@ -22,7 +22,10 @@ from ares_runtime.legacy_transition import LegacyTransitionError
 # Real child processes are spawned in their own session and SIGKILLed by
 # ``bounded_probe`` (killpg of that child's group only); the conftest guard
 # otherwise blocks killpg outside the test process group.
-pytestmark = pytest.mark.live_system_guard_bypass
+pytestmark = [
+    pytest.mark.live_system_guard_bypass,
+    pytest.mark.skipif(os.name != "posix", reason="canary child probes require POSIX"),
+]
 
 GOOD = {
     "backend_payload": "withheld", "canary": "offline_disposable",
@@ -88,6 +91,18 @@ def build(settings_value):
     canary.register(ctx)
     tool = ctx.tools[canary.TOOL_NAME]
     return ctx, tool, tool["check_fn"], tool["handler"]
+
+
+def test_missing_posix_primitives_refuse_before_launch(tmp_path, state_dir, monkeypatch):
+    witness = tmp_path / "launched"
+    exe = make_exe(tmp_path, f"touch {witness}\n")
+    _, _, check_fn, handler = build(settings(exe, state_dir))
+    monkeypatch.delattr(os, "geteuid")
+    assert check_fn() is False
+    result = run(handler)
+    assert result["reason"] == "unsupported_platform"
+    assert result["executed"] is False
+    assert not witness.exists() and list(state_dir.iterdir()) == []
 
 
 def run(handler, args=None):

@@ -113,6 +113,17 @@ class Admission:
     state_dir: str
 
 
+def _require_posix_uid() -> int:
+    """Refuse platforms without the child and filesystem primitives we require."""
+    get_uid = getattr(os, "geteuid", None)
+    if not callable(get_uid) or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "killpg"):
+        raise Refusal("unsupported_platform")
+    uid = get_uid()
+    if not isinstance(uid, int):
+        raise Refusal("unsupported_platform")
+    return uid
+
+
 def _normalized_absolute(value: object, code: str) -> str:
     if (not isinstance(value, str) or not value or len(value) > _MAX_PATH
             or "\x00" in value or not os.path.isabs(value)
@@ -148,9 +159,9 @@ def _lstat(path: str, code: str) -> os.stat_result:
         raise Refusal(code) from exc
 
 
-def _verify_state_dir(adm: Admission) -> None:
+def _verify_state_dir(adm: Admission, uid: int) -> None:
     info = _lstat(adm.state_dir, "state_dir_invalid")
-    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != uid
             or info.st_mode & 0o077 or os.path.realpath(adm.state_dir) != adm.state_dir):
         raise Refusal("state_dir_invalid")
     home = _profile_home()
@@ -159,24 +170,25 @@ def _verify_state_dir(adm: Admission) -> None:
         raise Refusal("state_dir_invalid")
 
 
-def _verify_executable(adm: Admission) -> os.stat_result:
+def _verify_executable(adm: Admission, uid: int) -> os.stat_result:
     info = _lstat(adm.executable, "executable_missing")
-    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid
             or info.st_mode & 0o022 or not info.st_mode & 0o100
             or info.st_size > _MAX_EXECUTABLE_BYTES
             or os.path.realpath(adm.executable) != adm.executable):
         raise Refusal("executable_unsafe")
     parent = _lstat(os.path.dirname(adm.executable), "executable_unsafe")
     if (not stat.S_ISDIR(parent.st_mode) or parent.st_mode & 0o022
-            or parent.st_uid not in (os.geteuid(), 0)):
+            or parent.st_uid not in (uid, 0)):
         raise Refusal("executable_unsafe")
     return info
 
 
 def verify_admission(adm: Admission, *, hash_executable: bool) -> None:
     """Filesystem recheck.  ``hash_executable`` is False only for ``check_fn``."""
-    _verify_state_dir(adm)
-    before = _verify_executable(adm)
+    uid = _require_posix_uid()
+    _verify_state_dir(adm, uid)
+    before = _verify_executable(adm, uid)
     if not hash_executable:
         return
     try:
@@ -185,7 +197,7 @@ def verify_admission(adm: Admission, *, hash_executable: bool) -> None:
         raise Refusal("executable_unreadable") from exc
     if not hmac.compare_digest(actual, adm.sha256):
         raise Refusal("hash_mismatch")
-    after = _verify_executable(adm)
+    after = _verify_executable(adm, uid)
     if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
             after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
         raise Refusal("executable_changed")
