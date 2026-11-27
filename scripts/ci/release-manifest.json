@@ -19,7 +19,7 @@
     "recursive-agent": {
       "url": "https://github.com/RecursiveIntell/recursive-agent.git",
       "ref": "refs/heads/main",
-      "commit": "ac578e0d92c3db917d3e04abe6ab662196cd5c24"
+      "commit": "1501d09254f1ff2ff0875bedd057243314b948d9"
     }
   },
   "submodules": {
