@@ -115,16 +115,22 @@ class GovernorSource:
         return cls(source_identity(recipe["source"]))
 
 
+# Single owner of the Context Governor capability contract. The release recipe
+# (require_capabilities) and the plugin's activation guard both read these.
+REQUIRED_CAPABILITY_FIELDS = {
+    "schema": "ContextGovernorCapabilitiesV1", "engine": "ri-context-governor",
+    "receipt_schema": "ContextCompactionReceiptV2",
+    "integrity": "hmac-sha256-canonical-json-v1",
+    "exactness_scope": "canonical_utf8_text_v1",
+}
+REQUIRED_CAPABILITY_FLAGS = ("supports_recursive_lineage", "supports_certified_receipt_store",
+         "supports_lineage_continuation", "supports_lineage_tip_projection",
+         "supports_host_finalization_reserve", "supports_pending_activation")
+
+
 def require_capabilities(value: object) -> dict:
-    required = {
-        "schema": "ContextGovernorCapabilitiesV1", "engine": "ri-context-governor",
-        "receipt_schema": "ContextCompactionReceiptV2",
-        "integrity": "hmac-sha256-canonical-json-v1",
-        "exactness_scope": "canonical_utf8_text_v1",
-    }
-    flags = ("supports_recursive_lineage", "supports_certified_receipt_store",
-             "supports_lineage_continuation", "supports_lineage_tip_projection",
-             "supports_host_finalization_reserve", "supports_pending_activation")
+    required = REQUIRED_CAPABILITY_FIELDS
+    flags = REQUIRED_CAPABILITY_FLAGS
     if not isinstance(value, dict) or any(value.get(k) != v for k, v in required.items()):
         raise GovernorInstallError("native capability schema mismatch")
     if any(value.get(flag) is not True for flag in flags):

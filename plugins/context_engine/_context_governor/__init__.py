@@ -481,21 +481,23 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             raise ContextGovernorActivationError(
                 "governor capability probe returned invalid JSON"
             ) from exc
-        required = {
-            "schema": "ContextGovernorCapabilitiesV1",
-            "engine": "ri-context-governor",
-            "receipt_schema": "ContextCompactionReceiptV2",
-            "integrity": "hmac-sha256-canonical-json-v1",
-            "exactness_scope": "canonical_utf8_text_v1",
-        }
+        # The capability contract has one owner (ares_runtime.governor_install);
+        # the release recipe and this activation guard require the same set.
+        from ares_runtime.governor_install import (
+            REQUIRED_CAPABILITY_FIELDS,
+            REQUIRED_CAPABILITY_FLAGS,
+        )
+
         if (
             not isinstance(capabilities, dict)
-            or any(capabilities.get(key) != value for key, value in required.items())
-            or not capabilities.get("supports_recursive_lineage")
-            or not capabilities.get("supports_certified_receipt_store")
-            or not capabilities.get("supports_lineage_continuation")
-            or not capabilities.get("supports_lineage_tip_projection")
-            or not capabilities.get("supports_host_finalization_reserve")
+            or any(
+                capabilities.get(key) != value
+                for key, value in REQUIRED_CAPABILITY_FIELDS.items()
+            )
+            or any(
+                capabilities.get(flag) is not True
+                for flag in REQUIRED_CAPABILITY_FLAGS
+            )
         ):
             raise ContextGovernorActivationError(
                 f"governor capability mismatch: {capabilities!r}"
