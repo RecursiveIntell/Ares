@@ -845,6 +845,14 @@ def test_error_publication_precedes_actual_successor_start_and_keeps_exact_custo
             for key in ['_turn_outcomes', '_lifecycle_projection_lock', '_run_thread']:
                 successor.pop(key, None)
             server._sessions['selected'] = successor
+        # The successor turn constructs GoalManager, whose first SessionDB open
+        # in this test's fresh HERMES_HOME runs the full schema build. That
+        # one-time cold init is unrelated to the ordering under test, but it
+        # landed inside the 2s liveness bounds below and measured 2-3.3s under
+        # CPU load (flaky locally and once on hosted CI). Warm the cache first
+        # so the bounds time only the handoff.
+        from hermes_cli import goals as goals_module
+        assert goals_module._get_session_db() is not None
         result = server._methods['prompt.submit']('rpc-B', {'session_id': 'selected', 'text': 'B'})
         assert not result.get('error'), result
         b_nonce = result['result']['accepted_turn']['request_id']
