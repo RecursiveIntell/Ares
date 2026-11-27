@@ -17,11 +17,12 @@ import shutil
 
 
 def _default_binary() -> str:
-    return (
-        shutil.which("context-governor")
-        or "/home/sikmindz/.local/bin/context-governor"
-        or "context-governor"
-    )
+    """The governor command to run when none is configured.
+
+    `shutil.which` covers the usual installs. The bare name is the fallback so the caller resolves it the
+    same way it resolves anything else; this module must not name one machine's home directory.
+    """
+    return shutil.which("context-governor") or "context-governor"
 
 
 def _context_lineage_root_with_evidence(
