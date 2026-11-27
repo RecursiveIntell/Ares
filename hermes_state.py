@@ -6007,25 +6007,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 # as session publication. Corrupt parent state aborts publication;
                 # repeated publication must never reset an existing child control.
                 if conn.execute("SELECT 1 FROM sessions WHERE id=?", (parent_session_id,)).fetchone():
-                    inherited = self._read_orchestration_record(
-                        conn, parent_session_id, require_qualified_lineage=True,
+                    self._inherit_orchestration_policy_on_conn(
+                        conn, parent_session_id=parent_session_id, child_session_id=session_id,
+                        require_qualified_lineage=True,
                     )
-                    if inherited is None:
-                        # Snapshot the declared effective default permission
-                        # record for a legacy parent; never a sibling override.
-                        from agent.orchestration_runtime import _config_for_owner
-                        from agent.orchestration_policy import OrchestrationPolicy
-                        snapshot = _config_for_owner(self)
-                        inherited = {"policy": OrchestrationPolicy.from_dict(
-                            snapshot.config["orchestration"]).to_dict(),
-                            "revision": 0, "source_message_id": None}
-                    if inherited is not None:
-                        conn.execute("""INSERT OR IGNORE INTO session_orchestration_policy
-                            (session_id,revision,policy_json,origin,source_message_id)
-                            VALUES(?,1,?,?,?)""", (session_id,
-                            json.dumps(inherited["policy"], sort_keys=True, separators=(",", ":")),
-                            f"inherit:{parent_session_id}:{inherited['revision']}",
-                            inherited["source_message_id"]))
                 conn.execute(
                     """UPDATE sessions
                        SET cwd = COALESCE(sessions.cwd,
@@ -7129,24 +7114,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             # child) hits the unqualified-lineage guard. The parent row is
             # pre-existing, so its record is read without the lineage
             # requirement.
-            inherited = self._read_orchestration_record(
-                conn, parent_session_id, require_qualified_lineage=False,
+            self._inherit_orchestration_policy_on_conn(
+                conn, parent_session_id=parent_session_id, child_session_id=child_session_id,
+                require_qualified_lineage=False,
             )
-            if inherited is None:
-                # Legacy parent with no session-scoped policy: snapshot the
-                # declared effective default permission record.
-                from agent.orchestration_runtime import _config_for_owner
-                from agent.orchestration_policy import OrchestrationPolicy
-                snapshot = _config_for_owner(self)
-                inherited = {"policy": OrchestrationPolicy.from_dict(
-                    snapshot.config["orchestration"]).to_dict(),
-                    "revision": 0, "source_message_id": None}
-            conn.execute("""INSERT OR IGNORE INTO session_orchestration_policy
-                (session_id,revision,policy_json,origin,source_message_id)
-                VALUES(?,1,?,?,?)""", (child_session_id,
-                json.dumps(inherited["policy"], sort_keys=True, separators=(",", ":")),
-                f"inherit:{parent_session_id}:{inherited['revision']}",
-                inherited["source_message_id"]))
             input_sources = self._bind_compacted_context_inputs_on_conn(conn, parent_session_id,
                 child_session_id, input_messages, row_ids)
             self._record_context_message_projections_on_conn(conn, parent_session_id,
@@ -8407,6 +8378,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         return {"session_id": row["id"], "revision": row["revision"],
                 "policy": policy.to_dict(), "origin": row["origin"],
                 "source_message_id": row["source_message_id"]}
+
+    def _inherit_orchestration_policy_on_conn(
+        self, conn, *, parent_session_id, child_session_id, require_qualified_lineage,
+    ):
+        """Copy the parent's effective orchestration policy onto a new child.
+
+        Runs on the caller's connection, inside the caller's transaction, so the
+        policy becomes visible together with the child. A parent that has no
+        session-scoped record contributes the declared effective default as
+        revision 0, never a sibling's override. ``INSERT OR IGNORE`` keeps an
+        existing child record: republishing must not reset a deliberate update.
+        A corrupt parent record raises and aborts the caller's publication.
+        """
+        inherited = self._read_orchestration_record(
+            conn, parent_session_id, require_qualified_lineage=require_qualified_lineage,
+        )
+        if inherited is None:
+            from agent.orchestration_runtime import _config_for_owner
+            from agent.orchestration_policy import OrchestrationPolicy
+            snapshot = _config_for_owner(self)
+            inherited = {"policy": OrchestrationPolicy.from_dict(
+                snapshot.config["orchestration"]).to_dict(),
+                "revision": 0, "source_message_id": None}
+        conn.execute("""INSERT OR IGNORE INTO session_orchestration_policy
+            (session_id,revision,policy_json,origin,source_message_id)
+            VALUES(?,1,?,?,?)""", (child_session_id,
+            json.dumps(inherited["policy"], sort_keys=True, separators=(",", ":")),
+            f"inherit:{parent_session_id}:{inherited['revision']}",
+            inherited["source_message_id"]))
 
     def get_orchestration_policy(self, session_id, *, require_qualified_lineage=False):
         """Strict exact-identity read; absence is distinct from unknown state."""

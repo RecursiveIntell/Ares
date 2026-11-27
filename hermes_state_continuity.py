@@ -1794,24 +1794,10 @@ class SessionContextContinuityMixin(SessionContextAuthorityMixin):
             # hits the unqualified-lineage guard. The parent row is already
             # loaded and pre-existing, so its record is read without the
             # lineage requirement.
-            inherited = self._read_orchestration_record(
-                conn, parent_session_id, require_qualified_lineage=False,
+            self._inherit_orchestration_policy_on_conn(
+                conn, parent_session_id=parent_session_id, child_session_id=child_session_id,
+                require_qualified_lineage=False,
             )
-            if inherited is None:
-                # Legacy parent with no session-scoped policy: snapshot the
-                # declared effective default permission record.
-                from agent.orchestration_runtime import _config_for_owner
-                from agent.orchestration_policy import OrchestrationPolicy
-                snapshot = _config_for_owner(self)
-                inherited = {"policy": OrchestrationPolicy.from_dict(
-                    snapshot.config["orchestration"]).to_dict(),
-                    "revision": 0, "source_message_id": None}
-            conn.execute("""INSERT OR IGNORE INTO session_orchestration_policy
-                (session_id,revision,policy_json,origin,source_message_id)
-                VALUES(?,1,?,?,?)""", (child_session_id,
-                json.dumps(inherited["policy"], sort_keys=True, separators=(",", ":")),
-                f"inherit:{parent_session_id}:{inherited['revision']}",
-                inherited["source_message_id"]))
             self._record_context_message_projections_on_conn(conn, parent_session_id,
                 child_session_id, messages, row_ids, kind="context_rebase")
             self._project_todo_baseline_on_conn(
