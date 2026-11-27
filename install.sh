@@ -358,6 +358,26 @@ print(units/name)
 PY
 )"
 
+STEP=recursive-agent-source
+# The managed-runtime step records the Recursive Agent source mode and revision
+# in the install receipt, so both are resolved and exported here, before it runs.
+ARES_RECURSIVE_AGENT_MODE="disabled"
+ARES_RECURSIVE_AGENT_SOURCE_SHA=""
+RECURSIVE_AGENT_SRC=""
+if [[ "$RECURSIVE_AGENT" == true ]]; then
+  if [[ -n "$RECURSIVE_AGENT_SOURCE" ]]; then
+    RECURSIVE_AGENT_SRC="$("$PYTHON" -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$RECURSIVE_AGENT_SOURCE")"
+    [[ -x "$RECURSIVE_AGENT_SRC/scripts/install-hermes-plugin.sh" ]] || die "Recursive Agent plugin installer not found or not executable: $RECURSIVE_AGENT_SRC/scripts/install-hermes-plugin.sh"
+    ARES_RECURSIVE_AGENT_MODE="explicit-development-source"
+  else
+    RECURSIVE_AGENT_SRC="$SOURCE_ROOT/recursive-agent"
+    checkout_exact recursive-agent "$RECURSIVE_AGENT_SRC"
+    ARES_RECURSIVE_AGENT_MODE="manifest-pinned"
+  fi
+  ARES_RECURSIVE_AGENT_SOURCE_SHA="$(git -C "$RECURSIVE_AGENT_SRC" rev-parse HEAD 2>/dev/null || printf 'UNQUALIFIED')"
+fi
+export ARES_RECURSIVE_AGENT_MODE ARES_RECURSIVE_AGENT_SOURCE_SHA
+
 STEP=managed-runtime
 "$BOOTSTRAP_PYTHON" - <<'PY'
 import hashlib, json, os, shutil, subprocess, sys, time
@@ -676,21 +696,9 @@ if [[ "$EXTRAS" == true ]]; then
 fi
 
 STEP=recursive-agent
-ARES_RECURSIVE_AGENT_MODE="disabled"
-ARES_RECURSIVE_AGENT_SOURCE_SHA=""
 if [[ "$RECURSIVE_AGENT" == true ]]; then
   plugin_dir="$ARES_HOME/plugins/recursive-agent-native"
-  if [[ -n "$RECURSIVE_AGENT_SOURCE" ]]; then
-    src="$("$PYTHON" -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$RECURSIVE_AGENT_SOURCE")"
-    [[ -x "$src/scripts/install-hermes-plugin.sh" ]] || die "Recursive Agent plugin installer not found or not executable: $src/scripts/install-hermes-plugin.sh"
-    ARES_RECURSIVE_AGENT_MODE="explicit-development-source"
-  else
-    src="$SOURCE_ROOT/recursive-agent"
-    checkout_exact recursive-agent "$src"
-    ARES_RECURSIVE_AGENT_MODE="manifest-pinned"
-  fi
-  ARES_RECURSIVE_AGENT_SOURCE_SHA="$(git -C "$src" rev-parse HEAD 2>/dev/null || printf 'UNQUALIFIED')"
-  export ARES_RECURSIVE_AGENT_MODE ARES_RECURSIVE_AGENT_SOURCE_SHA
+  src="$RECURSIVE_AGENT_SRC"
   if [[ -e "$plugin_dir" || -L "$plugin_dir" ]]; then
     HERMES_HOME="$ARES_HOME" bash "$src/scripts/install-hermes-plugin.sh" --verify \
       || die "Existing Recursive Agent plugin differs from the selected source; preserved at $plugin_dir. Use a separate Ares home for a different bundle."
@@ -702,7 +710,6 @@ if [[ "$RECURSIVE_AGENT" == true ]]; then
     log "Recursive Agent plugin payload installed from $src at $ARES_RECURSIVE_AGENT_SOURCE_SHA; the daemon remains operator-managed."
   fi
 else
-  export ARES_RECURSIVE_AGENT_MODE ARES_RECURSIVE_AGENT_SOURCE_SHA
   log "Recursive Agent plugin payload skipped (--no-recursive-agent)."
 fi
 
