@@ -4,7 +4,7 @@
     "Libraries": {
       "url": "https://github.com/RecursiveIntell/Libraries.git",
       "ref": "refs/heads/main",
-      "commit": "8355499c0653130ac55456bdfe7d3f391604a27b"
+      "commit": "414193cbf2c6a958f9933ea128933946d7aa8390"
     },
     "agent-memory-kits": {
       "url": "https://github.com/RecursiveIntell/agent-memory-kits.git",
@@ -27,7 +27,7 @@
       "parent": "Libraries",
       "path": "semantic-memory-mcp",
       "url": "https://github.com/RecursiveIntell/semantic-memory-mcp.git",
-      "commit": "1b2756cf9e2995cc82f9231fc21f1c0f032b07b1"
+      "commit": "f8f8af10a9301050aead763befcc8948c068acee"
     }
   },
   "toolchains": {
