@@ -1,0 +1,20 @@
+name: tool_observation_canary
+version: 0.1.0
+description: "Default-off OFFLINE staging bridge for the Libraries tool-observation canary. Runs one operator-admitted staged executable (absolute path + SHA-256) at most once per operator-created private pilot state directory. Not a production transport; no production-capability claim."
+author: RecursiveIntell
+kind: standalone
+provides_tools:
+  - ares_tool_observation_canary
+config_schema:
+  enabled:
+    type: bool
+    description: "Operator admission switch; must be exactly true. Default off."
+  executable:
+    type: str
+    description: "Absolute, symlink-free path of the staged ares-tool-observation-probe binary."
+  sha256:
+    type: str
+    description: "Lowercase hex SHA-256 the staged executable must match at every dispatch."
+  state_dir:
+    type: str
+    description: "Absolute path of an operator-created 0700 directory under the active profile home."
